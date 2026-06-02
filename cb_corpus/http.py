@@ -1,0 +1,88 @@
+"""HTTP fetcher: retries, identifying UA, minimal per-host throttle.
+
+This layer is intentionally NOT polite: robots.txt is ignored, the per-host
+delay is set low (0.5s default) just to avoid getting hard-banned. The only
+purpose is to scrape reliably.
+"""
+from __future__ import annotations
+
+import sys
+import time
+from typing import Optional
+from urllib.parse import urlparse
+
+import requests
+
+from .config import Config
+
+
+def host_of(url: str) -> str:
+    return urlparse(url).netloc.lower()
+
+
+def host_matches(url: str, domain: str) -> bool:
+    """True if url's host is `domain` or a subdomain of it."""
+    h = host_of(url)
+    d = domain.lower().lstrip(".")
+    return h == d or h.endswith("." + d)
+
+
+class Fetcher:
+    def __init__(self, config: Optional[Config] = None):
+        self.cfg = config or Config()
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = self.cfg.user_agent
+        self._last_hit: dict[str, float] = {}
+
+    def _throttle(self, host: str) -> None:
+        last = self._last_hit.get(host)
+        if last is not None:
+            wait = self.cfg.min_delay_seconds - (time.monotonic() - last)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_hit[host] = time.monotonic()
+
+    def get(self, url: str, *, allow_redirects: bool = True) -> requests.Response:
+        host = host_of(url)
+        last_exc: Exception | None = None
+        for attempt in range(self.cfg.max_retries):
+            self._throttle(host)
+            try:
+                r = self.session.get(url, timeout=self.cfg.timeout,
+                                     allow_redirects=allow_redirects)
+                r.raise_for_status()
+                return r
+            except requests.exceptions.HTTPError as exc:
+                # Make rate-limits and blocks visible immediately, even on
+                # the first attempt — these are the "are we banned?" signals.
+                code = getattr(exc.response, "status_code", "?")
+                if code in (429, 403, 503):
+                    print(f"!! HTTP {code} on {host} (attempt {attempt + 1}): {url}",
+                          file=sys.stderr, flush=True)
+                last_exc = exc
+                time.sleep(2 ** attempt)
+            except Exception as exc:  # noqa: BLE001 - retried below
+                last_exc = exc
+                time.sleep(2 ** attempt)
+        raise RuntimeError(f"GET failed after retries: {url}") from last_exc
+
+    def get_text(self, url: str) -> str:
+        return self.get(url).text
+
+    def get_bytes(self, url: str) -> tuple[bytes, str]:
+        """Return (body, mime_type). mime_type is the bare content-type (no charset)."""
+        r = self.get(url)
+        mime = (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        return r.content, mime
+
+    def head(self, url: str) -> requests.Response:
+        host = host_of(url)
+        self._throttle(host)
+        return self.session.head(url, timeout=self.cfg.timeout, allow_redirects=True)
+
+    def exists(self, url: str) -> bool:
+        try:
+            r = self.head(url)
+            return r.status_code < 400
+        except Exception:
+            return False

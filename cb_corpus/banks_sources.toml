@@ -1,0 +1,41 @@
+# Declarative per-bank source configuration.
+#
+# Two adapter types are supported:
+#   [<code>.sitemap]   - walk a sitemap.xml, filter URLs by regex per DocType
+#   [<code>.listing]   - scrape one or more listing pages, filter <a> by regex
+#
+# Regex notes:
+#   - Backslashes must be escaped (TOML strings): use \\d not \d.
+#   - URL templates may contain {year}; the listing adapter then iterates over
+#     `year_range` (defaults to 2000..current).
+#
+# Patterns are STARTING POINTS — verify each bank/url on first crawl. Selectors
+# tend to drift when sites are redesigned.
+
+[ch.sitemap]
+sitemap_url = "https://www.snb.ch/public/seo/sitemap.xml"
+[ch.sitemap.patterns]
+A2 = "/publikationen/medienmitteilungen/.*\\.de\\.pdf$"
+E2 = "/publikationen/finanzstabilitaetsbericht/.*\\.pdf$"
+
+[au.sitemap]
+sitemap_url = "https://www.rba.gov.au/sitemap.xml"
+[au.sitemap.patterns]
+A3 = "/monetary-policy/rba-board-minutes/.*\\.html$"
+E1 = "/publications/smp/.*\\.html$"
+
+[ca.sitemap]
+sitemap_url = "https://www.bankofcanada.ca/wp-sitemap.xml"
+[ca.sitemap.patterns]
+A3 = "/core-functions/monetary-policy/.*deliberations.*"
+E1 = "/publications/mpr/.*"
+
+[fr.sitemap]
+sitemap_url = "https://www.banque-france.fr/sitemap.xml"
+[fr.sitemap.patterns]
+E2 = "/publications/.*stabilite-financiere.*\\.pdf$"
+
+[jp.listing]
+year_range = [2015, 2025]
+[jp.listing.entries]
+A3 = [["https://www.boj.or.jp/en/mopo/mpmsche_minu/minu_{year}/index.htm", "g\\d{6}\\.pdf$"]]
