@@ -1,19 +1,23 @@
 # BIS-63 target banks — coverage checklist
 
-Generated from `cb_corpus/banks.py`. Use the **Adapter** column to track buildout: `generic` = speeches (C1) + papers (D) only; a named class = bespoke native listings (A/B/E/F).
+Generated from `cb_corpus/banks.py` + the adapter registries. **Adapter** column: `generic` = speeches (C1) + working papers (D1/D2) only; `TOML (native)` or a named class = bespoke native listings (A/B/E/F) on top.
+
+> ⚠️ Some native adapters have **known discovery gaps** (stale URL patterns, frozen snapshots) — validate their A/B/E/F output before trusting it.
+>
+> ✅ **Solid as of 2026-06**: **ECB** (A1/A2/A3), **Fed `us`** (A2/A3), **RBA `au`** (A1, now `RBAAdapter` — not TOML), **BoE `gb`** (full working papers + MPC minutes A3, from the bank's own sitemaps). Counts live in `CORPUS.md`.
 
 | # | code | bank | country | domain | verify | adapter |
 |--:|------|------|---------|--------|:------:|---------|
 | 1 | `ae` | Central Bank of the United Arab Emirates | United Arab Emirates | centralbank.ae | ⚠️ | generic |
 | 2 | `ar` | Central Bank of Argentina | Argentina | bcra.gob.ar |  | generic |
 | 3 | `at` | Oesterreichische Nationalbank | Austria | oenb.at |  | generic |
-| 4 | `au` | Reserve Bank of Australia | Australia | rba.gov.au |  | generic |
+| 4 | `au` | Reserve Bank of Australia | Australia | rba.gov.au |  | RBAAdapter (native) |
 | 5 | `ba` | Central Bank of Bosnia and Herzegovina | Bosnia and Herzegovina | cbbh.ba | ⚠️ | generic |
 | 6 | `be` | National Bank of Belgium | Belgium | nbb.be |  | generic |
 | 7 | `bg` | Bulgarian National Bank | Bulgaria | bnb.bg |  | generic |
 | 8 | `br` | Central Bank of Brazil | Brazil | bcb.gov.br |  | generic |
-| 9 | `ca` | Bank of Canada | Canada | bankofcanada.ca |  | generic |
-| 10 | `ch` | Swiss National Bank | Switzerland | snb.ch |  | generic |
+| 9 | `ca` | Bank of Canada | Canada | bankofcanada.ca |  | TOML (native) |
+| 10 | `ch` | Swiss National Bank | Switzerland | snb.ch |  | TOML (native) |
 | 11 | `cl` | Central Bank of Chile | Chile | bcentral.cl |  | generic |
 | 12 | `cn` | People's Bank of China | China | pbc.gov.cn |  | generic |
 | 13 | `co` | Central Bank of Colombia | Colombia | banrep.gov.co |  | generic |
@@ -25,7 +29,7 @@ Generated from `cb_corpus/banks.py`. Use the **Adapter** column to track buildou
 | 19 | `ee` | Eesti Pank | Estonia | eestipank.ee |  | generic |
 | 20 | `es` | Banco de Espana | Spain | bde.es |  | generic |
 | 21 | `fi` | Bank of Finland | Finland | suomenpankki.fi |  | generic |
-| 22 | `fr` | Bank of France | France | banque-france.fr |  | generic |
+| 22 | `fr` | Bank of France | France | banque-france.fr |  | TOML (native) |
 | 23 | `gb` | Bank of England | United Kingdom | bankofengland.co.uk |  | generic |
 | 24 | `gr` | Bank of Greece | Greece | bankofgreece.gr |  | generic |
 | 25 | `hk` | Hong Kong Monetary Authority | Hong Kong SAR | hkma.gov.hk |  | generic |
@@ -37,7 +41,7 @@ Generated from `cb_corpus/banks.py`. Use the **Adapter** column to track buildou
 | 31 | `in` | Reserve Bank of India | India | rbi.org.in |  | generic |
 | 32 | `is` | Central Bank of Iceland | Iceland | cb.is |  | generic |
 | 33 | `it` | Bank of Italy | Italy | bancaditalia.it |  | generic |
-| 34 | `jp` | Bank of Japan | Japan | boj.or.jp |  | generic |
+| 34 | `jp` | Bank of Japan | Japan | boj.or.jp |  | TOML (native) |
 | 35 | `kr` | Bank of Korea | Korea | bok.or.kr |  | generic |
 | 36 | `kw` | Central Bank of Kuwait | Kuwait | cbk.gov.kw | ⚠️ | generic |
 | 37 | `lt` | Lietuvos bankas | Lithuania | lb.lt |  | generic |
@@ -69,8 +73,10 @@ Generated from `cb_corpus/banks.py`. Use the **Adapter** column to track buildou
 | 63 | `za` | South African Reserve Bank | South Africa | resbank.co.za |  | generic |
 
 - **Total banks:** 63
-- **Bespoke adapters:** 2 (ecb, us) — the other 61 run on the generic adapter.
-- **Domains to verify on first run (⚠️):** dz, ba, kw, ma, mk, ae, vn
+- **Native adapters:** 7 — hand-written: ecb, us, au; TOML-declarative: ca, ch, fr, jp. The other 56 run on the generic adapter (C1 + D only).
+- **Domains to verify on first run (⚠️):** ae, ba, dz, kw, ma, mk, vn
 
-## Suggested adapter build order (highest A3/E volume first)
-`gb` BoE · `jp` BoJ · `ca` BoC · `au` RBA · `in` RBI · `ch` SNB · `se` Riksbank · `no` Norges Bank · `de` Bundesbank · `it` Banca d'Italia
+## Native-adapter status
+- **Working** after fixes: `ecb` (A3 accounts 2015→, E4 bulletin).
+- **Broken / partial (RC3 — needs repair):** `us` (Fed A2 not wired; pre-2008 minutes & 2007-2020 SEP missed), `au` (frozen-2017 sitemap), `ca` (wrong paths), `ch` (dead German paths), `fr` (HTML-only E2), `jp` (hard-coded year range + .htm).
+- **C1 speeches** (all banks) are healthy after the institution-alias fix (RC1).

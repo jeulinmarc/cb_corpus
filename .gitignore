@@ -15,3 +15,17 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# Docs — generated snapshots (regenerate via the scripts) + local working/analysis notes.
+# Committed docs: README, DOCS, INGESTION_RAG, BANKS, central_bank_corpus_inventory.
+CORPUS.md
+PRESENTATION.md
+PRESENTATION_EN.md
+*.pptx
+ARCHITECTURE_REVIEW.md
+ARCHITECTURE_ALTERNATIVES.md
+DISCOVERY_AUDIT.md
+COMPLETENESS.md
+REFACTORING.md
+ECB_DOC_TYPES.md
+RUNBOOK.md

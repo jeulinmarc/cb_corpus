@@ -3,6 +3,14 @@
 *Planning + completeness-check reference for scraping/downloading central bank PDFs.*
 *Compiled June 2026. All counts are order-of-magnitude estimates unless a source is cited.*
 
+> ⚠️ **This is the original PLANNING doc.** For the **as-built** system see `README.md`
+> (architecture) and `CORPUS.md` (actual counts, generated). Two rules below were relaxed in implementation:
+> - **RePEc PDFs (§2a):** the plan says "always fetch from the bank's domain, never a cached
+>   copy". The shipped `extract_pdf` *prefers* the bank domain but **falls back to any available
+>   PDF** (EconStor/SSRN/IDEAS) so papers aren't dropped. There is **no domain guard** in v2.
+> - **Politeness (§6):** the shipped crawler **ignores robots.txt** and uses a 0.5 s/host throttle
+>   (not 2 s) — set a real contact UA in `config.py`.
+
 ---
 
 ## 0. Scope & headline finding (read this first)

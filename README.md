@@ -1,55 +1,115 @@
 # cb_corpus
 
-Official central-bank document corpus builder.
-**Scope:** document types A–F (see taxonomy). **Targets:** the 63 BIS member central banks.
-**Rule:** official primary sources only — every PDF must come from the issuing bank's own
-domain (or `*.bis.org`, the official re-host for speeches). No academic-curated datasets,
+Builder for a corpus of **official central-bank documents** — first-hand sources only,
+for downstream RAG / analysis.
+
+**Scope:** document families A–F (see `taxonomy.py`). **Targets:** the 63 BIS member central banks.
+**Rule:** official primary sources only — every document comes from the issuing bank's own
+domain, or `*.bis.org` (the official re-host for speeches). No academic-curated datasets,
 no machine-translated or model-generated text.
+
+> 📊 Data reference: run `python gen_corpus.py` → **`CORPUS.md`** (counts, per-bank / per-type inventory).
+> 🤖 RAG handoff contract (schema, filters, citation): **`INGESTION_RAG.md`**.
 
 ## What's wired up
 
-- **BIS speech index** (`sources/bis_speeches.py`) → discovers speeches (C1) for all ~130
-  banks and takes the **original PDF**, not the BIS text extract.
-- **RePEc URL discovery** (`sources/repec.py`) → finds working papers (D1/D2) but keeps a
-  PDF **only if it resolves to the bank's own domain**; IDEAS-cached copies are dropped.
-- **Per-bank adapter framework** (`adapters/`) → one adapter per bank for the
-  site-specific listings (A/B/E/F). A `GenericAdapter` is registered for all 63 banks, so
-  every bank already yields speeches + papers; `FedAdapter` and `ECBAdapter` are worked
-  examples that add native listings.
-- **Completeness matrix** (`completeness.py`) → expected-vs-downloaded per
-  (bank × doc_type × year), with `ok / partial / missing / unknown` status.
-- **Politeness** (`http.py`) → per-domain rate limiting, robots.txt, retries, crawler UA.
-- **Domain guard** (`storage.py`) → refuses any PDF not on an official domain; dedupes on
-  content hash; manifest at `data/manifest.jsonl`.
+- **BIS speech index** (`sources/bis_speeches.py`) → speeches (C1) for all 63 banks from the
+  BIS yearly sitemaps; keeps the **original PDF**. Institution attribution is **alias-aware**
+  (`banks.py::BIS_ALIASES`, accent/apostrophe-insensitive) so renamed / historical / native
+  BIS labels (e.g. "Bank of Latvia" → `lv`, pre-2010 "…US Federal Reserve System" → `us`)
+  still map to the right bank instead of being silently dropped.
+- **RePEc / IDEAS discovery** (`sources/repec.py`) → working papers (D1/D2). **Paginates** the
+  full series back-catalogue (not just the ~200 newest) and reads the publication **date** from
+  the IDEAS `citation_*` metadata. Prefers the bank's own PDF, falls back to any available PDF.
+- **Per-bank adapters** (`adapters/`) → site-specific listings (A/B/E/F). `GenericAdapter`
+  (C1 + D for every bank) is the default; bespoke `ECBAdapter` (A1 decisions / A2 statements /
+  A3 accounts), `FedAdapter` (A2 statements / A3 minutes / F1), `RBAAdapter` (au, A1 rate
+  decisions) and the TOML-declarative adapters (`banks_sources.toml`: ch/ca/fr/jp) add native
+  listings. **Rate decisions, policy statements & minutes (A1/A2/A3) are wired for the majors.**
+- **Bank-of-England official recovery** (`sources/boe_wp.py` + `pipeline.run_boe_wp_recovery` /
+  `run_boe_recovery`) → BoE working papers and MPC minutes from the bank's **own sitemaps**
+  (`/sitemap/staff-working-paper`, `/sitemap/minutes`), since IDEAS only carries the pre-2017
+  dead URLs. Generic over any BoE sitemap section (reports/FSR are a one-line addition).
+- **Wayback recovery** (`sources/wayback.py`) → official PDFs a bank has taken offline, fetched
+  from archive.org's raw snapshot (`provenance="wayback"`, fully audited). Used for the Riksbank.
+- **HTML→PDF** (`htmlpdf.py`) → HTML-only documents (e.g. ECB monetary-policy accounts) are
+  rendered to PDF via headless Chrome; the **raw HTML is also kept** (`html_path`).
+- **Storage / dedup** (`storage.py`) → manifest at `data/manifest.jsonl`; dedup on `doc_id`
+  (stable hash of bank+type+**url** — date-independent, so correcting a date is a pure metadata
+  update, no id churn) and content `sha256`. **No domain guard** — discovery owns URL quality.
+- **Completeness matrix** (`completeness.py`) → expected-vs-downloaded per (bank × type × year):
+  `ok / partial / missing / unknown`.
+- **Fetcher** (`http.py`) → per-host rate limit (0.5s default) + retries with exponential
+  backoff. Deliberately **not** robots-gated; set a real contact address in
+  `config.py::Config.user_agent`.
+- **Reproducible rebuild** (`pipeline.py`) → idempotent re-runs; `run(..., max_rounds=N)`
+  re-crawls until a clean round (no new docs, no errors); discovery failures are logged to
+  `data/discovery_errors.jsonl` (no silent drops).
 
-## Install
+## Install / test
 
 ```bash
 pip install -r requirements.txt
+python3.13 -m pytest tests/ -q          # 85 tests
 ```
+> Use **`python3.13`** — that interpreter has the dependencies in this environment
+> (`python3` resolves to 3.14 without them).
 
 ## Use
 
 ```bash
-# the 63 target banks
 python -m cb_corpus list-banks
 
-# DRY RUN (index URLs only, no download) for two banks since 2015
-python -m cb_corpus discover --banks us,ecb --since 2015-01-01
+# Speeches (C1) — single pass over the BIS yearly sitemaps, all banks at once
+python -m cb_corpus bis-sitemap --download
 
-# actually download PDFs (respects robots.txt + rate limits)
-python -m cb_corpus discover --banks us,ecb --since 2015-01-01 --download
+# Working papers (D1/D2) via RePEc (paginated, dated)
+python -m cb_corpus repec --download                  # all wired series
+python -m cb_corpus repec --banks ecb,us --download
 
-# completeness report -> CSV
+# Per-bank native listings (A/B/E/F + inherited C1/D), with convergence retries
+python -m cb_corpus discover --banks us,ecb --types A3,E4 --download --rounds 3
+
+# Completeness report -> CSV
 python -m cb_corpus report --years 2015-2025 --csv data/reports/matrix.csv
 ```
 
-Full run (all 63, dry run first) from Python:
+Full rebuild from Python:
 
 ```python
-from cb_corpus.pipeline import run
-results = run(dry_run=True)          # omit dry_run to download
+from cb_corpus.pipeline import run_bis_sitemap, run_repec, run
+run_bis_sitemap(dry_run=False)      # C1 speeches (single pass, idempotent)
+run_repec(dry_run=False)            # D1/D2 working papers (paginated)
+run(dry_run=False, max_rounds=3)    # native A/B/E/F per bank (converges)
 ```
+
+## Before a real run
+
+1. **Set a contact in `config.py::Config.user_agent`.** It's how central-bank webmasters reach
+   you — part of being a polite crawler. Throughput is bounded by politeness
+   (`min_delay_seconds`, default ~2 s/domain); the rate limit is **per-host**, so banks on
+   different domains crawl in parallel.
+2. **Validate on a small window first.** Parsers were written to each site's documented markup,
+   not all validated against live HTML. Dry-run one or two banks before a full crawl:
+   ```bash
+   PYTHONPATH=. python -m cb_corpus discover --banks us,ecb --since 2024-01-01   # no --download
+   ```
+   If a parser returns nothing / wrong rows: save the live HTML, adjust the pure `parse_*`
+   function, and re-run its test in `tests/`.
+
+**Completeness** (`report`) — status per (bank × type × year): `ok` (downloaded ≥ expected),
+`partial` (0 < got < expected → re-crawl that bank/type/year), `missing` (expected but 0 → fix the
+adapter/selector), `unknown` (no expected count). Add `expected_per_year` to an adapter (from the
+bank's published meeting calendar) to turn `unknown` cells into real checks.
+
+## Reproducibility & reliability
+
+- **Idempotent** — re-running skips already-saved docs (`doc_id` + `sha256`), so a full
+  rebuild converges instead of duplicating.
+- **Convergence** — `--rounds N` (or `run(max_rounds=N)`) re-crawls until a round adds nothing
+  new and reports no errors, filling transient-failure gaps.
+- **Visible failures** — discovery fetch failures are appended to `data/discovery_errors.jsonl`
+  instead of being swallowed, so an incomplete run is detectable.
 
 ## Adding a bank adapter
 
@@ -62,44 +122,43 @@ class BoEAdapter(BankAdapter):
     native_types = (DocType.A3, DocType.E1, DocType.E2)
     expected_per_year = {DocType.A3: 8}          # MPC minutes/yr
     def _discover_native(self, doc_type, since):
-        # fetch the bank's listing page(s), parse, yield DocRecord(...)
+        # fetch the bank's listing page(s) via self._fetch_text (records failures),
+        # parse with a pure parse_* function, yield DocRecord(...)
         ...
 ```
-
 C1 (speeches) and D1/D2 (papers) are inherited — only implement the native listings.
-
-## Important notes
-
-- **Selectors need a live check.** Parsers target the documented markup of each site but
-  could not be validated against live HTML in the build environment (network restricted).
-  Every parser is an isolated, unit-tested pure function (`parse_*`) so re-pointing is a
-  one-line change. Run a small `--since` window first and confirm counts.
-- **RePEc handles** in `sources/repec.py::SERIES` are a seed list for the majors — verify on
-  IDEAS and extend toward all 63.
-- **Long-tail domains** flagged `verify=True` in `banks.py` should be confirmed on first run.
-- **Languages**: non-English originals are kept as-is (no machine translation).
+Use `self._fetch_text(url, context=...)` for listing fetches so failures are surfaced.
 
 ## Layout
 
 ```
 cb_corpus/
   taxonomy.py        DocType A1..G3, FULL_SCOPE (A–F)
-  banks.py           the 63 BIS members
+  banks.py           the 63 BIS members + BIS_ALIASES (institution matching)
   models.py          DocRecord
-  config.py          settings
-  http.py            polite fetcher (robots, rate limit, retries)
-  storage.py         manifest, dedup, official-domain guard
+  config.py          settings (UA, throttle, html_to_pdf)
+  http.py            fetcher (per-host throttle + retry/backoff; throttle() for Chrome)
+  storage.py         manifest, dedup (doc_id + sha256), HTML→PDF render, html_path
+  htmlpdf.py         headless-Chrome HTML→PDF (shared profile)
   completeness.py    expected-vs-downloaded matrix
-  pipeline.py        orchestration
-  cli.py             command line
+  pipeline.py        run() (convergence), run_bis_sitemap(), run_repec(), run_*_recovery()
+  cli.py             command line (list-banks, discover, bis-sitemap, repec, report, ...)
   sources/
-    bis_speeches.py  BIS speech index  -> C1
-    repec.py         RePEc discovery   -> D1/D2 (official domain only)
+    bis_speeches.py  BIS speech index         -> C1 (alias-aware attribution)
+    repec.py         RePEc discovery          -> D1/D2 (paginated, dated)
+    wayback.py       Wayback CDX recovery      -> dead-but-official PDFs/HTML
+    ecb_pub.py       ECB per-section includes  -> A1/B1/C2/E1-E4/G2 (primary -> CDX fallback)
+    boe_wp.py        BoE official sitemaps     -> working papers + MPC minutes
   adapters/
-    base.py          BankAdapter ABC + registry + GenericAdapter
-    fed.py           example (FOMC minutes, SEP)
-    ecb.py           example (accounts, Economic Bulletin)
-tests/               13 tests over taxonomy, registry, parsers, guard, matrix
+    base.py          BankAdapter ABC + registry + GenericAdapter + _fetch_text
+    fed.py / ecb.py / rba.py  worked native examples (us / ecb / au)
+    declarative.py + generic_sitemap.py + listing_crawler.py  TOML-driven adapters
+tests/               85 tests (taxonomy, registry, parsers, dedup, matrix, reliability)
 ```
 
-Run tests: `PYTHONPATH=. python -m pytest -q`
+## Notes
+
+- Official primary sources only; non-English originals are kept as-is (the BIS speech corpus
+  is English-language).
+- The corpus is **~99 % complete** against each source's authoritative catalogue (BIS speeches,
+  IDEAS working-paper series, bank publication calendars).
