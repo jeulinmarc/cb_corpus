@@ -13,7 +13,7 @@ from datetime import date, datetime
 from .banks import BIS_63
 from .completeness import build_matrix, export_csv, summarize
 from .convert import convert_existing
-from .pipeline import run, run_bis_sitemap
+from .pipeline import run, run_bis_sitemap, run_repec
 from .retry_html import retry_failed
 from .taxonomy import FULL_SCOPE, by_code
 
@@ -51,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--since", type=_date, default=None)
     d.add_argument("--download", action="store_true",
                    help="actually fetch PDFs (default is dry-run: index only)")
+    d.add_argument("--rounds", type=int, default=3,
+                   help="re-crawl up to N times until no new docs and no errors "
+                        "(idempotent; fills transient-failure gaps). Use a higher "
+                        "value for a full rebuild. Ignored for dry-run.")
 
     b = sub.add_parser("bis-sitemap",
                        help="Single-pass discovery of all C1 speeches via BIS sitemaps.")
@@ -59,6 +63,13 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--download", action="store_true")
     b.add_argument("--max-per-year", type=int, default=None,
                    help="cap entries per year (smoke-test only)")
+
+    rp = sub.add_parser("repec",
+                        help="Discover/download RePEc working papers (D1/D2) with "
+                             "IDEAS pagination, for all SERIES-wired banks.")
+    rp.add_argument("--banks", default="", help="restrict to bank codes")
+    rp.add_argument("--download", action="store_true",
+                    help="actually fetch PDFs (default is dry-run: index only)")
 
     r = sub.add_parser("report")
     r.add_argument("--banks", default="")
@@ -87,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "discover":
         scope = _types(args.types)
         results = run(bank_codes=banks, scope=scope, since=args.since,
-                      dry_run=not args.download)
+                      dry_run=not args.download, max_rounds=args.rounds)
         for code, counts in results.items():
             print(f"{code}: {counts}")
         return 0
@@ -102,6 +113,12 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=not args.download, max_per_year=args.max_per_year,
         )
         print("bis-sitemap:", counts)
+        return 0
+
+    if args.cmd == "repec":
+        results = run_repec(bank_codes=banks, dry_run=not args.download)
+        for code, counts in results.items():
+            print(f"{code}: {counts}")
         return 0
 
     if args.cmd == "report":

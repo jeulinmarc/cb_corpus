@@ -11,7 +11,9 @@ class Config:
     user_agent: str = "cb-corpus/0.2 (+jeulinmarc@gmail.com)"
     # Minimal anti-ban throttle per host (NOT politeness — kept low on purpose).
     min_delay_seconds: float = 0.5
-    timeout: float = 30.0
+    timeout: float = 30.0          # per-request connect/read (inactivity) timeout
+    download_timeout: float = 90.0  # TOTAL deadline for a body download (defeats
+                                    # slow-trickle hosts that never trip `timeout`)
     max_retries: int = 3
     # No robots.txt enforcement. No domain guard. We scrape whatever the
     # discovery layer hands us.

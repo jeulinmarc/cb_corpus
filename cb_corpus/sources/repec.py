@@ -13,6 +13,8 @@ IDEAS and extended toward all 63 banks; the crawler accepts any handle.
 """
 from __future__ import annotations
 
+import re
+from datetime import date
 from typing import Iterator, Optional
 from urllib.parse import urljoin
 
@@ -63,27 +65,44 @@ def extract_pdf(paper_html: str, bank_homepage: Optional[str] = None) -> Optiona
       2. PDF on bis.org (BIS re-hosts some)
       3. Any other absolute PDF link (EconStor, SSRN, RePEc cached, ...).
 
+    PDF links surface in three shapes on IDEAS, collected in order:
+      a. <a href="...pdf"> — rare today, kept for compatibility.
+      b. <input name="url" value="...pdf"> — the canonical IDEAS download
+         form; this is where the real PDF actually lives on modern pages.
+      c. any absolute .pdf URL anywhere in the raw HTML — last-ditch fallback.
+
     Returns None if no PDF link is present.
     """
+    c = extract_pdf_candidates(paper_html, bank_homepage)
+    return c[0] if c else None
+
+
+def extract_pdf_candidates(paper_html: str,
+                           bank_homepage: Optional[str] = None) -> list[str]:
+    """All PDF URLs on an IDEAS paper page, ORDERED by preference:
+    1. the bank's own domain, 2. bis.org, 3. any other (EconStor/SSRN/cached).
+
+    Collected from <a href>, the <input name="url"> download form, and any bare
+    `.pdf` URL in the markup; deduped. Storage tries them in order so a paper
+    isn't lost when the preferred host 403s / dies (see DocRecord.alt_urls).
+    """
     soup = BeautifulSoup(paper_html, "lxml")
-    candidates: list[str] = []
+    raw: list[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if not href.startswith("http"):
-            continue
-        if not (href.lower().endswith(".pdf") or "pdf" in href.lower()):
-            continue
-        candidates.append(href)
-    if not candidates:
-        return None
-    if bank_homepage:
-        for href in candidates:
-            if host_matches(href, bank_homepage):
-                return href
-    for href in candidates:
-        if host_matches(href, "bis.org"):
-            return href
-    return candidates[0]
+        if href.startswith("http") and (href.lower().endswith(".pdf") or "pdf" in href.lower()):
+            raw.append(href)
+    for inp in soup.find_all("input", attrs={"name": "url"}):
+        value = inp.get("value", "")
+        if value.startswith("http"):
+            raw.append(value)
+    for match in re.finditer(r'https?://[^\s"\'<>]+?\.pdf', paper_html, re.IGNORECASE):
+        raw.append(match.group(0))
+    raw = list(dict.fromkeys(raw))  # dedupe, preserve discovery order
+    bank = [h for h in raw if bank_homepage and host_matches(h, bank_homepage)]
+    bis = [h for h in raw if h not in bank and host_matches(h, "bis.org")]
+    rest = [h for h in raw if h not in bank and h not in bis]
+    return bank + bis + rest
 
 
 def extract_official_pdf(paper_html: str, bank_homepage: str,
@@ -108,33 +127,59 @@ def extract_official_pdf(paper_html: str, bank_homepage: str,
 
 class RePEcDiscovery:
     def __init__(self, fetcher: Optional[Fetcher] = None,
-                 max_items_per_series: int = 5000):
+                 max_items_per_series: int = 5000,
+                 max_pages: int = 80):
         self.fetcher = fetcher or Fetcher()
         self.max_items = max_items_per_series
+        self.max_pages = max_pages
+
+    def _series_paper_urls(self, handle: str) -> list[str]:
+        """All paper-page URLs for a series, FOLLOWING IDEAS pagination.
+
+        IDEAS caps a series listing at ~200 items per page; older papers live on
+        numbered pages (`<handle>2.html`, `<handle>3.html`, ...). We walk pages
+        until one yields no new URLs (last page repeats / 404s) or a cap is hit,
+        so the full back-catalogue is discovered instead of only the ~200 newest.
+        """
+        base = f"{IDEAS}/s/{handle.replace(':', '/')}"
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for page in range(1, self.max_pages + 1):
+            url = f"{base}.html" if page == 1 else f"{base}{page}.html"
+            try:
+                html = self.fetcher.get_text(url)
+            except Exception:
+                break
+            new = [u for u in parse_series_page(html) if u not in seen]
+            if not new:                       # last page repeats or empties out
+                break
+            for u in new:
+                seen.add(u)
+                ordered.append(u)
+            if len(ordered) >= self.max_items:
+                break
+        return ordered[: self.max_items]
 
     def discover_bank(self, bank_code: str) -> Iterator[DocRecord]:
         bank = get_bank(bank_code)
         for handle, doc_type in SERIES.get(bank_code, []):
-            series_url = f"{IDEAS}/s/{handle.replace(':', '/')}.html"
-            try:
-                listing = self.fetcher.get_text(series_url)
-            except Exception:
-                continue
-            for paper_url in parse_series_page(listing)[: self.max_items]:
+            for paper_url in self._series_paper_urls(handle):
                 try:
                     paper_html = self.fetcher.get_text(paper_url)
                 except Exception:
                     continue
-                pdf = extract_pdf(paper_html, bank.homepage)
-                if pdf is None:
+                cands = extract_pdf_candidates(paper_html, bank.homepage)
+                if not cands:
                     continue
-                title = _title_of(paper_html)
+                title, pub_date = _paper_meta(paper_html)
                 yield DocRecord(
                     bank_code=bank_code,
                     doc_type=doc_type,
                     title=title,
-                    pdf_url=pdf,
+                    pdf_url=cands[0],
+                    alt_urls=cands[1:],          # tried by Storage if cands[0] fails
                     source_url=paper_url,
+                    date=pub_date,
                     provenance="repec_discovery",
                     mime_type="application/pdf",
                 )
@@ -148,3 +193,46 @@ def _title_of(paper_html: str) -> str:
     if soup.title:
         return soup.title.get_text(strip=True)
     return "(untitled)"
+
+
+def _iso_date(s: str) -> Optional[date]:
+    """Parse 'YYYY-MM-DD', 'YYYY/MM', or 'YYYY' into a date (missing parts -> 1)."""
+    parts = (s or "").strip().replace("/", "-").split("-")
+    try:
+        y = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 and parts[1] else 1
+        d = int(parts[2]) if len(parts) > 2 and parts[2] else 1
+        return date(y, m, d)
+    except (ValueError, IndexError):
+        return None
+
+
+def _paper_meta(paper_html: str) -> tuple[str, Optional[date]]:
+    """Extract (title, publication date) from an IDEAS paper page.
+
+    IDEAS embeds Highwire `citation_*` meta tags. Use `citation_publication_date`
+    (YYYY/MM — the real publication date), then `citation_year`. The bare `date`
+    meta is deliberately ignored: on IDEAS it is the RePEc record/index date
+    (uniformly YYYY-02-02), which previously dated ~16k papers to 2 February.
+    Falls back to the <h1> for the title.
+    """
+    soup = BeautifulSoup(paper_html, "lxml")
+    title = ""
+    full: Optional[date] = None
+    year: Optional[int] = None
+    for m in soup.find_all("meta"):
+        name = (m.get("name") or m.get("property") or "").lower()
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        if name == "citation_title":
+            title = content
+        elif name == "citation_publication_date" and full is None:
+            # The real publication date (YYYY/MM). Do NOT read the bare `date`
+            # meta: on IDEAS that is the RePEc record/index date (uniformly
+            # YYYY-02-02), which silently dated ~16k papers to 2 February.
+            full = _iso_date(content)
+        elif name == "citation_year" and year is None and content.isdigit():
+            year = int(content)
+    pub_date = full or (date(year, 1, 1) if year else None)
+    return (title or _title_of(paper_html)), pub_date

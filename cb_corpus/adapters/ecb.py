@@ -27,9 +27,32 @@ from .base import BankAdapter, register
 ECB = "https://www.ecb.europa.eu"
 ACCOUNTS_INDEX = ECB + "/press/accounts/html/index.en.html"
 BULLETIN_INDEX = ECB + "/press/economic-bulletin/html/all_releases.en.html"
+# Monetary-policy DECISIONS index (A1) — same lazy-load year-include mechanism
+# as accounts. Each year lists decisions (mp/legacy pr), accounts (mg) and
+# statements (is); we keep the decisions.
+MOPO_INDEX = ECB + "/press/govcdec/mopo/html/index.en.html"
+# Dedicated monetary-policy STATEMENT index (A2) — same lazy-load mechanism,
+# full history (the MOPO index only links statements for recent years).
+STATEMENT_INDEX = ECB + "/press/press_conference/monetary-policy-statement/html/index.en.html"
 
-_ACCOUNT_HTML_RE = re.compile(r"/press/accounts/\d{4}/html/ecb\.mg(\d{6})[~a-z0-9]*\.en\.html$",
+# Accounts use two URL conventions over time:
+#   legacy (2015-2017): /press/accounts/2015/html/mg151119.en.html
+#   modern (2017->)    : /press/accounts/2017/html/ecb.mg171123~<hash>.en.html
+# The `ecb.` prefix and the `~hash` suffix are both optional.
+_ACCOUNT_HTML_RE = re.compile(r"/press/accounts/\d{4}/html/(?:ecb\.)?mg(\d{6})[~a-z0-9]*\.en\.html$",
                               re.I)
+# Monetary-policy decision press releases (A1), same legacy/modern split:
+#   legacy (->2017): /press/pr/date/2015/html/pr151203.en.html
+#   modern         : /press/pr/date/2025/html/ecb.mp251218~<hash>.en.html
+# Matches mp/pr only (NOT mg=accounts/A3, NOT is=statements/A2) within the MOPO index.
+_DECISION_HTML_RE = re.compile(
+    r"/press/pr/date/\d{4}/html/(?:ecb\.)?(?:mp|pr)(\d{6})[~a-z0-9]*\.en\.html$", re.I)
+# Monetary-policy STATEMENT (A2) — the press-conference statement (with Q&A),
+# filename `is<YYMMDD>` (optionally `ecb.` prefixed), EN only. Path-agnostic
+# (statements live under /press/press_conference/monetary-policy-statement/, not
+# /press/pr/date/) so a path change doesn't silently drop them.
+_STATEMENT_HTML_RE = re.compile(
+    r"/(?:ecb\.)?is(\d{6})[~a-z0-9]*\.en\.html$", re.I)
 _BULLETIN_PDF_RE = re.compile(r"/pub/pdf/ecbu/eb(\d{4})(\d{2})\.en\.pdf$", re.I)
 _DATE_IN_HREF = re.compile(r"(\d{4})(\d{2})(\d{2})")
 
@@ -70,6 +93,51 @@ def parse_account_items(html: str, base_url: str = ACCOUNTS_INDEX) -> list[tuple
         if d is None:
             continue
         url = urljoin(base_url, href)
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append((d, url))
+    return out
+
+
+def parse_decision_items(html: str, base_url: str = MOPO_INDEX) -> list[tuple[date, str]]:
+    """From a MOPO year-include, return (date, html_url) for decision releases (A1).
+
+    Keeps only monetary-policy DECISIONS (mp/legacy pr); ignores accounts (mg, A3)
+    and statements (is, A2) that share the index.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    out: list[tuple[date, str]] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        m = _DECISION_HTML_RE.search(href)
+        if not m:
+            continue
+        d = _yymmdd_to_date(m.group(1))
+        if d is None:
+            continue
+        url = urljoin(base_url, href)
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append((d, url))
+    return out
+
+
+def parse_statement_items(html: str, base_url: str = MOPO_INDEX) -> list[tuple[date, str]]:
+    """From a MOPO year-include, return (date, html_url) for policy statements (A2)."""
+    soup = BeautifulSoup(html, "lxml")
+    out: list[tuple[date, str]] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        m = _STATEMENT_HTML_RE.search(a["href"])
+        if not m:
+            continue
+        d = _yymmdd_to_date(m.group(1))
+        if d is None:
+            continue
+        url = urljoin(base_url, a["href"])
         if url in seen:
             continue
         seen.add(url)
@@ -128,27 +196,53 @@ def parse_index(html: str, base_url: str = ECB,
 
 @register("ecb")
 class ECBAdapter(BankAdapter):
-    native_types = (DocType.A3, DocType.E4)
-    expected_per_year = {DocType.A3: 8, DocType.E4: 8}
+    native_types = (DocType.A1, DocType.A2, DocType.A3, DocType.E4)
+    expected_per_year = {DocType.A1: 8, DocType.A2: 8, DocType.A3: 8, DocType.E4: 8}
 
     def _discover_native(self, doc_type: DocType,
                          since: Optional[date]) -> Iterator[DocRecord]:
-        if doc_type == DocType.A3:
+        if doc_type == DocType.A1:
+            yield from self._discover_index(MOPO_INDEX, since, parse_decision_items,
+                                            DocType.A1, "Monetary policy decision")
+        elif doc_type == DocType.A2:
+            yield from self._discover_index(STATEMENT_INDEX, since, parse_statement_items,
+                                            DocType.A2, "Monetary policy statement")
+        elif doc_type == DocType.A3:
             yield from self._discover_accounts(since)
         elif doc_type == DocType.E4:
             yield from self._discover_bulletin(since)
 
+    def _discover_index(self, index_url, since, parse_fn, doc_type, title_prefix
+                        ) -> Iterator[DocRecord]:
+        """Walk a lazy-load year-include index and yield the items selected by
+        `parse_fn` — decisions (A1, MOPO index) or statements (A2, statement index)."""
+        idx = self._fetch_text(index_url, context=f"{doc_type.code}-index")
+        if idx is None:
+            return
+        for snippet in parse_year_includes(idx):
+            year_url = urljoin(index_url, snippet)
+            year_html = self._fetch_text(year_url, context=f"{doc_type.code}-year")
+            if year_html is None:
+                continue
+            for d, url in parse_fn(year_html, year_url):
+                if since and d < since:
+                    continue
+                yield DocRecord(
+                    bank_code="ecb", doc_type=doc_type,
+                    title=f"{title_prefix} {d.isoformat()}",
+                    pdf_url=url, source_url=year_url, date=d,
+                    provenance="bank_site",
+                )
+
     def _discover_accounts(self, since: Optional[date]) -> Iterator[DocRecord]:
-        try:
-            idx = self.fetcher.get_text(ACCOUNTS_INDEX)
-        except Exception:
+        idx = self._fetch_text(ACCOUNTS_INDEX, context="A3-index")
+        if idx is None:
             return
         includes = parse_year_includes(idx)
         for snippet in includes:
             year_url = urljoin(ACCOUNTS_INDEX, snippet)
-            try:
-                year_html = self.fetcher.get_text(year_url)
-            except Exception:
+            year_html = self._fetch_text(year_url, context="A3-year")
+            if year_html is None:
                 continue
             for d, url in parse_account_items(year_html, year_url):
                 if since and d < since:
@@ -165,9 +259,8 @@ class ECBAdapter(BankAdapter):
                 )
 
     def _discover_bulletin(self, since: Optional[date]) -> Iterator[DocRecord]:
-        try:
-            html = self.fetcher.get_text(BULLETIN_INDEX)
-        except Exception:
+        html = self._fetch_text(BULLETIN_INDEX, context="E4-index")
+        if html is None:
             return
         for d, title, pdf in parse_bulletin_pdfs(html):
             if since and d and d < since:

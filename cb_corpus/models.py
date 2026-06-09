@@ -23,6 +23,11 @@ class DocRecord:
     sha256: Optional[str] = None       # filled after download
     local_path: Optional[str] = None   # filled after download — the canonical artifact (PDF preferred)
     html_path: Optional[str] = None    # set when source was HTML — the original HTML sibling file
+    # Runtime-only ordered fallback PDF URLs (e.g. EconStor/SSRN copies) tried by
+    # Storage when the preferred `pdf_url` download fails (host 403 / dead link).
+    # NOT serialized and NOT part of doc_id, so identity/dedup stay stable on the
+    # preferred URL regardless of which copy actually downloaded.
+    alt_urls: list[str] = field(default_factory=list)
 
     @property
     def year(self) -> Optional[int]:
@@ -30,12 +35,20 @@ class DocRecord:
 
     @property
     def doc_id(self) -> str:
-        """Stable id used for filenames and dedup (independent of bytes)."""
-        basis = f"{self.bank_code}|{self.doc_type.code}|{self.date}|{self.pdf_url}"
+        """Stable id used for filenames and dedup.
+
+        Derived from IMMUTABLE identity only (bank, type, url) — deliberately NOT
+        the date. Date is mutable metadata (it gets corrected/enriched); binding
+        it into the id used to mean a date fix changed the id, creating a
+        duplicate + a file rename. With the date out, enriching a date is a pure
+        metadata update (no id churn). The url already uniquely identifies a doc.
+        """
+        basis = f"{self.bank_code}|{self.doc_type.code}|{self.pdf_url}"
         return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
 
     def to_row(self) -> dict:
         d = asdict(self)
+        d.pop("alt_urls", None)            # runtime-only, not persisted
         d["doc_type"] = self.doc_type.code
         d["date"] = self.date.isoformat() if self.date else None
         d["doc_id"] = self.doc_id

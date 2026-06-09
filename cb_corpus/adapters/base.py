@@ -12,6 +12,7 @@ listings (A1/A2/A3, B, E, F) by implementing `_discover_native`.
 """
 from __future__ import annotations
 
+import sys
 from abc import ABC
 from datetime import date
 from typing import Callable, Iterator, Optional
@@ -51,8 +52,34 @@ class BankAdapter(ABC):
         self.fetcher = fetcher or Fetcher()
         self._bis = BISSpeechIndex(self.fetcher)
         self._repec = RePEcDiscovery(self.fetcher)
+        #: discovery-time fetch failures recorded during this adapter's life.
+        #: A non-empty list means discovery was PARTIAL — the caller should
+        #: re-run (discovery is idempotent) rather than trust the result as
+        #: complete. This is what stops a transient blip from silently
+        #: dropping a whole year/listing.
+        self.errors: list[dict] = []
 
     # ---- discovery -----------------------------------------------------
+    def _fetch_text(self, url: str, *, context: str = "") -> Optional[str]:
+        """Fetch `url`, or record the failure and return None.
+
+        Use this instead of a bare ``try/except: continue`` so a failed listing
+        fetch is visible (logged + appended to ``self.errors``) instead of being
+        swallowed silently. Returning None lets the caller skip *this* item while
+        the recorded error signals that a re-run is needed for completeness.
+        """
+        try:
+            return self.fetcher.get_text(url)
+        except Exception as exc:  # noqa: BLE001 - recorded, not hidden
+            self.errors.append({
+                "bank": self.bank.code,
+                "context": context,
+                "url": url,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            print(f"!! discovery fetch FAILED [{self.bank.code} {context}]: "
+                  f"{url} -> {type(exc).__name__}", file=sys.stderr, flush=True)
+            return None
     def supported_types(self) -> tuple[DocType, ...]:
         extra = (DocType.C1, DocType.D1, DocType.D2)
         return tuple(dict.fromkeys(self.native_types + extra))

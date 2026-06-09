@@ -10,6 +10,7 @@ a speech back to a bank_code.
 """
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 
 
@@ -100,12 +101,83 @@ _BY_CODE = {b.code: b for b in BIS_63}
 _BY_BIS = {b.bis_institution: b for b in BIS_63}
 
 
+# Extra BIS speech-listing labels per bank: historical names, official renames,
+# native-language forms and variants the BIS has used over time. The primary
+# `bis_institution` above is one label per bank, which silently dropped whole
+# banks/eras whenever BIS wrote a different name (audit 2026-06, RC1 — see
+# DISCOVERY_AUDIT.md). Matching ANY of these labels recovers them.
+BIS_ALIASES: dict[str, tuple[str, ...]] = {
+    "lv": ("Bank of Latvia", "Bank of Lativa"),
+    "lt": ("Bank of Lithuania",),
+    "lu": ("Central Bank of Luxembourg",),
+    "ru": ("Bank of Russia", "Central Bank of Russia"),
+    "sa": ("Saudi Arabian Monetary Agency", "Saudi Arabian Monetary Authority"),
+    "tr": ("Central Bank of the Republic of Turkiye",),
+    "mk": ("National Bank of the Republic of Macedonia",),
+    "pt": ("Banco de Portugal",),
+    "si": ("Banka Slovenije",),
+    "ma": ("Bank of Morocco",),
+    "co": ("Banco de la Republica",),
+    "hu": ("Central Bank of Hungary", "National Bank of Hungary"),
+    "ph": ("Central Bank of the Philippines",),
+    "us": ("Board of Governors of the US Federal Reserve System",),
+    "es": ("Banco de Espana",),
+    "my": ("Bank Negara Malaysia",),
+    "nl": ("De Nederlandsche Bank",),
+    "pl": ("Narodowy Bank Polski",),
+    "sk": ("Narodna banka Slovenska",),
+}
+
+
+def normalize_institution(s: str) -> str:
+    """Fold a label/description to a robust match key.
+
+    Strips diacritics (Türkiye->turkiye, España->espana), drops apostrophes and
+    punctuation (People's->peoples, also neutralising mojibake bytes), lowercases
+    and collapses whitespace — so BIS encoding/diacritic quirks stop dropping
+    speeches.
+    """
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = "".join(c if (c.isalnum() or c.isspace()) else " " for c in s.lower())
+    return " ".join(s.split())
+
+
+def _bis_labels(bank: Bank) -> tuple[str, ...]:
+    return (bank.bis_institution,) + BIS_ALIASES.get(bank.code, ())
+
+
+# (normalized_label, primary_label) for every primary + alias label, sorted
+# longest-normalized-first so the most specific institution wins on a substring
+# match. Maps to the bank's PRIMARY label so bank_for_bis_institution resolves it.
+_BIS_LABEL_INDEX: list[tuple[str, str]] = sorted(
+    {(normalize_institution(lbl), b.bis_institution)
+     for b in BIS_63 for lbl in _bis_labels(b)},
+    key=lambda t: len(t[0]), reverse=True,
+)
+
+
 def get_bank(code: str) -> Bank:
     return _BY_CODE[code]
 
 
 def bank_for_bis_institution(label: str) -> Bank | None:
     return _BY_BIS.get(label)
+
+
+def match_bis_institution(head_text: str) -> str:
+    """Return the PRIMARY bis_institution label whose primary/alias form appears
+    in `head_text` (longest match wins), or "" if none. Alias-aware + accent/
+    apostrophe-insensitive."""
+    nhead = normalize_institution(head_text)
+    if not nhead:
+        return ""
+    for nlabel, primary in _BIS_LABEL_INDEX:
+        if nlabel and nlabel in nhead:
+            return primary
+    return ""
 
 
 assert len(BIS_63) == 63, f"expected 63 banks, got {len(BIS_63)}"

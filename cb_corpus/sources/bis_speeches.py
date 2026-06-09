@@ -111,20 +111,15 @@ def _guess_institution(text: str) -> str:
 
     Looks only in the SPEAKER half of the description (the text before the
     first event-introducer like "at" / "organised by"). Picks the LONGEST
-    registry label that matches. Returns "" if no match.
+    registry label (primary OR historical/renamed alias) that matches, accent-
+    and apostrophe-insensitively. Returns the bank's PRIMARY label, or "".
     """
-    from ..banks import BIS_63
+    from ..banks import match_bis_institution
     if not text:
         return ""
     m = _SPEAKER_END_RE.search(text)
     head = text[:m.start()] if m else text
-    lower = head.lower()
-    best = ""
-    for bank in BIS_63:
-        label = bank.bis_institution
-        if label.lower() in lower and len(label) > len(best):
-            best = label
-    return best
+    return match_bis_institution(head)
 
 
 def parse_detail(html: str) -> tuple[str, str]:

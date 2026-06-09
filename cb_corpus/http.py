@@ -42,6 +42,16 @@ class Fetcher:
                 time.sleep(wait)
         self._last_hit[host] = time.monotonic()
 
+    def throttle(self, url: str) -> None:
+        """Public per-host throttle for work done OUTSIDE this fetcher.
+
+        Headless-Chrome PDF rendering fetches the live URL itself, bypassing
+        the throttle on `get()`. Calling this before a render keeps the host's
+        rate budget shared between our requests and Chrome's, so a single
+        HTML doc (raw fetch + render) doesn't double-hammer the server.
+        """
+        self._throttle(host_of(url))
+
     def get(self, url: str, *, allow_redirects: bool = True) -> requests.Response:
         host = host_of(url)
         last_exc: Exception | None = None
@@ -67,13 +77,46 @@ class Fetcher:
         raise RuntimeError(f"GET failed after retries: {url}") from last_exc
 
     def get_text(self, url: str) -> str:
-        return self.get(url).text
+        # Route through get_bytes so the TOTAL download deadline applies here too
+        # — a slow-trickle listing/detail page must fail fast, not hang forever.
+        body, _ = self.get_bytes(url)
+        return body.decode("utf-8", errors="replace")
 
     def get_bytes(self, url: str) -> tuple[bytes, str]:
-        """Return (body, mime_type). mime_type is the bare content-type (no charset)."""
-        r = self.get(url)
-        mime = (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-        return r.content, mime
+        """Return (body, mime_type), streaming with a TOTAL download deadline.
+
+        `timeout` only bounds inactivity between bytes, so a slow-trickle host can
+        stall a download for minutes/forever without ever tripping it (observed on
+        some bank PDF hosts). We stream and abort once `download_timeout` total has
+        elapsed, then retry/backoff like `get()`. mime is the bare content-type.
+        """
+        host = host_of(url)
+        last_exc: Exception | None = None
+        for attempt in range(self.cfg.max_retries):
+            self._throttle(host)
+            try:
+                r = self.session.get(url, timeout=self.cfg.timeout, stream=True)
+                r.raise_for_status()
+                deadline = time.monotonic() + self.cfg.download_timeout
+                chunks: list[bytes] = []
+                for chunk in r.iter_content(chunk_size=65536):
+                    chunks.append(chunk)
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"download exceeded {self.cfg.download_timeout}s: {url}")
+                mime = (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+                return b"".join(chunks), mime
+            except requests.exceptions.HTTPError as exc:
+                code = getattr(exc.response, "status_code", "?")
+                if code in (429, 403, 503):
+                    print(f"!! HTTP {code} on {host} (attempt {attempt + 1}): {url}",
+                          file=sys.stderr, flush=True)
+                last_exc = exc
+                time.sleep(2 ** attempt)
+            except Exception as exc:  # noqa: BLE001 - retried below
+                last_exc = exc
+                time.sleep(2 ** attempt)
+        raise RuntimeError(f"GET bytes failed after retries: {url}") from last_exc
 
     def head(self, url: str) -> requests.Response:
         host = host_of(url)

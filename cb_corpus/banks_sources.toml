@@ -18,11 +18,9 @@ sitemap_url = "https://www.snb.ch/public/seo/sitemap.xml"
 A2 = "/publikationen/medienmitteilungen/.*\\.de\\.pdf$"
 E2 = "/publikationen/finanzstabilitaetsbericht/.*\\.pdf$"
 
-[au.sitemap]
-sitemap_url = "https://www.rba.gov.au/sitemap.xml"
-[au.sitemap.patterns]
-A3 = "/monetary-policy/rba-board-minutes/.*\\.html$"
-E1 = "/publications/smp/.*\\.html$"
+# NOTE: `au` is handled by the hand-written RBAAdapter (A1/A3/E1 via per-year
+# listing pages), not by a sitemap — the RBA sitemap.xml was a frozen 2017
+# snapshot. See cb_corpus/adapters/rba.py.
 
 [ca.sitemap]
 sitemap_url = "https://www.bankofcanada.ca/wp-sitemap.xml"

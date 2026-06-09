@@ -16,8 +16,11 @@ content sha256.
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -38,6 +41,30 @@ def ext_for_mime(mime: str) -> str:
     return _EXT_FOR_MIME.get((mime or "").lower(), "bin")
 
 
+def _sweep_chrome_profiles(data_dir: Path, keep: Path) -> None:
+    """Remove leftover per-PID Chrome profiles whose process is gone.
+
+    Profiles are named `.chrome-profile-<pid>`; a crashed/killed run leaves its
+    profile behind, so on startup we drop any whose PID is no longer alive
+    (best-effort, never raises). `keep` (our own profile) is preserved.
+    """
+    try:
+        candidates = list(data_dir.glob(".chrome-profile-*"))
+    except OSError:
+        return
+    for p in candidates:
+        if p == keep:
+            continue
+        try:
+            pid = int(p.name.rsplit("-", 1)[-1])
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)          # raises if the PID is not alive
+        except OSError:
+            shutil.rmtree(p, ignore_errors=True)
+
+
 class Storage:
     def __init__(self, config: Optional[Config] = None,
                  fetcher: Optional[Fetcher] = None):
@@ -48,6 +75,15 @@ class Storage:
         self._hashes: set[str] = set()
         self._ids: set[str] = set()
         self._urls: set[str] = set()
+        # Chrome profile reused across every render in THIS process (a fresh
+        # per-call temp profile is ~10x slower). Keyed by PID so multiple
+        # concurrent download processes don't fight over one profile lock —
+        # this lets HTML→PDF renders run in parallel. Lives under data/
+        # (git-ignored). Purged on exit (atexit) and stale ones swept at start,
+        # so the per-PID dirs don't accumulate (they can reach hundreds of MB).
+        self._chrome_profile = self.cfg.data_dir / f".chrome-profile-{os.getpid()}"
+        _sweep_chrome_profiles(self.cfg.data_dir, keep=self._chrome_profile)
+        atexit.register(shutil.rmtree, self._chrome_profile, ignore_errors=True)
         self._load_existing()
 
     # -- manifest --------------------------------------------------------
@@ -93,12 +129,30 @@ class Storage:
         if rec.doc_id in self._ids:
             return "skip:already-indexed"
         if dry_run:
+            # In-memory only: dedup within this pass for accurate counts, but
+            # NEVER write to the manifest. A persisted dry-run row (local_path
+            # =null, sha256=null) would be re-loaded by the next real run and
+            # make save() skip it as "already-indexed" — the document would
+            # then never be downloaded. (This is exactly how a 155-row
+            # placeholder pollution happened once.)
             self._ids.add(rec.doc_id)
             self._urls.add(rec.pdf_url)
-            self._append(rec)
             return "dry-run:indexed"
 
-        content, mime = self.fetcher.get_bytes(rec.pdf_url)
+        # Try the preferred URL, then any fallback copies (EconStor/SSRN/cached)
+        # so a 403/dead preferred host doesn't lose the document. doc_id stays
+        # bound to rec.pdf_url, so dedup/identity are unaffected by which copy won.
+        content = None
+        mime = ""
+        for url in [rec.pdf_url, *(rec.alt_urls or [])]:
+            try:
+                content, mime = self.fetcher.get_bytes(url)
+                break
+            except Exception:
+                content = None
+        if content is None:
+            raise RuntimeError(
+                f"all {1 + len(rec.alt_urls or [])} candidate URL(s) failed for {rec.pdf_url}")
         if mime:
             rec.mime_type = mime
         digest = hashlib.sha256(content).hexdigest()
@@ -126,7 +180,11 @@ class Storage:
                 # doc_id is derived from immutable fields, so same as rec.doc_id.
                 pdf_path = self.target_path(pdf_rec)
                 try:
-                    render_url_to_pdf(rec.pdf_url, pdf_path)
+                    # Chrome re-fetches the live URL; share the host's rate
+                    # budget so this render + the get_bytes above don't burst.
+                    self.fetcher.throttle(rec.pdf_url)
+                    render_url_to_pdf(rec.pdf_url, pdf_path,
+                                      user_data_dir=str(self._chrome_profile))
                     rec.mime_type = "application/pdf"
                     path = pdf_path
                 except Exception:

@@ -167,6 +167,31 @@ def test_guess_institution_ignores_host_institution_after_at():
     assert _guess_institution(desc) == "Deutsche Bundesbank"
 
 
+def test_guess_institution_recovers_banks_via_aliases():
+    """RC1: BIS labels that differ from our primary registry name must still map
+    (these whole banks/eras were silently dropped before the alias table)."""
+    # BIS writes "Bank of Latvia"; registry primary is "Latvijas Banka".
+    inst = _guess_institution("Speech by G. Razans, Governor of the Bank of Latvia, in Riga.")
+    assert bank_for_bis_institution(inst).code == "lv"
+    # Pre-2010 BIS label for the Fed.
+    inst = _guess_institution(
+        "Speech by Ben Bernanke, Chairman of the Board of Governors of the US "
+        "Federal Reserve System, at a conference.")
+    assert bank_for_bis_institution(inst).code == "us"
+    # Renamed institutions (Türkiye endonym, North Macedonia).
+    assert bank_for_bis_institution(_guess_institution(
+        "Remarks by the Governor of the Central Bank of the Republic of Turkiye, in Ankara.")).code == "tr"
+
+
+def test_guess_institution_is_accent_and_apostrophe_insensitive():
+    # Diacritic in the speaker half must not break the match.
+    assert bank_for_bis_institution(_guess_institution(
+        "Speech by the Governor of the Central Bank of the Republic of Türkiye.")).code == "tr"
+    # Curly apostrophe (U+2019) vs the straight one in the registry.
+    assert bank_for_bis_institution(_guess_institution(
+        "Speech by the Governor of the People’s Bank of China, in Beijing.")).code == "cn"
+
+
 # ---- RePEc discovery -------------------------------------------------
 REPEC_SERIES = """
 <html><body>
@@ -211,12 +236,376 @@ def test_repec_extract_pdf_prefers_bank_then_falls_back():
     assert extract_pdf("<html></html>", "example.org") is None
 
 
+# The real IDEAS markup: the PDF lives in an <input name="url">, never an
+# <a href>. This is the page shape that previously yielded 0 working papers.
+REPEC_PAPER_INPUT = """
+<html><body><h1>Monetary policy and the term structure</h1>
+<INPUT TYPE="radio" NAME="url"
+ VALUE="https://www.ecb.europa.eu//pub/pdf/scpwps/ecbwp722.pdf" checked>
+<B>File URL:</B> <span style="word-break:break-all">https://www.ecb.europa.eu//pub/pdf/scpwps/ecbwp722.pdf</span>
+</body></html>
+"""
+
+
+def test_repec_extract_pdf_reads_ideas_input_form():
+    # The canonical download form (no <a href>) must still yield the PDF.
+    pdf = extract_pdf(REPEC_PAPER_INPUT, "ecb.europa.eu")
+    assert pdf == "https://www.ecb.europa.eu//pub/pdf/scpwps/ecbwp722.pdf"
+    # And it is preferred because it sits on the bank's own domain.
+    assert extract_pdf(REPEC_PAPER_INPUT, "example.org").endswith("ecbwp722.pdf")
+
+
+def test_repec_extract_pdf_regex_fallback_on_bare_url():
+    # No <a> and no <input>, but a bare absolute .pdf URL in the markup.
+    html = '<html><body>see https://www.snb.ch/n/some/working_paper_2020_01.pdf here</body></html>'
+    assert extract_pdf(html, "snb.ch").endswith("working_paper_2020_01.pdf")
+
+
+def test_repec_pagination_walks_pages_until_no_new():
+    """Series listings cap at ~200/page; discovery must follow numbered pages
+    and stop when a page yields nothing new (last page repeats / 404s)."""
+    from cb_corpus.sources.repec import RePEcDiscovery, IDEAS
+    pages = {
+        f"{IDEAS}/s/ecb/ecbwps.html":
+            '<a href="/p/ecb/ecbwps/0001.html">a</a><a href="/p/ecb/ecbwps/0002.html">b</a>',
+        f"{IDEAS}/s/ecb/ecbwps2.html":
+            '<a href="/p/ecb/ecbwps/0003.html">c</a>',
+        # page 3 repeats page 2 -> 0 new -> walk stops here
+        f"{IDEAS}/s/ecb/ecbwps3.html":
+            '<a href="/p/ecb/ecbwps/0003.html">c</a>',
+    }
+
+    class FakeFetcher:
+        def get_text(self, url):
+            return pages.get(url, "")  # unknown page -> empty -> 0 new -> stop
+
+    d = RePEcDiscovery(FakeFetcher())
+    got = [u.split("/")[-1] for u in d._series_paper_urls("ecb:ecbwps")]
+    assert got == ["0001.html", "0002.html", "0003.html"]
+
+
+def test_repec_paper_meta_extracts_title_and_date():
+    """IDEAS citation_* meta tags give a real title + date; without them every
+    working paper lands under year 0. The bare `date` meta (02-02 index date)
+    is ignored, so year-only metadata falls back to Jan 1, not 2 Feb."""
+    from cb_corpus.sources.repec import _paper_meta
+    html = ('<html><head>'
+            '<meta name="citation_title" content="Shocks and frictions">'
+            '<meta name="date" content="2007-02-02">'
+            '<meta name="citation_year" content="2007">'
+            '</head><body><h1>fallback h1</h1></body></html>')
+    title, d = _paper_meta(html)
+    assert title == "Shocks and frictions"
+    assert (d.year, d.month, d.day) == (2007, 1, 1)        # date meta ignored
+    # Year-only fallback + <h1> title fallback.
+    t2, d2 = _paper_meta('<meta name="citation_year" content="2015"><h1>Only H1</h1>')
+    assert t2 == "Only H1" and d2 == date(2015, 1, 1)
+    # No date metadata -> None (caller stores undated rather than crashing).
+    assert _paper_meta("<html><h1>x</h1></html>")[1] is None
+
+
+def test_repec_extract_pdf_candidates_ordered_by_preference():
+    """Candidates ordered bank-domain → bis.org → rest, so Storage can fall back
+    when the preferred host blocks us (403)."""
+    from cb_corpus.sources.repec import extract_pdf_candidates
+    html = """<html><body>
+    <a href="https://ideas.repec.org/cached/x.pdf">cached</a>
+    <a href="https://www.bis.org/review/r1.pdf">bis</a>
+    <a href="https://www.bankofengland.co.uk/wp/0001.pdf">bank</a>
+    <a href="https://econstor.eu/y.pdf">econstor</a>
+    </body></html>"""
+    c = extract_pdf_candidates(html, "bankofengland.co.uk")
+    assert c[0].startswith("https://www.bankofengland.co.uk")   # bank first
+    assert c[1].startswith("https://www.bis.org")               # bis second
+    assert set(c[2:]) == {"https://ideas.repec.org/cached/x.pdf",
+                          "https://econstor.eu/y.pdf"}           # rest
+
+
+def test_storage_tries_alt_urls_on_download_failure(tmp_path):
+    """When the preferred PDF 403s, Storage downloads a fallback copy — and keeps
+    doc_id bound to the preferred URL (idempotence)."""
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    calls = []
+
+    def fake_get_bytes(url):
+        calls.append(url)
+        if "preferred" in url:
+            raise RuntimeError("403 Forbidden")
+        return (b"%PDF-1.4 fallback", "application/pdf")
+
+    st.fetcher.get_bytes = fake_get_bytes
+    rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="x",
+                    pdf_url="https://blocked.fr/preferred.pdf",
+                    alt_urls=["https://econstor.eu/fallback.pdf"],
+                    date=date(2024, 1, 1))
+    assert st.save(rec) == "saved"
+    assert calls == ["https://blocked.fr/preferred.pdf",
+                     "https://econstor.eu/fallback.pdf"]        # tried in order
+    assert Path(rec.local_path).read_bytes().startswith(b"%PDF")
+    assert rec.pdf_url == "https://blocked.fr/preferred.pdf"    # citation/doc_id unchanged
+    # alt_urls is runtime-only — never serialized to the manifest.
+    assert "alt_urls" not in rec.to_row()
+
+
+def test_wayback_cdx_parse_and_raw_url():
+    """Wayback recovery: CDX rows -> (original, timestamp); raw_url uses `id_`."""
+    from cb_corpus.sources.wayback import cdx_pdfs, raw_url
+
+    class FakeF:
+        def get_text(self, url):
+            return json.dumps([["original", "timestamp"],
+                               ["http://boe/1992/wp05.pdf", "20170812133136"],
+                               ["http://boe/1993/wp01.pdf", "20160101000000"]])
+
+    got = cdx_pdfs(FakeF(), "boe")
+    assert got == [("http://boe/1992/wp05.pdf", "20170812133136"),
+                   ("http://boe/1993/wp01.pdf", "20160101000000")]
+    assert raw_url("http://boe/a.pdf", "2017") == "https://web.archive.org/web/2017id_/http://boe/a.pdf"
+
+
+def test_wayback_for_url_latest_or_none():
+    """Per-URL recovery (opaque paths): latest snapshot, or None if not archived."""
+    from cb_corpus.sources.wayback import wayback_for_url
+
+    class Has:
+        def get_text(self, url):
+            return json.dumps([["timestamp"], ["20170811213710"]])
+
+    class Empty:
+        def get_text(self, url):
+            return json.dumps([["timestamp"]])
+
+    assert wayback_for_url(Has(), "http://riksbank.com/upload/993/x.pdf") == \
+        "https://web.archive.org/web/20170811213710id_/http://riksbank.com/upload/993/x.pdf"
+    assert wayback_for_url(Empty(), "http://riksbank.com/upload/none.pdf") is None
+
+
+def test_boe_wp_sitemap_parser_and_pdf_url():
+    """BoE working papers from the bank's own sitemap -> live PDF urls."""
+    from cb_corpus.sources.boe_wp import sitemap_papers
+
+    class FakeF:
+        def get_text(self, url):
+            return ('<a href="/working-paper/2006/uk-monetary-regimes">x</a>'
+                    '<a href="/working-paper/2007/a-state-space-approach">y</a>'
+                    '<a href="/news/2020/not-a-paper">skip</a>')
+
+    got = sitemap_papers(FakeF())
+    assert len(got) == 2
+    d, title, pdf = got[0]
+    assert d.year == 2006
+    assert pdf == ("https://www.bankofengland.co.uk/-/media/boe/files/"
+                   "working-paper/2006/uk-monetary-regimes.pdf")
+    assert len(sitemap_papers(FakeF(), years={2007})) == 1   # year filter
+
+
+def test_boe_generic_doc_pages_and_page_doc():
+    """Generic BoE recovery: sitemap filter + page->PDF (or HTML-only)."""
+    from cb_corpus.sources.boe_wp import doc_pages, page_doc
+
+    class FakeF:
+        def __init__(self, pages):
+            self.pages = pages
+
+        def get_text(self, url):
+            return self.pages[url]
+
+    sm = ('<a href="/minutes/2010/monetary-policy-committee-january-2010">a</a>'
+          '<a href="/minutes/2010/financial-policy-committee-x">fpc skip</a>'
+          '<a href="/minutes/1998/monetary-policy-committee-may-1998">b</a>')
+    f = FakeF({"https://www.bankofengland.co.uk/sitemap/minutes": sm})
+    pages = doc_pages(f, "minutes", r"/minutes/\d{4}/monetary-policy-committee")
+    assert len(pages) == 2 and {d.year for d, _ in pages} == {2010, 1998}  # MPC only
+
+    pdf_page = ('<html><head><meta property="og:title" content="MPC minutes"></head>'
+                '<body><a href="/-/media/boe/files/minutes/2010/jan.pdf">PDF</a></body></html>')
+    f2 = FakeF({"https://www.bankofengland.co.uk/p": pdf_page})
+    title, pdf = page_doc(f2, "https://www.bankofengland.co.uk/p")
+    assert title == "MPC minutes" and pdf.endswith("/minutes/2010/jan.pdf")
+
+    f3 = FakeF({"https://www.bankofengland.co.uk/h": "<html><title>T</title>no pdf</html>"})
+    assert page_doc(f3, "https://www.bankofengland.co.uk/h")[1] is None   # HTML-only
+
+
+def test_ecb_pub_section_include_and_date_formats():
+    """ECB primary source = per-section/year static include; None signals fallback."""
+    from cb_corpus.sources.ecb_pub import section_include_docs, date_from_url
+
+    class FakeF:
+        def get_text(self, url):
+            if "/inter/date/2024/" in url:
+                return ('<a href="/press/inter/date/2024/html/ecb.in240115~ab.en.html">x</a>'
+                        '<a href="/press/inter/date/2024/html/sp240220_content.en.html">y</a>'
+                        '<a href="/x.fr.html">non-en skip</a>')
+            raise RuntimeError("404")
+
+    f = FakeF()
+    docs = section_include_docs(f, "inter", 2024, exts=(".en.html",))
+    assert len(docs) == 2 and docs[0].startswith("https://www.ecb.europa.eu/press/inter/")
+    assert section_include_docs(f, "fsr", 2024) is None       # not served -> triggers fallback
+    # section-aware date parsing resolves the YYYYMM/YYMMDD ambiguity ("200612")
+    assert date_from_url("x/ecb.fsr200612~h.en.pdf", "yyyymm").isoformat() == "2006-12-01"
+    assert date_from_url("x/ecb.in200612~h.en.html", "yymmdd").isoformat() == "2020-06-12"
+
+
+def test_repec_paper_meta_uses_publication_date_not_record_date():
+    """Real pub date = citation_publication_date (YYYY/MM); the bare `date` meta
+    (RePEc index date, uniformly YYYY-02-02) must be ignored."""
+    from cb_corpus.sources.repec import _paper_meta
+    html = ('<html><head>'
+            '<meta name="date" content="2007-02-02">'
+            '<meta name="citation_publication_date" content="2007/09">'
+            '<meta name="citation_year" content="2007">'
+            '<meta name="citation_title" content="A paper">'
+            '</head></html>')
+    title, d = _paper_meta(html)
+    assert title == "A paper"
+    assert d.isoformat() == "2007-09-01"          # Sept 2007, NOT 2 Feb
+    # year-only fallback must not fall back to the 02-02 record date
+    _, d2 = _paper_meta('<meta name="citation_year" content="2010">'
+                        '<meta name="date" content="2010-02-02">')
+    assert d2.isoformat() == "2010-01-01"
+
+
+# ECB accounts use two URL conventions; the parser must accept BOTH, else the
+# 2015-2017 backfill (legacy `mg...`) is silently dropped (only `ecb.mg...` kept).
+ECB_ACCOUNTS_MIXED = """
+<html><body>
+<a href="/press/accounts/2015/html/mg150219.en.html">19 Feb 2015 (legacy form)</a>
+<a href="/press/accounts/2017/html/ecb.mg171123.en.html">23 Nov 2017 (modern form)</a>
+<a href="/press/accounts/2021/html/ecb.mg210729~b83737e3b5.en.html">29 Jul 2021 (modern + hash)</a>
+</body></html>
+"""
+
+
+def test_ecb_account_parser_accepts_legacy_and_modern_urls():
+    from cb_corpus.adapters.ecb import parse_account_items
+    items = parse_account_items(ECB_ACCOUNTS_MIXED)
+    got = {d.isoformat() for d, _ in items}
+    # All three conventions must be discovered, not just the `ecb.` prefixed ones.
+    assert got == {"2015-02-19", "2017-11-23", "2021-07-29"}
+
+
+def test_ecb_decision_parser_keeps_decisions_only():
+    """A1 = monetary-policy decisions (modern mp / legacy pr) — NOT accounts (mg,
+    A3) nor statements (is, A2) that share the MOPO index."""
+    from cb_corpus.adapters.ecb import parse_decision_items
+    html = ('<html><body>'
+            '<a href="/press/pr/date/2025/html/ecb.mp251218~58b0e415a6.en.html">modern</a>'
+            '<a href="/press/pr/date/2015/html/pr151203.en.html">legacy</a>'
+            '<a href="/press/accounts/2026/html/ecb.mg260122~x.en.html">account A3</a>'
+            '<a href="/press/pr/date/2025/html/ecb.is251030~y.en.html">statement A2</a>'
+            '</body></html>')
+    got = {d.isoformat() for d, _ in parse_decision_items(html)}
+    assert got == {"2025-12-18", "2015-12-03"}
+
+
+def test_ecb_statement_parser_keeps_is_only():
+    """A2 = monetary-policy statements (is prefix, EN only) — not decisions/accounts."""
+    from cb_corpus.adapters.ecb import parse_statement_items
+    P = "/press/press_conference/monetary-policy-statement/2025/html"
+    html = ('<html><body>'
+            f'<a href="{P}/ecb.is250911~a13675b834.en.html">EN stmt</a>'
+            f'<a href="{P}/ecb.is250911~a13675b834.bg.html">BG (skip)</a>'
+            '<a href="/press/pr/date/2025/html/ecb.mp251218~x.en.html">decision (skip)</a>'
+            '</body></html>')
+    got = [(d.isoformat(), u) for d, u in parse_statement_items(html)]
+    assert len(got) == 1 and got[0][0] == "2025-09-11" and got[0][1].endswith(".en.html")
+
+
 # ---- Fed / ECB native parsers ---------------------------------------
 def test_fed_minutes_parser():
     html = '<a href="/monetarypolicy/files/fomcminutes20240131.pdf">Minutes</a>'
     got = parse_minutes_links(html)
     assert got and got[0][0] == date(2024, 1, 31)
     assert got[0][1].endswith("fomcminutes20240131.pdf")
+
+
+def test_fed_statement_parser_modern_and_legacy_paths():
+    """A2 FOMC statements: modern + legacy paths, excluding a1 (impl note) / b."""
+    from cb_corpus.adapters.fed import parse_statement_links
+    html = ('<a href="/newsevents/pressreleases/monetary20150128a.htm">modern</a>'
+            '<a href="/newsevents/press/monetary/20080130a.htm">legacy path</a>'
+            '<a href="/newsevents/pressreleases/monetary20150128a1.htm">impl note skip</a>'
+            '<a href="/newsevents/pressreleases/monetary20150128b.htm">discount skip</a>')
+    got = sorted(d.isoformat() for d, _ in parse_statement_links(html))
+    assert got == ["2008-01-30", "2015-01-28"]
+
+
+def test_fed_statement_parser_includes_historical_boarddocs():
+    """A2: pre-2006 statements live at /boarddocs/press/monetary/<yr>/<date>/ -> default.htm."""
+    from cb_corpus.adapters.fed import parse_statement_links
+    html = ('<a href="/newsevents/pressreleases/monetary20150128a.htm">modern</a>'
+            '<a href="/boarddocs/press/monetary/2003/20030129/default.htm">historical</a>'
+            '<a href="/boarddocs/press/monetary/2003/20030129/">same, dir (dedup)</a>')
+    pairs = parse_statement_links(html)
+    assert sorted(set(d.isoformat() for d, _ in pairs)) == ["2003-01-29", "2015-01-28"]
+    # historical entry resolves to the default.htm page
+    assert any(u.endswith("/boarddocs/press/monetary/2003/20030129/default.htm")
+               for _, u in pairs)
+
+
+def test_fed_sep_parser_modern_and_historical():
+    """F1: modern `fomcprojtabl<date>.pdf` (2021+) + historical `FOMC<date>SEPcompilation.pdf`."""
+    from cb_corpus.adapters.fed import parse_sep_links
+    html = ('<a href="/monetarypolicy/files/fomcprojtabl20210317.pdf">x</a>'
+            '<a href="/monetarypolicy/files/FOMC20150318SEPcompilation.pdf">y</a>'
+            '<a href="/monetarypolicy/files/FOMC20150318SEPkey.pdf">z</a>'        # key -> skip
+            '<a href="/monetarypolicy/files/FOMC20030624gbpt20030618.pdf">g</a>')  # greenbook -> skip
+    got = sorted(d.isoformat() for d, _ in parse_sep_links(html))
+    assert got == ["2015-03-18", "2021-03-17"]
+
+
+def test_fed_minutes_parser_modern_and_historical():
+    """A3: modern `fomcminutes<date>.pdf` (PDF) + historical `/fomc/minutes/<date>.htm`."""
+    from cb_corpus.adapters.fed import parse_minutes_links
+    html = ('<a href="/monetarypolicy/files/fomcminutes20150128.pdf">modern</a>'
+            '<a href="/fomc/minutes/20020130.htm">historical html</a>')
+    got = sorted(d.isoformat() for d, _ in parse_minutes_links(html))
+    assert got == ["2002-01-30", "2015-01-28"]
+
+
+def test_rba_decision_parser_reads_date_from_link_text():
+    """RBA A1: decision date is in the link TEXT ('9 December 2025'), not the URL."""
+    from cb_corpus.adapters.rba import parse_rba_decisions
+    html = ('<a href="/media-releases/2025/mr-25-33.html">9 December 2025</a>'
+            '<a href="/media-releases/2025/mr-25-03.html">18 February 2025</a>'
+            '<a href="/media-releases/2025/mr-25-99.html">Quarterly bulletin</a>'  # bad date -> skip
+            '<a href="/speeches/2025/sp-gov-2025.html">9 December 2025</a>')        # not a decision -> skip
+    got = sorted(d.isoformat() for d, _ in parse_rba_decisions(html))
+    assert got == ["2025-02-18", "2025-12-09"]
+
+
+def test_rba_adapter_overrides_au():
+    from cb_corpus.adapters.rba import RBAAdapter
+    from cb_corpus.taxonomy import DocType
+    au = get_adapter("au")
+    assert isinstance(au, RBAAdapter)
+    # A3 (minutes) + E1 (SMP) are covered natively now — not via the (removed,
+    # frozen-2017) TOML sitemap.
+    assert DocType.A3 in au.native_types and DocType.E1 in au.native_types
+
+
+def test_rba_minutes_parser_handles_both_url_date_formats():
+    """A3 date is in the URL: modern YYYY-MM-DD and legacy DDMMYYYY."""
+    from cb_corpus.adapters.rba import parse_rba_minutes
+    html = ('<a href="/monetary-policy/rba-board-minutes/2025/2025-11-04.html">x</a>'
+            '<a href="/monetary-policy/rba-board-minutes/2010/05102010.html">y</a>'   # 5 Oct 2010
+            '<a href="/monetary-policy/rba-board-minutes/2010/index.html">skip</a>')
+    got = sorted(d.isoformat() for d, _ in parse_rba_minutes(html))
+    assert got == ["2010-10-05", "2025-11-04"]
+
+
+def test_rba_smp_parser_keeps_only_quarterly_issues():
+    """E1: only the issue overview /smp/<year>/<feb|may|aug|nov>/ — not sub-pages."""
+    from cb_corpus.adapters.rba import parse_rba_smp
+    html = ('<a href="/publications/smp/2026/feb/">x</a>'
+            '<a href="/publications/smp/2025/nov/">y</a>'
+            '<a href="/publications/smp/2026/boxes.html">skip sub-page</a>'
+            '<a href="/publications/smp/2026/feb/outlook.html">skip chapter</a>')
+    got = sorted((d.isoformat()) for d, _ in parse_rba_smp(html))
+    assert got == ["2025-11-01", "2026-02-01"]
 
 
 def test_ecb_index_parser():
@@ -228,11 +617,15 @@ def test_ecb_index_parser():
 # ---- declarative adapters from TOML ---------------------------------
 def test_toml_factories_loaded_for_majors():
     # banks_sources.toml ships with at least these.
-    for code in ("ch", "au", "ca", "fr", "jp"):
+    for code in ("ch", "ca", "fr", "jp"):
         assert code in INSTANCE_FACTORIES
-    # Hand-written ADAPTERS still override TOML for us/ecb.
+    # Hand-written ADAPTERS override TOML for us/ecb/au.
     from cb_corpus.adapters.fed import FedAdapter
+    from cb_corpus.adapters.rba import RBAAdapter
     assert isinstance(get_adapter("us"), FedAdapter)
+    # `au` moved from a (frozen-2017) TOML sitemap to the RBAAdapter class.
+    assert isinstance(get_adapter("au"), RBAAdapter)
+    assert "au" not in INSTANCE_FACTORIES
 
 
 def test_sitemap_parser_handles_urlset_and_index():
@@ -317,16 +710,51 @@ def test_storage_indexes_any_url_in_dry_run(tmp_path):
 
 
 def test_storage_tracks_known_urls_for_rerun_dedup(tmp_path):
-    """Re-runs must short-circuit before the BIS detail-page fetch."""
+    """Re-runs must short-circuit before the BIS detail-page fetch — populated
+    by a REAL save (dry-run must not persist; see the next test)."""
     cfg = Config(data_dir=tmp_path)
     st1 = Storage(cfg)
+    st1.fetcher.get_bytes = lambda url: (b"%PDF-1.4 data", "application/pdf")
     rec = DocRecord(bank_code="de", doc_type=DocType.C1, title="x",
-                    pdf_url="https://www.bis.org/review/r240315a.pdf")
-    st1.save(rec, dry_run=True)
+                    pdf_url="https://www.bis.org/review/r240315a.pdf",
+                    date=date(2024, 3, 15))
+    assert st1.save(rec) == "saved"
     # Reopen — _urls is re-populated from the manifest.
     st2 = Storage(cfg)
     assert st2.is_known_url("https://www.bis.org/review/r240315a.pdf")
     assert not st2.is_known_url("https://www.bis.org/review/r240316b.pdf")
+
+
+def test_dry_run_does_not_persist_and_never_blocks_real_save(tmp_path):
+    """R1 regression: a dry-run must NOT write a placeholder manifest row, or a
+    later real run would skip it as 'already-indexed' and never download it."""
+    cfg = Config(data_dir=tmp_path)
+    rec = DocRecord(bank_code="us", doc_type=DocType.A2, title="x",
+                    pdf_url="https://x/a.pdf", date=date(2020, 1, 1),
+                    mime_type="application/pdf")
+    st = Storage(cfg)
+    assert st.save(rec, dry_run=True) == "dry-run:indexed"
+    # Manifest stays empty — nothing persisted.
+    assert not cfg.manifest_path.exists() or cfg.manifest_path.read_text().strip() == ""
+    # A fresh Storage (new process) still downloads it.
+    st2 = Storage(cfg)
+    st2.fetcher.get_bytes = lambda url: (b"%PDF-1.4 data", "application/pdf")
+    assert st2.save(rec) == "saved"
+    assert cfg.manifest_path.read_text().strip().count("\n") == 0  # exactly 1 line
+
+
+def test_sweep_chrome_profiles_removes_dead_pids(tmp_path):
+    """R3: stale `.chrome-profile-<pid>` dirs of dead processes are swept; the
+    live one (ours + current PID) is kept."""
+    import os
+    from cb_corpus.storage import _sweep_chrome_profiles
+    dead = tmp_path / ".chrome-profile-999999"; dead.mkdir()
+    alive = tmp_path / f".chrome-profile-{os.getpid()}"; alive.mkdir()
+    keep = tmp_path / ".chrome-profile-keepme"; keep.mkdir()
+    _sweep_chrome_profiles(tmp_path, keep=keep)
+    assert not dead.exists()        # PID 999999 not alive -> removed
+    assert alive.exists()           # current PID alive -> kept
+    assert keep.exists()            # explicitly kept
 
 
 def test_storage_html_to_pdf_invokes_renderer(tmp_path, monkeypatch):
@@ -511,3 +939,155 @@ def test_completeness_matrix_statuses(tmp_path):
     f1 = next(r for r in rows if r["doc_type"] == "F1" and r["year"] == 2024)
     assert f1["status"] == "missing"
     assert "partial" in summarize(rows)
+
+
+# ---- reliability: surfaced failures, throttle, convergence audit trail ----
+class _BoomFetcher:
+    """Fetcher stub whose every fetch fails — to test that discovery records
+    the failure instead of swallowing it."""
+    def get_text(self, url):
+        raise RuntimeError("network down")
+
+
+def test_adapter_fetch_text_records_failure_instead_of_swallowing():
+    from cb_corpus.adapters.base import GenericAdapter
+    a = GenericAdapter(get_bank("ecb"), _BoomFetcher())
+    assert a._fetch_text("https://x.test/listing", context="probe") is None
+    assert len(a.errors) == 1
+    assert a.errors[0]["url"] == "https://x.test/listing"
+    assert a.errors[0]["context"] == "probe"
+    assert "RuntimeError" in a.errors[0]["error"]
+
+
+def test_ecb_discovery_records_error_and_does_not_crash_on_fetch_failure():
+    from cb_corpus.adapters.ecb import ECBAdapter
+    a = ECBAdapter(get_bank("ecb"), _BoomFetcher())
+    # A transient index failure must NOT raise and must NOT silently yield [];
+    # it has to leave a breadcrumb so the caller knows to re-run.
+    recs = list(a.discover(DocType.A3))
+    assert recs == []
+    assert any(e["context"] == "A3-index" for e in a.errors)
+
+
+def test_fetcher_throttle_is_public_and_records_host():
+    from cb_corpus.http import Fetcher
+    f = Fetcher()
+    f.throttle("https://www.ecb.europa.eu/press/accounts/x.html")
+    assert "www.ecb.europa.eu" in f._last_hit
+
+
+def test_pipeline_writes_discovery_errors_audit_trail(tmp_path):
+    from cb_corpus.pipeline import _record_discovery_errors
+    cfg = Config(data_dir=tmp_path)
+    _record_discovery_errors(cfg, [
+        {"bank": "ecb", "context": "A3-year", "url": "u1", "error": "RuntimeError: x"},
+    ])
+    out = tmp_path / "discovery_errors.jsonl"
+    assert out.exists()
+    row = json.loads(out.read_text().splitlines()[0])
+    assert row["bank"] == "ecb" and row["context"] == "A3-year"
+    # No errors -> no file churn.
+    _record_discovery_errors(cfg, [])
+    assert len(out.read_text().splitlines()) == 1
+
+
+def test_pipeline_run_converges_and_records_errors(tmp_path, monkeypatch):
+    """run(max_rounds>1) must re-crawl until a clean round, then stop — and
+    persist discovery errors. Covers the reliability convergence loop."""
+    from cb_corpus import pipeline as pl
+
+    rounds_seen = {"n": 0}
+
+    class FakeAdapter:
+        def __init__(self):
+            # error on the first round only -> forces a second round, then clean
+            self.errors = ([{"bank": "x", "url": "u", "context": "c", "error": "E"}]
+                           if rounds_seen["n"] == 0 else [])
+            rounds_seen["n"] += 1
+
+        def discover_all(self, scope, since):
+            return iter([])
+
+    class FakeStorage:
+        def __init__(self, *a, **k):
+            pass
+
+        def save_many(self, recs, dry_run=False, label=""):
+            list(recs)
+            return {"skip": 0}
+
+    monkeypatch.setattr(pl, "Fetcher", lambda cfg: object())
+    monkeypatch.setattr(pl, "Storage", FakeStorage)
+    monkeypatch.setattr(pl, "get_adapter", lambda code, fetcher: FakeAdapter())
+
+    cfg = Config(data_dir=tmp_path)
+    pl.run(bank_codes=["x"], dry_run=False, config=cfg, max_rounds=5)
+    # round 1 had an error -> not converged; round 2 clean -> stop. Exactly 2.
+    assert rounds_seen["n"] == 2
+    assert (tmp_path / "discovery_errors.jsonl").exists()
+
+
+def test_fetcher_retries_then_raises(monkeypatch):
+    """Fetcher.get retries up to max_retries with backoff, then raises — the
+    resilience contract the crawl depends on."""
+    from cb_corpus import http
+    monkeypatch.setattr(http.time, "sleep", lambda s: None)  # no real backoff wait
+    f = http.Fetcher()
+    calls = {"n": 0}
+
+    class BoomSession:
+        def get(self, *a, **k):
+            calls["n"] += 1
+            raise http.requests.exceptions.ConnectionError("down")
+
+    f.session = BoomSession()
+    with pytest.raises(RuntimeError):
+        f.get("https://x.test/a")
+    assert calls["n"] == f.cfg.max_retries
+
+
+def test_fetcher_get_bytes_streams_and_enforces_total_deadline(monkeypatch):
+    """get_bytes joins streamed chunks, and a slow-trickle body that never trips
+    the inactivity timeout is still aborted by the total download deadline."""
+    from cb_corpus import http
+    monkeypatch.setattr(http.time, "sleep", lambda s: None)
+    f = http.Fetcher()
+
+    class OkResp:
+        headers = {"content-type": "application/pdf; charset=binary"}
+        def raise_for_status(self): pass
+        def iter_content(self, chunk_size):
+            yield b"%PDF-"; yield b"data"
+
+    f.session = type("S", (), {"get": lambda self, u, **k: OkResp()})()
+    body, mime = f.get_bytes("https://x.test/a.pdf")
+    assert body == b"%PDF-data" and mime == "application/pdf"
+
+    # Infinite trickle + past-deadline -> TimeoutError each attempt -> RuntimeError.
+    f.cfg.download_timeout = -1.0
+
+    class Trickle:
+        headers = {"content-type": "application/pdf"}
+        def raise_for_status(self): pass
+        def iter_content(self, chunk_size):
+            while True:
+                yield b"x"
+
+    f.session = type("S", (), {"get": lambda self, u, **k: Trickle()})()
+    with pytest.raises(RuntimeError):
+        f.get_bytes("https://x.test/hang.pdf")
+
+
+def test_cli_dispatches_subcommands(monkeypatch, capsys):
+    """list-banks runs offline; discover/repec/bis-sitemap dispatch is wired
+    (guards against command-registration regressions like a new subcommand)."""
+    from cb_corpus import cli
+    assert cli.main(["list-banks"]) == 0
+    assert "63 banks" in capsys.readouterr().out
+
+    monkeypatch.setattr(cli, "run", lambda **k: {"us": {"saved": 1}})
+    monkeypatch.setattr(cli, "run_repec", lambda **k: {"us": {"saved": 2}})
+    monkeypatch.setattr(cli, "run_bis_sitemap", lambda **k: {"saved": 3})
+    assert cli.main(["discover", "--banks", "us"]) == 0
+    assert cli.main(["repec", "--download"]) == 0
+    assert cli.main(["bis-sitemap"]) == 0
