@@ -17,7 +17,7 @@ venv/
 *.swp
 
 # Docs — generated snapshots (regenerate via the scripts) + local working/analysis notes.
-# Committed docs: README, DOCS, INGESTION_RAG, BANKS, central_bank_corpus_inventory.
+# Committed docs: README, INGESTION_RAG, BANKS, central_bank_corpus_inventory.
 CORPUS.md
 PRESENTATION.md
 PRESENTATION_EN.md
@@ -26,4 +26,3 @@ ARCHITECTURE.md
 DISCOVERY_AUDIT.md
 COMPLETENESS.md
 ECB_DOC_TYPES.md
-RUNBOOK.md

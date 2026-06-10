@@ -128,6 +128,13 @@ class BoEAdapter(BankAdapter):
 ```
 C1 (speeches) and D1/D2 (papers) are inherited — only implement the native listings.
 Use `self._fetch_text(url, context=...)` for listing fetches so failures are surfaced.
+When a parser misbehaves, save the live HTML and adjust the relevant pure function
+(`parse_listing`, `parse_minutes_links`, `parse_index`, `parse_series_page`,
+`extract_official_pdf`), then re-run its test in `tests/`.
+
+**Extending coverage** — the adapter build order is in `BANKS.md`; confirm any domain flagged
+⚠️ there is reachable before a first crawl. To add working-paper series, extend
+`sources/repec.py::SERIES` toward all 63 banks (verify each handle on IDEAS first).
 
 ## Layout
 
@@ -159,6 +166,8 @@ tests/               85 tests (taxonomy, registry, parsers, dedup, matrix, relia
 ## Notes
 
 - Official primary sources only; non-English originals are kept as-is (the BIS speech corpus
-  is English-language).
+  is English-language). No machine translation or model-OCR as a substitute for the original
+  PDF (local OCR for indexing is fine if kept separate).
+- Respect each site's terms — BIS content is noncommercial-use.
 - The corpus is **~99 % complete** against each source's authoritative catalogue (BIS speeches,
   IDEAS working-paper series, bank publication calendars).
