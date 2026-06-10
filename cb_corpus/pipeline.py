@@ -11,7 +11,7 @@ from .banks import BIS_63
 from .config import Config
 from .http import Fetcher
 from .models import DocRecord
-from .sources.bis_speeches import BISSpeechIndex
+from .sources.bis_speeches import BISSpeechIndex, parse_detail
 from .sources.recovery import Source
 from .storage import Storage
 from .taxonomy import DocType, FULL_SCOPE
@@ -126,6 +126,229 @@ def run_bis_sitemap(since: Optional[date] = None,
         skip_url=storage.is_known_url,
     )
     return storage.save_many(recs, dry_run=dry_run, label="bis-sitemap")
+
+
+def _disk_missing_index(storage: Storage, raw,
+                        *, only_banks: Optional[set[str]] = None,
+                        doc_types: Optional[set[str]] = None,
+                        min_year: Optional[int] = None,
+                        max_year: Optional[int] = None) -> dict[str, "object"]:
+    """Map ``doc_id -> Path`` for on-disk PDFs not yet in the manifest.
+
+    The on-disk filename stem *is* the cb_corpus ``doc_id``, so this is exactly
+    the set of documents whose bytes are present but whose manifest row is gone.
+    """
+    missing: dict[str, object] = {}
+    for bank_dir in sorted(p for p in raw.iterdir() if p.is_dir()):
+        if only_banks and bank_dir.name not in only_banks:
+            continue
+        for dt_dir in sorted(p for p in bank_dir.iterdir() if p.is_dir()):
+            if doc_types and dt_dir.name.upper() not in doc_types:
+                continue
+            for year_dir in dt_dir.iterdir():
+                if not year_dir.is_dir() or not year_dir.name.isdigit():
+                    continue
+                year = int(year_dir.name)
+                if (min_year and year < min_year) or (max_year and year > max_year):
+                    continue
+                for f in year_dir.glob("*.pdf"):
+                    if f.stem not in storage._ids:
+                        missing[f.stem] = f
+    return missing
+
+
+def _apply_reindex(recs: Iterable[DocRecord], storage: Storage,
+                   missing: dict, *, dry_run: bool) -> dict[str, int]:
+    """Reindex each discovered record whose ``doc_id`` is an on-disk missing file.
+
+    Mutates ``missing`` (pops matched ids) so the caller can report what stayed
+    unmatched. Records not on disk are ignored (we only index files we have).
+    """
+    counts: dict[str, int] = {"matched": 0, "reindexed": 0, "skip": 0}
+    for rec in recs:
+        path = missing.get(rec.doc_id)
+        if path is None:
+            continue
+        counts["matched"] += 1
+        status = storage.reindex(rec, path, dry_run=dry_run).split(":")[0]
+        counts[status] = counts.get(status, 0) + 1
+        missing.pop(rec.doc_id, None)
+    return counts
+
+
+def reindex_native_from_disk(bank_codes: Optional[Iterable[str]] = None,
+                             scope: tuple[DocType, ...] = FULL_SCOPE,
+                             since: Optional[date] = None,
+                             dry_run: bool = True,
+                             config: Optional[Config] = None,
+                             min_year: Optional[int] = None,
+                             max_year: Optional[int] = None) -> dict[str, int]:
+    """Rebuild manifest rows for on-disk *native-adapter* docs missing from it.
+
+    Re-runs each bank's adapter discovery (listing pages only — **no PDF
+    downloads**) and matches every discovered :class:`DocRecord` to an on-disk
+    file by ``doc_id``. Recovers the exact publication date AND the real title
+    for documents scraped from bank sites (C1 speeches, A1/A2/A3 decisions &
+    minutes, E reports, …) — i.e. everything that did NOT come from BIS sitemaps
+    or RePEc. Matching requires the bank site to still expose the same URLs the
+    files were scraped from; anything that no longer resolves stays unmatched
+    (reported, never silently dropped). ``dry_run`` writes nothing.
+    """
+    cfg, fetcher, storage = _make_storage(config, html_to_pdf=False)
+    doc_types = {dt.code for dt in scope}
+    missing = _disk_missing_index(
+        storage, cfg.raw_dir,
+        only_banks=set(bank_codes) if bank_codes else None,
+        doc_types=doc_types, min_year=min_year, max_year=max_year,
+    )
+    n0 = len(missing)
+    counts = {"missing_on_disk": n0, "matched": 0, "reindexed": 0,
+              "skip": 0, "unmatched": 0}
+    if not n0:
+        print("reindex(native): no unindexed docs on disk for this scope",
+              file=sys.stderr, flush=True)
+        return counts
+
+    codes = list(bank_codes) if bank_codes else [b.code for b in BIS_63]
+    print(f"reindex(native): {n0} unindexed docs on disk; re-running discovery "
+          f"for {len(codes)} bank(s) (listing pages only, no PDF downloads)…",
+          file=sys.stderr, flush=True)
+    disc_errors: list[dict] = []
+    for code in codes:
+        try:
+            adapter = get_adapter(code, fetcher)
+            c = _apply_reindex(adapter.discover_all(scope=scope, since=since),
+                               storage, missing, dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001 — one bad bank never aborts the run
+            print(f"  {code}: discovery failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            continue
+        for k, v in c.items():
+            counts[k] = counts.get(k, 0) + v
+        disc_errors.extend(getattr(adapter, "errors", []))
+    _record_discovery_errors(cfg, disc_errors)
+    counts["unmatched"] = len(missing)
+    print(f"reindex(native): matched={counts['matched']} "
+          f"reindexed={counts.get('reindexed', 0)} dry_run={dry_run} "
+          f"unmatched={len(missing)} (unmatched = URL no longer exposed by the "
+          f"bank site, or non-native source)", file=sys.stderr, flush=True)
+    return counts
+
+
+def reindex_bis_from_disk(only_banks: Optional[set[str]] = None,
+                          dry_run: bool = True,
+                          config: Optional[Config] = None,
+                          fetch_titles: bool = False,
+                          min_year: Optional[int] = None,
+                          max_year: Optional[int] = None) -> dict[str, int]:
+    """Rebuild manifest rows for C1 speeches whose PDF is on disk but unindexed.
+
+    Use when the manifest was reset/lost while downloaded PDFs accumulated: the
+    files are present but their rich metadata (exact publication date, URL) is
+    gone. This recovers it **without re-downloading anything** — it fetches only
+    the BIS yearly sitemaps (a few dozen XML files), and matches each sitemap URL
+    to an on-disk file by recomputing the stable ``doc_id = sha1(bank|C1|url)``
+    (the on-disk folder already tells us the bank). The exact date comes from the
+    URL slug (``r<YYMMDD>``).
+
+    ``fetch_titles`` additionally fetches each *matched* speech's detail page for
+    a human title (one HTTP request per matched file — slower; off by default).
+    ``dry_run`` reports matches without writing to the manifest.
+    """
+    import hashlib
+
+    cfg, fetcher, storage = _make_storage(config, html_to_pdf=False)
+    raw = cfg.raw_dir
+
+    # 1. On-disk C1 PDFs whose doc_id is not in the manifest, bucketed by year.
+    missing_by_year: dict[int, dict[str, tuple[str, "object"]]] = {}
+    banks_by_year: dict[int, set[str]] = {}
+    n_missing = 0
+    for bank_dir in sorted(p for p in raw.iterdir() if p.is_dir()):
+        bank = bank_dir.name
+        if only_banks and bank not in only_banks:
+            continue
+        c1_dir = bank_dir / "C1"
+        if not c1_dir.is_dir():
+            continue
+        for year_dir in c1_dir.iterdir():
+            if not year_dir.is_dir() or not year_dir.name.isdigit():
+                continue
+            year = int(year_dir.name)
+            if (min_year and year < min_year) or (max_year and year > max_year):
+                continue
+            for f in year_dir.glob("*.pdf"):
+                doc_id = f.stem
+                if doc_id in storage._ids:
+                    continue
+                missing_by_year.setdefault(year, {})[doc_id] = (bank, f)
+                banks_by_year.setdefault(year, set()).add(bank)
+                n_missing += 1
+
+    counts = {"missing_on_disk": n_missing, "matched": 0, "reindexed": 0,
+              "skip": 0, "unmatched": 0}
+    if not n_missing:
+        print("reindex: no unindexed C1 PDFs on disk — nothing to do",
+              file=sys.stderr, flush=True)
+        return counts
+
+    print(f"reindex: {n_missing} unindexed C1 PDFs across {len(missing_by_year)} "
+          f"year(s); fetching BIS sitemaps (no PDF downloads)…",
+          file=sys.stderr, flush=True)
+
+    # 2. Walk the BIS yearly sitemaps for exactly those years; match by hash.
+    bis = BISSpeechIndex(fetcher)
+    try:
+        sitemaps = {y: u for y, u in bis.list_years()}
+    except Exception as exc:  # noqa: BLE001
+        print(f"reindex: could not fetch sitemap index: {exc}",
+              file=sys.stderr, flush=True)
+        sitemaps = {}
+
+    for year in sorted(missing_by_year):
+        bucket = missing_by_year[year]
+        banks = banks_by_year[year]
+        url = sitemaps.get(year)
+        if url is None:
+            continue  # year not covered by BIS sitemaps (e.g. pre-1996)
+        try:
+            metas = bis.speeches_for_year(year, url)
+        except Exception:  # noqa: BLE001 — one bad year never aborts the run
+            continue
+        for meta in metas:
+            if not bucket:
+                break
+            for bank in banks:
+                cand = hashlib.sha1(
+                    f"{bank}|C1|{meta.pdf_url}".encode("utf-8")).hexdigest()[:16]
+                hit = bucket.get(cand)
+                if hit is None or hit[0] != bank:
+                    continue
+                counts["matched"] += 1
+                title = ""
+                if fetch_titles:
+                    try:
+                        title, _ = parse_detail(fetcher.get_text(meta.detail_url))
+                    except Exception:  # noqa: BLE001
+                        title = ""
+                rec = DocRecord(
+                    bank_code=bank, doc_type=DocType.C1,
+                    title=title or meta.pdf_url, pdf_url=meta.pdf_url,
+                    source_url=meta.detail_url, date=meta.date,
+                    provenance="bis_index", mime_type="application/pdf",
+                )
+                status = storage.reindex(rec, hit[1], dry_run=dry_run).split(":")[0]
+                counts[status] = counts.get(status, 0) + 1
+                del bucket[cand]
+                break
+
+    counts["unmatched"] = sum(len(b) for b in missing_by_year.values())
+    print(f"reindex: matched={counts['matched']} "
+          f"reindexed={counts.get('reindexed', 0)} dry_run={dry_run} "
+          f"unmatched={counts['unmatched']} (unmatched = on disk but not found in "
+          f"BIS sitemaps — pre-1996 or non-BIS-sourced)",
+          file=sys.stderr, flush=True)
+    return counts
 
 
 def run_repec(bank_codes: Optional[Iterable[str]] = None,

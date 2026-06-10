@@ -205,6 +205,42 @@ class Storage:
         self._append(rec)
         return "saved"
 
+    # -- reindex (no download) -------------------------------------------
+    def reindex(self, rec: DocRecord, path: Path, *, dry_run: bool = False) -> str:
+        """Index an already-downloaded file WITHOUT re-fetching it.
+
+        For a document whose bytes are already on disk (at ``path``) but whose
+        manifest row was lost — e.g. the manifest was reset while the downloads
+        accumulated — recompute sha256 from the on-disk bytes, set
+        ``local_path``/``mime_type``, and append the manifest row from the
+        (re-discovered) record. Idempotent: skips a ``doc_id`` already indexed or
+        whose content hash is already present. ``dry_run`` reports the action
+        without writing (mirrors :meth:`save`'s no-write contract).
+        """
+        if rec.doc_id in self._ids:
+            return "skip:already-indexed"
+        if not path.is_file():
+            return "skip:missing-file"
+        if dry_run:
+            return "dry-run:would-reindex"
+
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if digest in self._hashes:
+            return "skip:duplicate-content"
+
+        ext = path.suffix.lower().lstrip(".")
+        rec.mime_type = {"pdf": "application/pdf", "html": "text/html"}.get(ext, rec.mime_type)
+        if ext == "html":
+            rec.html_path = str(path)
+        rec.sha256 = digest
+        rec.local_path = str(path)
+        self._ids.add(rec.doc_id)
+        self._hashes.add(digest)
+        self._urls.add(rec.pdf_url)
+        self._append(rec)
+        return "reindexed"
+
     def save_many(self, recs: Iterable[DocRecord], *, dry_run: bool = False,
                   progress_every: int = 100, label: str = "") -> dict[str, int]:
         import sys

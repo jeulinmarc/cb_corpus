@@ -13,7 +13,8 @@ from datetime import date, datetime
 from .banks import BIS_63
 from .completeness import build_matrix, export_csv, summarize
 from .convert import convert_existing
-from .pipeline import run, run_bis_sitemap, run_repec
+from .pipeline import (run, run_bis_sitemap, run_repec,
+                       reindex_bis_from_disk, reindex_native_from_disk)
 from .retry_html import retry_failed
 from .taxonomy import FULL_SCOPE, by_code
 
@@ -71,6 +72,22 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--download", action="store_true",
                     help="actually fetch PDFs (default is dry-run: index only)")
 
+    rx = sub.add_parser("reindex-from-disk",
+                        help="Rebuild manifest rows for on-disk docs missing from "
+                             "the manifest, by replaying discovery (recovers exact "
+                             "dates/titles; downloads no PDFs).")
+    rx.add_argument("--source", choices=["native", "bis-sitemap"], default="native",
+                    help="discovery to replay: native per-bank adapters (default, "
+                         "covers C1/A/B/E/F from bank sites) or BIS sitemaps (C1)")
+    rx.add_argument("--banks", default="", help="restrict to bank codes")
+    rx.add_argument("--types", default="", help="native only: e.g. C1,A3 (default full A-F)")
+    rx.add_argument("--years", default="", help="YYYY or YYYY-YYYY (restrict)")
+    rx.add_argument("--write", action="store_true",
+                    help="actually append manifest rows (default: dry-run report)")
+    rx.add_argument("--titles", action="store_true",
+                    help="bis-sitemap only: fetch each matched speech's detail page "
+                         "for a human title (one HTTP request per matched file; slower)")
+
     r = sub.add_parser("report")
     r.add_argument("--banks", default="")
     r.add_argument("--years", type=_years, default=_years("2015-2025"))
@@ -119,6 +136,24 @@ def main(argv: list[str] | None = None) -> int:
         results = run_repec(bank_codes=banks, dry_run=not args.download)
         for code, counts in results.items():
             print(f"{code}: {counts}")
+        return 0
+
+    if args.cmd == "reindex-from-disk":
+        years = _years(args.years) if args.years else None
+        mn = min(years) if years else None
+        mx = max(years) if years else None
+        if args.source == "bis-sitemap":
+            counts = reindex_bis_from_disk(
+                only_banks=set(banks) if banks else None,
+                dry_run=not args.write, fetch_titles=args.titles,
+                min_year=mn, max_year=mx,
+            )
+        else:
+            counts = reindex_native_from_disk(
+                bank_codes=banks, scope=_types(args.types),
+                dry_run=not args.write, min_year=mn, max_year=mx,
+            )
+        print(f"reindex-from-disk ({args.source}):", counts)
         return 0
 
     if args.cmd == "report":

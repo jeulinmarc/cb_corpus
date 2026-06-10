@@ -37,6 +37,13 @@ no machine-translated or model-generated text.
 - **Storage / dedup** (`storage.py`) → manifest at `data/manifest.jsonl`; dedup on `doc_id`
   (stable hash of bank+type+**url** — date-independent, so correcting a date is a pure metadata
   update, no id churn) and content `sha256`. **No domain guard** — discovery owns URL quality.
+- **Reindex from disk** (`pipeline.reindex_native_from_disk` / `reindex_bis_from_disk`, CLI
+  `reindex-from-disk`) → rebuild manifest rows for PDFs that are **on disk but missing from the
+  manifest** (e.g. the manifest was reset/lost while downloads kept accumulating). Replays
+  discovery — native per-bank adapters (`--source native`, default; covers C1/A/B/E/F) or BIS
+  sitemaps (`--source bis-sitemap`; C1) — to recover each document's exact **date** and **title**,
+  then writes the row **without re-downloading the PDF**, matched to the on-disk file by the
+  stable `doc_id`. Dry-run by default (`--write` to persist); idempotent.
 - **Completeness matrix** (`completeness.py`) → expected-vs-downloaded per (bank × type × year):
   `ok / partial / missing / unknown`.
 - **Fetcher** (`http.py`) → per-host rate limit (0.5s default) + retries with exponential
@@ -69,6 +76,11 @@ python -m cb_corpus repec --banks ecb,us --download
 
 # Per-bank native listings (A/B/E/F + inherited C1/D), with convergence retries
 python -m cb_corpus discover --banks us,ecb --types A3,E4 --download --rounds 3
+
+# Reindex: rebuild manifest rows for PDFs on disk but missing from the manifest
+# (recovers exact dates/titles, no PDF re-download). Dry-run report unless --write.
+python -m cb_corpus reindex-from-disk --source native --banks ecb            # report
+python -m cb_corpus reindex-from-disk --source native --banks ecb --write    # persist
 
 # Completeness report -> CSV
 python -m cb_corpus report --years 2015-2025 --csv data/reports/matrix.csv
@@ -148,8 +160,9 @@ cb_corpus/
   storage.py         manifest, dedup (doc_id + sha256), HTML→PDF render, html_path
   htmlpdf.py         headless-Chrome HTML→PDF (shared profile)
   completeness.py    expected-vs-downloaded matrix
-  pipeline.py        run() (convergence), run_bis_sitemap(), run_repec(), run_*_recovery()
-  cli.py             command line (list-banks, discover, bis-sitemap, repec, report, ...)
+  pipeline.py        run() (convergence), run_bis_sitemap(), run_repec(),
+                     reindex_*_from_disk() (manifest recovery, no re-download), run_*_recovery()
+  cli.py             command line (list-banks, discover, bis-sitemap, repec, reindex-from-disk, report, ...)
   sources/
     bis_speeches.py  BIS speech index         -> C1 (alias-aware attribution)
     repec.py         RePEc discovery          -> D1/D2 (paginated, dated)
