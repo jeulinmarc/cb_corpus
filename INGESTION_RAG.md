@@ -1,49 +1,49 @@
-# Corpus → RAG : contrat de données & handoff
+# Corpus → RAG: data contract & handoff
 
-> ℹ️ **L'ingestion elle-même est gérée par un repo séparé.** Ce document est le **contrat de
-> données** : ce que `cb_corpus` expose (schéma, chemins, filtres, citation, pièges) pour que
-> n'importe quel ingéreur puisse le consommer. Les extraits de code sont une **référence**, à
-> adapter à la stack du repo d'ingestion — pas une implémentation imposée.
+> ℹ️ **Ingestion itself is handled by a separate repo.** This document is the **data
+> contract**: what `cb_corpus` exposes (schema, paths, filters, citation, caveats) so that
+> any ingester can consume it. The code snippets are a **reference**, to be
+> adapted to the ingestion repo's stack — not an imposed implementation.
 
-Tout part de `data/raw/` (fichiers) + `data/manifest.jsonl` (l'index). L'objectif côté RAG :
-**filtres de métadonnées** + **citations de source officielle**.
+Everything starts from `data/raw/` (files) + `data/manifest.jsonl` (the index). The goal on the RAG side:
+**metadata filters** + **official-source citations**.
 
-> Inventaire des données (par pays / type) : `CORPUS.md` (généré). Couverture ~99 % vs les catalogues officiels.
+> Data inventory (by country / type): `CORPUS.md` (generated). Coverage ~99% vs the official catalogs.
 
 ---
 
-## 1. Le manifest est ton index
+## 1. The manifest is your index
 
-`data/manifest.jsonl` = 1 ligne JSON par document. **N'itère pas le disque, itère le manifest** :
-il porte toutes les métadonnées et pointe vers le fichier local.
+`data/manifest.jsonl` = 1 JSON line per document. **Don't iterate the disk, iterate the manifest**:
+it carries all the metadata and points to the local file.
 
-> 🗄️ **Le store requêtable est ta responsabilité (côté RAG).** `cb_corpus` produit un **handoff**
-> (JSONL dédupliqué + fichiers raw) ; c'est à ce repo de l'ingérer dans son **store indexé/vectoriel**
-> (SQLite, pgvector, etc.). Le builder reste volontairement en JSONL (le store requêtable est côté repo RAG).
-> `doc_id` est **date-indépendant** (hash de bank+type+url) → stable comme `id` de document.
+> 🗄️ **The queryable store is your responsibility (RAG side).** `cb_corpus` produces a **handoff**
+> (deduplicated JSONL + raw files); it is up to this repo to ingest it into its **indexed/vector
+> store** (SQLite, pgvector, etc.). The builder deliberately stays in JSONL (the queryable store is on the RAG repo side).
+> `doc_id` is **date-independent** (hash of bank+type+url) → stable as a document `id`.
 
-Champs utiles à l'ingestion :
+Fields useful for ingestion:
 
-| Champ | Usage RAG |
+| Field | RAG usage |
 |---|---|
-| `local_path` | **chemin du fichier à lire** (PDF, ou HTML si le rendu a échoué) |
-| `bank_code` | **filtre** + métadonnée (mapper vers nom complet via `cb_corpus.banks`) |
-| `doc_type` | **filtre** + métadonnée (mapper vers libellé lisible, cf. §5) |
-| `year`, `date` | **filtre temporel** / facette |
-| `title` | titre du chunk / affichage |
-| `pdf_url` | **citation** (source officielle) |
-| `language` | filtre (tout `en` aujourd'hui) |
-| `doc_id` | clé primaire stable (idéale comme `id` de document dans le store) |
-| `sha256` | détection de changement / idempotence d'ingestion |
+| `local_path` | **path of the file to read** (PDF, or HTML if rendering failed) |
+| `bank_code` | **filter** + metadata (map to full name via `cb_corpus.banks`) |
+| `doc_type` | **filter** + metadata (map to a readable label, cf. §5) |
+| `year`, `date` | **temporal filter** / facet |
+| `title` | chunk title / display |
+| `pdf_url` | **citation** (official source) |
+| `language` | filter (all `en` today) |
+| `doc_id` | stable primary key (ideal as a document `id` in the store) |
+| `sha256` | change detection / ingestion idempotence |
 
 ---
 
-## 2. Pipeline d'ingestion minimal
+## 2. Minimal ingestion pipeline
 
 ```python
 import json
 from pathlib import Path
-import fitz  # PyMuPDF — rapide et robuste pour l'extraction texte PDF
+import fitz  # PyMuPDF — fast and robust for PDF text extraction
 
 from cb_corpus.banks import get_bank
 from cb_corpus.taxonomy import by_code
@@ -54,7 +54,7 @@ MANIFEST = ROOT / "data" / "manifest.jsonl"
 def iter_docs():
     for line in MANIFEST.open():
         d = json.loads(line)
-        # n'ingère que les PDF réellement présents
+        # ingest only PDFs actually present
         lp = d.get("local_path")
         if not lp or not lp.endswith(".pdf"):
             continue
@@ -67,7 +67,7 @@ def extract_text(pdf_path: Path) -> str:
         return "\n".join(page.get_text("text") for page in doc)
 
 def doc_metadata(d: dict) -> dict:
-    """Métadonnées propres, prêtes pour le filtrage + la citation."""
+    """Clean metadata, ready for filtering + citation."""
     return {
         "doc_id":   d["doc_id"],
         "bank_code": d["bank_code"],
@@ -77,7 +77,7 @@ def doc_metadata(d: dict) -> dict:
         "year":   d.get("year"),
         "date":   d.get("date"),
         "title":  d.get("title", ""),
-        "source_url": d.get("pdf_url"),   # <- la citation officielle
+        "source_url": d.get("pdf_url"),   # <- the official citation
         "language":   d.get("language", "en"),
     }
 ```
@@ -86,14 +86,14 @@ def doc_metadata(d: dict) -> dict:
 
 ## 3. Chunking
 
-Recommandations pour ce corpus (discours + rapports, souvent longs) :
+Recommendations for this corpus (speeches + reports, often long):
 
-- **Taille** : ~800–1 200 tokens par chunk, **overlap** ~100–150 tokens.
-- **Découpe sémantique** d'abord (paragraphes / sauts de ligne), puis regroupe jusqu'à la
-  taille cible — évite de couper en plein milieu de phrase.
-- **Reporte les métadonnées du document sur chaque chunk** (même `doc_id`, `bank_code`,
-  `doc_type`, `year`, `source_url`, `title`) + un `chunk_index`. C'est ce qui permet le
-  filtrage et la citation au niveau du chunk.
+- **Size**: ~800–1,200 tokens per chunk, **overlap** ~100–150 tokens.
+- **Semantic splitting** first (paragraphs / line breaks), then group up to the
+  target size — avoid cutting in the middle of a sentence.
+- **Carry the document metadata onto each chunk** (same `doc_id`, `bank_code`,
+  `doc_type`, `year`, `source_url`, `title`) + a `chunk_index`. This is what enables
+  filtering and citation at the chunk level.
 
 ```python
 def chunk_text(text, target=1000, overlap=120):
@@ -115,34 +115,34 @@ def build_records():
         try:
             text = extract_text(path)
         except Exception:
-            continue                          # PDF illisible -> on saute
+            continue                          # unreadable PDF -> skip
         for i, ch in enumerate(chunk_text(text)):
             yield {**meta, "chunk_index": i, "text": ch,
                    "id": f"{meta['doc_id']}:{i}"}
 ```
 
-Branche `build_records()` sur ton vector store (Chroma, Qdrant, pgvector, FAISS…), en mettant
-`bank_code` / `doc_type` / `year` comme **métadonnées filtrables**.
+Wire `build_records()` into your vector store (Chroma, Qdrant, pgvector, FAISS…), setting
+`bank_code` / `doc_type` / `year` as **filterable metadata**.
 
 ---
 
-## 4. Filtrer au retrieval
+## 4. Filtering at retrieval
 
-Les filtres de métadonnées rendent les réponses ciblées et citables :
+Metadata filters make answers targeted and citable:
 
-| Question | Filtre |
+| Question | Filter |
 |---|---|
-| « Que dit la BCE sur l'inflation en 2023 ? » | `bank_code = "ecb" AND year = 2023` |
-| « Minutes de la Fed » | `bank_code = "us" AND doc_type = "A3"` |
-| « Discours des banques de la zone euro depuis 2020 » | `bank_code IN (…) AND doc_type = "C1" AND year >= 2020` |
+| "What does the ECB say about inflation in 2023?" | `bank_code = "ecb" AND year = 2023` |
+| "Fed minutes" | `bank_code = "us" AND doc_type = "A3"` |
+| "Speeches by euro-area banks since 2020" | `bank_code IN (…) AND doc_type = "C1" AND year >= 2020` |
 
 ---
 
-## 5. Libellés de types (pour l'affichage)
+## 5. Type labels (for display)
 
-`doc_type` est un code ; mappe-le pour l'utilisateur (`cb_corpus.taxonomy.by_code(code).label`) :
+`doc_type` is a code; map it for the user (`cb_corpus.taxonomy.by_code(code).label`):
 
-| Code | Libellé |
+| Code | Label |
 |---|---|
 | A1 | Rate-decision press release |
 | A2 | Monetary policy statement |
@@ -163,32 +163,23 @@ Les filtres de métadonnées rendent les réponses ciblées et citables :
 
 ## 6. Citation
 
-À chaque réponse, renvoie la **source officielle** : `title` + `bank_name` + `date` + `source_url`
-(`pdf_url`). Exemple de rendu :
+With every answer, return the **official source**: `title` + `bank_name` + `date` + `source_url`
+(`pdf_url`). Example rendering:
 
-> *« … »* — Bank of England, *Andrew Bailey: Monetary policy and the outlook*, 2023-05-18.
-> Source : https://www.bis.org/review/r230518a.pdf
-
----
-
-## 7. Caveats à connaître pour pondérer le RAG
-
-- **Composition** : le corpus est dominé par les **discours (C1)**. C'est une base « parole de
-  banquier central » ; les décisions chiffrées (A1/A2) et la recherche (D1/D2) sont présentes. Pondère le retrieval selon le cas d'usage.
-- **Langue** : 100 % anglais. Les discours de banques non-anglophones sont les **versions EN
-  officielles**, pas les originaux.
-- **À exclure de l'ingestion** : fichiers `.html` orphelins dans `data/raw/` (pages non
-  converties), `.DS_Store`. Le filtre `local_path.endswith(".pdf")` du §2 s'en charge.
-- **Working papers (D1/D2)** : la date vient des métadonnées IDEAS ; un petit nombre peut être
-  sans date (rangé sous `year` nul) — filtrer/gérer si besoin.
-- **Idempotence** : ré-ingère en te basant sur `sha256` (inchangé = déjà indexé) pour éviter
-  de tout recalculer à chaque mise à jour du corpus.
+> *"…"* — Bank of England, *Andrew Bailey: Monetary policy and the outlook*, 2023-05-18.
+> Source: https://www.bis.org/review/r230518a.pdf
 
 ---
 
-## 8. Dépendances suggérées
+## 7. Caveats to know for weighting the RAG
 
-```bash
-pip install pymupdf          # extraction texte PDF (fitz)
-# + ton vector store / framework : chromadb | qdrant-client | langchain | llama-index …
-```
+- **Composition**: the corpus is dominated by **speeches (C1)**. It is a "central-banker
+  voice" base; the quantified decisions (A1/A2) and research (D1/D2) are present. Weight retrieval according to the use case.
+- **Language**: 100% English. Speeches from non-English-speaking banks are the **official EN
+  versions**, not the originals.
+- **To exclude from ingestion**: orphan `.html` files in `data/raw/` (unconverted
+  pages), `.DS_Store`. The `local_path.endswith(".pdf")` filter in §2 takes care of it.
+- **Working papers (D1/D2)**: the date comes from the IDEAS metadata; a small number may be
+  undated (filed under a null `year`) — filter/handle if needed.
+- **Idempotence**: re-ingest based on `sha256` (unchanged = already indexed) to avoid
+  recomputing everything on each corpus update.

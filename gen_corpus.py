@@ -30,109 +30,109 @@ missing = [b.code for b in BIS_63 if b.code not in bt]
 
 out = []
 W = out.append
-W("# Corpus des banques centrales — documentation détaillée\n")
-W("*Référence des données — **régénérée automatiquement** depuis `data/manifest.jsonl` "
+W("# Central bank corpus — detailed documentation\n")
+W("*Data reference — **auto-regenerated** from `data/manifest.jsonl` "
   "via `gen_corpus.py`.*\n")
-W("> Présentation non-technique : `PRESENTATION.md` · Couverture/audit : `DISCOVERY_AUDIT.md` "
-  "· Ingestion RAG : `INGESTION_RAG.md` · Architecture : `ARCHITECTURE_REVIEW.md`\n")
+W("> Non-technical presentation: `PRESENTATION.md` · Coverage/audit: `DISCOVERY_AUDIT.md` "
+  "· RAG ingestion: `INGESTION_RAG.md` · Architecture: `ARCHITECTURE.md`\n")
 
-W("\n## 1. Vue d'ensemble\n")
-W("| Métrique | Valeur |")
+W("\n## 1. Overview\n")
+W("| Metric | Value |")
 W("|---|---|")
 W(f"| Documents | **{total:,}** |".replace(",", " "))
-W(f"| Banques centrales | **{nbanks}** (sur 63 ciblées) |")
-W(f"| Période | **{min(allyears)} → {max(allyears)}** |")
-W(f"| Langue | **{', '.join(lang)}** |")
-W(f"| Taille | **{size}** |")
-W(f"| Index | `data/manifest.jsonl` (1 ligne JSON / document) |")
-W("\n**Principe :** documents officiels de première main uniquement (site de la banque, "
-  "`bis.org` pour les discours, ou IDEAS/RePEc → PDF de l'éditeur pour les working papers). "
-  "Dédup par `doc_id` + `sha256`.\n")
+W(f"| Central banks | **{nbanks}** (out of 63 targeted) |")
+W(f"| Period | **{min(allyears)} → {max(allyears)}** |")
+W(f"| Language | **{', '.join(lang)}** |")
+W(f"| Size | **{size}** |")
+W(f"| Index | `data/manifest.jsonl` (1 JSON line / document) |")
+W("\n**Principle:** first-hand official documents only (the bank's site, "
+  "`bis.org` for speeches, or IDEAS/RePEc → publisher PDF for working papers). "
+  "Dedup by `doc_id` + `sha256`.\n")
 
-W("\n## 2. Schéma des données (`manifest.jsonl`)\n")
-W("| Champ | Usage RAG |")
+W("\n## 2. Data schema (`manifest.jsonl`)\n")
+W("| Field | RAG use |")
 W("|---|---|")
-for f, u in [("bank_code", "**filtre** banque/pays"), ("doc_type", "**filtre** type"),
-             ("title", "titre / embedding"), ("date / year", "**filtre temporel**"),
-             ("pdf_url", "**citation** (source officielle)"), ("source_url", "page d'origine"),
+for f, u in [("bank_code", "bank/country **filter**"), ("doc_type", "type **filter**"),
+             ("title", "title / embedding"), ("date / year", "**temporal filter**"),
+             ("pdf_url", "**citation** (official source)"), ("source_url", "origin page"),
              ("provenance", "`bis_index` / `bank_site` / `repec_discovery`"),
              ("mime_type", "`application/pdf` / `text/html`"),
-             ("local_path", "**chemin du fichier** à lire"), ("html_path", "HTML source (si rendu)"),
-             ("sha256", "dédup / intégrité"), ("doc_id", "clé primaire stable")]:
+             ("local_path", "**file path** to read"), ("html_path", "HTML source (if rendered)"),
+             ("sha256", "dedup / integrity"), ("doc_id", "stable primary key")]:
     W(f"| `{f}` | {u} |")
-W("\nLayout : `data/raw/<bank>/<doc_type>/<year>/<doc_id>.<pdf|html>`\n")
+W("\nLayout: `data/raw/<bank>/<doc_type>/<year>/<doc_id>.<pdf|html>`\n")
 
-W("\n## 3. Inventaire par type de document\n")
-W("| Type | Description | Nombre | Source |")
+W("\n## 3. Inventory by document type\n")
+W("| Type | Description | Count | Source |")
 W("|---|---|---:|---|")
-desc = {"A1": ("Décisions de taux", "sites banques"),
-        "A2": ("Communiqués de politique monétaire", "sites banques"),
-        "A3": ("Minutes / comptes-rendus", "sites banques"),
-        "B1": ("Conférences de presse (Q&A)", "BCE/Fed"),
-        "C1": ("Discours", "index BIS"),
-        "C2": ("Interviews / op-eds / testimonies", "BCE"),
-        "D1": ("Working papers", "RePEc/IDEAS → PDF éditeur"),
+desc = {"A1": ("Rate decisions", "bank sites"),
+        "A2": ("Monetary policy statements", "bank sites"),
+        "A3": ("Minutes / accounts", "bank sites"),
+        "B1": ("Press conferences (Q&A)", "ECB/Fed"),
+        "C1": ("Speeches", "BIS index"),
+        "C2": ("Interviews / op-eds / testimonies", "ECB"),
+        "D1": ("Working papers", "RePEc/IDEAS → publisher PDF"),
         "D2": ("Occasional / discussion papers", "RePEc/IDEAS"),
-        "D3": ("Blog / lettres de recherche", "sites banques"),
-        "E1": ("Rapports politique mon. / inflation", "sites banques"),
-        "E2": ("Stabilité financière (FSR, macropru.)", "sites banques"),
-        "E3": ("Rapports annuels / de convergence", "BCE"),
-        "E4": ("Bulletins économiques", "BCE"),
-        "F1": ("Projections / prévisions (SEP)", "Fed"),
-        "G2": ("Enquêtes / publications statistiques", "BCE")}
+        "D3": ("Blog / research letters", "bank sites"),
+        "E1": ("Monetary policy / inflation reports", "bank sites"),
+        "E2": ("Financial stability (FSR, macropru.)", "bank sites"),
+        "E3": ("Annual / convergence reports", "ECB"),
+        "E4": ("Economic bulletins", "ECB"),
+        "F1": ("Projections / forecasts (SEP)", "Fed"),
+        "G2": ("Surveys / statistical publications", "ECB")}
 for t in TYPES_PRESENT:
     de, s = desc.get(t, (t, "—"))
     W(f"| **{t}** | {de} | {bytype[t]:,} | {s} |".replace(",", " "))
-W(f"\n**Provenance :** " + " · ".join(f"`{k}` {v:,}".replace(",", " ")
+W(f"\n**Provenance:** " + " · ".join(f"`{k}` {v:,}".replace(",", " ")
                                       for k, v in prov.most_common()) + "\n")
 
-W("\n## 4. Inventaire par pays\n")
-W(f"{nbanks} banques, triées par volume. Colonnes = documents par type.\n")
-W("| # | Code | Banque centrale | Total | Années | " + " | ".join(TYPES_PRESENT) + " |")
+W("\n## 4. Inventory by country\n")
+W(f"{nbanks} banks, sorted by volume. Columns = documents per type.\n")
+W("| # | Code | Central bank | Total | Years | " + " | ".join(TYPES_PRESENT) + " |")
 W("|---:|---|---|---:|---|" + "|".join("---:" for _ in TYPES_PRESENT) + "|")
 for i, (c, n) in enumerate(tot_by_bank.most_common(), 1):
     ys = bankyears[c]; yr = f"{min(ys)}-{max(ys)}" if ys else "—"
     cells = " | ".join(str(bt[c][t]) if bt[c][t] else "—" for t in TYPES_PRESENT)
     W(f"| {i} | `{c}` | {names.get(c, c)} | {n:,} | {yr} | {cells} |".replace(",", " "))
-W("\n### Banques ciblées absentes (0 doc)")
+W("\n### Targeted banks absent (0 docs)")
 for c in missing:
     W(f"- `{c}` {names[c]}")
-W("\n> `pe` (espagnol) et `vn` (vietnamien) : absences réelles confirmées — pas de version "
-  "EN indexée par la BIS. Voir `DISCOVERY_AUDIT.md`.\n")
+W("\n> `pe` (Spanish) and `vn` (Vietnamese): confirmed real absences — no EN version "
+  "indexed by the BIS. See `DISCOVERY_AUDIT.md`.\n")
 
-W("\n## 5. Couverture temporelle (documents par tranche de 5 ans)\n")
+W("\n## 5. Temporal coverage (documents per 5-year bucket)\n")
 decs = sorted({(y // 5) * 5 for y in allyears})
 W("| Type | " + " | ".join(f"{d}" for d in decs) + " |")
 W("|---|" + "|".join("---:" for _ in decs) + "|")
 for t in TYPES_PRESENT:
     W(f"| {t} | " + " | ".join(str(ty_dec[t].get(d, 0) or "—") for d in decs) + " |")
 
-W("\n## 6. Notes d'ingestion RAG (voir `INGESTION_RAG.md` pour le détail)\n")
-W("- Filtres : `bank_code`, `doc_type`, `year`, `provenance`.")
-W("- Citation : `pdf_url` + `title` + `date`. Chargement : `local_path`.")
-W("- Dédup déjà faite (`sha256`). Exclure les `.html` orphelins et `.DS_Store`.")
-W(f"- Composition : discours {100*bytype['C1']//total}% · working papers "
-  f"{100*(bytype['D1']+bytype['D2'])//total}% · autres. Pondérer le retrieval selon le besoin.")
+W("\n## 6. RAG ingestion notes (see `INGESTION_RAG.md` for detail)\n")
+W("- Filters: `bank_code`, `doc_type`, `year`, `provenance`.")
+W("- Citation: `pdf_url` + `title` + `date`. Loading: `local_path`.")
+W("- Dedup already done (`sha256`). Exclude orphan `.html` and `.DS_Store`.")
+W(f"- Composition: speeches {100*bytype['C1']//total}% · working papers "
+  f"{100*(bytype['D1']+bytype['D2'])//total}% · others. Weight retrieval as needed.")
 
-W("\n## 7. Complétude RePEc (D1/D2) & gaps connus\n")
-W("Working papers récupérés vs cible découvrable (IDEAS, pagination complète) :\n")
+W("\n## 7. RePEc completeness (D1/D2) & known gaps\n")
+W("Working papers retrieved vs discoverable target (IDEAS, full pagination):\n")
 target = {'us':4198,'ecb':3658,'ca':1360,'it':1211,'gb':1128,'es':1088,'fr':1005,
           'de':691,'au':536,'jp':405,'se':391,'ch':318,'nl':200}
 gg = sum(bt[b]['D1'] + bt[b]['D2'] for b in target); tg = sum(target.values())
-W(f"**Total : {gg:,} / {tg:,} ({100*gg//tg}%).**".replace(",", " ") +
-  " Gaps : `se` host mort, + entrées *abstract-only* sans PDF "
-  "(non récupérables). Détail + remèdes : `DISCOVERY_AUDIT.md`.\n")
+W(f"**Total: {gg:,} / {tg:,} ({100*gg//tg}%).**".replace(",", " ") +
+  " Gaps: `se` dead host, + *abstract-only* entries with no PDF "
+  "(unrecoverable). Detail + remedies: `DISCOVERY_AUDIT.md`.\n")
 
-W("\n## 8. Reproductibilité\n")
+W("\n## 8. Reproducibility\n")
 W("```bash")
-W("python -m cb_corpus bis-sitemap --download     # discours C1")
-W("python -m cb_corpus repec --download           # working papers D1/D2 (paginé, daté)")
-W("python -m cb_corpus discover --download --rounds 3   # natif A/B/E/F par banque")
-W("python3.13 gen_corpus.py                        # régénère ce fichier")
+W("python -m cb_corpus bis-sitemap --download     # C1 speeches")
+W("python -m cb_corpus repec --download           # D1/D2 working papers (paginated, dated)")
+W("python -m cb_corpus discover --download --rounds 3   # native A/B/E/F per bank")
+W("python3.13 gen_corpus.py                        # regenerate this file")
 W("```")
-W("Idempotent (`doc_id`+`sha256`), convergence (`--rounds`), échecs tracés dans "
+W("Idempotent (`doc_id`+`sha256`), convergence (`--rounds`), failures traced in "
   "`data/discovery_errors.jsonl`.\n")
 
 open("CORPUS.md", "w").write("\n".join(out) + "\n")
-print(f"CORPUS.md régénéré : {total} docs, {nbanks} banques, {size}, "
-      f"{len(open('CORPUS.md').read())} octets")
+print(f"CORPUS.md regenerated: {total} docs, {nbanks} banks, {size}, "
+      f"{len(open('CORPUS.md').read())} bytes")
