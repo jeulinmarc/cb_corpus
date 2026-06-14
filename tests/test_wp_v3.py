@@ -515,6 +515,44 @@ def test_buba_adapter_routes_d1_native(monkeypatch):
     assert [r.title for r in ad.discover(DocType.D1)] == ["x"]
 
 
+# ---- phase 4: wp-dates day recovery ---------------------------------
+from cb_corpus import wp_dates
+from cb_corpus.wp_dates import month_ok, pdf_creation_date, row_key, recover, _abs_variant
+
+
+def test_wp_dates_month_constraint():
+    row = {"date": "2002-01-01"}
+    assert month_ok(date(2002, 1, 29), row) is True
+    assert month_ok(date(2002, 1, 1), row) is False     # the 1st = no real day
+    assert month_ok(date(2002, 2, 3), row) is False     # different month -> reject
+    assert month_ok(None, row) is False
+
+
+def test_wp_dates_row_key_and_abs_variant():
+    assert row_key({"source_url": "https://ideas.repec.org/p/fip/fedgfe/2002-1.html"}) == "RePEc:fip:fedgfe:2002-1"
+    assert row_key({"title": "Some Paper"}).startswith("t:")
+    assert _abs_variant("https://x/2002/200201/200201pap.pdf").endswith("200201abs.html")
+
+
+def test_wp_dates_pdf_creation_date(tmp_path):
+    p = tmp_path / "x.pdf"
+    p.write_bytes(b"%PDF-1.4 stuff /CreationDate (D:20020115120000-05'00') more")
+    assert pdf_creation_date(str(p)) == date(2002, 1, 15)
+    assert pdf_creation_date(str(tmp_path / "missing.pdf")) is None
+
+
+def test_wp_dates_recover_wayback_month_constrained(monkeypatch):
+    # same-month first capture -> day recovered (wayback)
+    monkeypatch.setattr(wp_dates, "first_capture", lambda f, u: "20020129141357")
+    row = {"date": "2002-01-01", "pdf_url": "https://x/200201pap.pdf", "local_path": None}
+    r = recover(object(), row)
+    assert r["date"] == "2002-01-29" and r["date_source"] == "wayback"
+    assert r["evidence_url"].startswith("https://web.archive.org/web/20020129")
+    # capture in a later month (e.g. a digitisation snapshot) -> rejected
+    monkeypatch.setattr(wp_dates, "first_capture", lambda f, u: "20130205000000")
+    assert recover(object(), {"date": "2002-01-01", "pdf_url": "https://x/200201pap.pdf"}) is None
+
+
 def test_run_wp_migrate_write_applies_in_place_and_is_idempotent(tmp_path, monkeypatch):
     native = [
         DocRecord(bank_code="ecb", doc_type=DocType.D1, title="WP 3244",

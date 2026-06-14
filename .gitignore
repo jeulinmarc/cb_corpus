@@ -5,6 +5,8 @@ data/*
 !data/manifest/
 data/manifest/*
 !data/manifest/*.jsonl
+# committed date-recovery index (run-once, replay-forever — DATE_RECOVERY.md)
+!data/wp_dates_index.jsonl
 
 # Python
 __pycache__/

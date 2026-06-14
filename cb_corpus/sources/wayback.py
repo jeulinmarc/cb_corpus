@@ -42,6 +42,24 @@ def raw_url(original: str, timestamp: str) -> str:
     return f"https://web.archive.org/web/{timestamp}id_/{original}"
 
 
+def first_capture(fetcher: Fetcher, url: str) -> Optional[str]:
+    """Earliest 200 snapshot timestamp (YYYYMMDDhhmmss) for an EXACT url, else None.
+
+    CDX returns captures in ascending time order, so ``limit=1`` is the first one.
+    No mimetype filter (a paper's landing page is HTML). The first archive of a
+    document is an upper bound on its publication date — for date recovery
+    (DATE_RECOVERY.md rung 1) we accept it only when it lands in the paper's
+    RePEc month (the caller enforces that month constraint).
+    """
+    q = (f"{CDX}?url={url}&filter=statuscode:200&output=json&fl=timestamp&limit=1")
+    try:
+        rows = json.loads(fetcher.get_text(q))
+    except Exception:
+        return None
+    rows = [r for r in rows if r and r[0] != "timestamp"]
+    return rows[0][0] if rows else None
+
+
 def wayback_for_url(fetcher: Fetcher, url: str) -> Optional[str]:
     """Latest archived PDF snapshot (raw-bytes URL) for ONE exact url, or None.
 

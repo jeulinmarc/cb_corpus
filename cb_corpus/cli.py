@@ -113,6 +113,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="apply the date fixes to the manifest (metadata only: "
                          "date/precision/source/handle/alt_urls; doc_id unchanged)")
 
+    wd = sub.add_parser("wp-dates",
+                        help="WP v3 phase 4: recover the publication DAY for legacy "
+                             "month/year-precision D1/D2 rows via PDF /CreationDate + "
+                             "Wayback (month-constrained), into the committed "
+                             "data/wp_dates_index.jsonl. Default dry-run; --write applies.")
+    wd.add_argument("--banks", default="", help="restrict to banks (default: ecb,us,jp,gb,de)")
+    wd.add_argument("--csv", default="", help="CSV output path (default data/reports/wp_dates.csv)")
+    wd.add_argument("--write", action="store_true",
+                    help="apply recovered days to the manifest + append to the index")
+
     args = p.parse_args(argv)
     banks = _banks(getattr(args, "banks", ""))
 
@@ -188,6 +198,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "wp-migrate":
         from .wp_migrate import run_wp_migrate
         run_wp_migrate(bank_codes=banks, csv_path=args.csv or None, write=args.write)
+        return 0
+
+    if args.cmd == "wp-dates":
+        from .wp_dates import run_wp_dates
+        run_wp_dates(bank_codes=banks, csv_path=args.csv or None, write=args.write)
         return 0
     return 1
 
