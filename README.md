@@ -18,14 +18,21 @@ no machine-translated or model-generated text.
   (`banks.py::BIS_ALIASES`, accent/apostrophe-insensitive) so renamed / historical / native
   BIS labels (e.g. "Bank of Latvia" → `lv`, pre-2010 "…US Federal Reserve System" → `us`)
   still map to the right bank instead of being silently dropped.
-- **RePEc / IDEAS discovery** (`sources/repec.py`) → working papers (D1/D2). **Paginates** the
-  full series back-catalogue (not just the ~200 newest) and reads the publication **date** from
-  the IDEAS `citation_*` metadata. Prefers the bank's own PDF, falls back to any available PDF.
-- **Per-bank adapters** (`adapters/`) → site-specific listings (A/B/E/F). `GenericAdapter`
-  (C1 + D for every bank) is the default; bespoke `ECBAdapter` (A1 decisions / A2 statements /
-  A3 accounts), `FedAdapter` (A2 statements / A3 minutes / F1), `RBAAdapter` (au, A1 rate
-  decisions) and the TOML-declarative adapters (`banks_sources.toml`: ch/ca/fr/jp) add native
-  listings. **Rate decisions, policy statements & minutes (A1/A2/A3) are wired for the majors.**
+- **RePEc / IDEAS discovery** (`sources/repec.py`) → working papers (D1/D2) for banks **without**
+  a native source. **Paginates** the full series back-catalogue and reads the publication month
+  from the IDEAS `citation_*` metadata (RePEc is month-only → `date_precision="month"`).
+- **Working Papers v3 — native bank-site discovery** (the 5 big banks: ecb, us, jp, gb, de).
+  Each gets a native scraper with the **exact publication day** from the bank's own site
+  (`sources/{ecb_foedb,fed_wp,boj_wp,boe_wp,buba_wp}.py`), replacing RePEc for D1/D2.
+  `wp-migrate` rewrites existing rows' dates in place (key→URL→exact-title join, `doc_id`/
+  `sha256`/`local_path` untouched, zero re-downloads); `wp-dates` recovers the day for legacy
+  rows via PDF `/CreationDate` + Wayback into the **committed** `data/wp_dates_index.jsonl`
+  (run-once, replay-forever). See [docs/WP_V3_SUMMARY.md](docs/WP_V3_SUMMARY.md).
+- **Per-bank adapters** (`adapters/`) → site-specific listings (A/B/E/F + native D1/D2). Bespoke
+  `ECBAdapter`, `FedAdapter`, `BoJAdapter` (jp), `BoEAdapter` (gb), `BubaAdapter` (de),
+  `RBAAdapter` (au); TOML-declarative adapters (`banks_sources.toml`: ch/ca/fr). `GenericAdapter`
+  (C1 + RePEc D) is the default. **Rate decisions, policy statements & minutes (A1/A2/A3) are
+  wired for the majors.**
 - **Bank-of-England official recovery** (`sources/boe_wp.py` + `pipeline.run_boe_wp_recovery` /
   `run_boe_recovery`) → BoE working papers and MPC minutes from the bank's **own sitemaps**
   (`/sitemap/staff-working-paper`, `/sitemap/minutes`), since IDEAS only carries the pre-2017
@@ -34,9 +41,11 @@ no machine-translated or model-generated text.
   from archive.org's raw snapshot (`provenance="wayback"`, fully audited). Used for the Riksbank.
 - **HTML→PDF** (`htmlpdf.py`) → HTML-only documents (e.g. ECB monetary-policy accounts) are
   rendered to PDF via headless Chrome; the **raw HTML is also kept** (`html_path`).
-- **Storage / dedup** (`storage.py`) → manifest at `data/manifest.jsonl`; dedup on `doc_id`
-  (stable hash of bank+type+**url** — date-independent, so correcting a date is a pure metadata
-  update, no id churn) and content `sha256`. **No domain guard** — discovery owns URL quality.
+- **Storage / dedup** (`storage.py`) → **per-bank manifests** `data/manifest/<bank>.jsonl`
+  (a legacy single `data/manifest.jsonl` is auto-split on first use); committed to git for
+  replayability. Dedup on `doc_id` (stable hash of bank+type+**url** — date-independent, so
+  correcting a date is a pure metadata update, no id churn), persisted `alt_urls`, and content
+  `sha256`. **No domain guard** — discovery owns URL quality.
 - **Reindex from disk** (`pipeline.reindex_native_from_disk` / `reindex_bis_from_disk`, CLI
   `reindex-from-disk`) → rebuild manifest rows for PDFs that are **on disk but missing from the
   manifest** (e.g. the manifest was reset/lost while downloads kept accumulating). Replays
@@ -57,7 +66,7 @@ no machine-translated or model-generated text.
 
 ```bash
 pip install -r requirements.txt
-python3.13 -m pytest tests/ -q          # 85 tests
+python3.13 -m pytest tests/ -q          # 119 tests
 ```
 > Use **`python3.13`** — that interpreter has the dependencies in this environment
 > (`python3` resolves to 3.14 without them).
@@ -70,9 +79,15 @@ python -m cb_corpus list-banks
 # Speeches (C1) — single pass over the BIS yearly sitemaps, all banks at once
 python -m cb_corpus bis-sitemap --download
 
-# Working papers (D1/D2) via RePEc (paginated, dated)
+# Working papers (D1/D2) via RePEc (paginated, dated) — banks without a native source
 python -m cb_corpus repec --download                  # all wired series
 python -m cb_corpus repec --banks ecb,us --download
+
+# Working Papers v3 — replace RePEc month-dates with native bank-site day-dates
+python -m cb_corpus wp-migrate --banks ecb,us,jp,gb,de            # dry-run report + CSV
+python -m cb_corpus wp-migrate --banks ecb,us,jp,gb,de --write    # apply (metadata only)
+# Recover the day for legacy / month-precision rows -> committed, replayable index
+python -m cb_corpus wp-dates --write
 
 # Per-bank native listings (A/B/E/F + inherited C1/D), with convergence retries
 python -m cb_corpus discover --banks us,ecb --types A3,E4 --download --rounds 3
