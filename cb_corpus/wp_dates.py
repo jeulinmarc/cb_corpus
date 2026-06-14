@@ -162,35 +162,48 @@ def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
     storage = Storage(cfg, fetcher)
     codes = set(bank_codes) if bank_codes else set(_LEGACY_BANKS)
     idx = load_index(cfg)
+    # Resumable: in write mode each new resolution is appended to the committed
+    # index immediately, so an interrupted long crawl keeps its progress and a
+    # re-run short-circuits the already-resolved rows (no repeat Wayback queries).
+    idx_fh = index_path(cfg).open("a") if write else None
 
     by_id: dict[str, dict] = {}          # doc_id -> {date, date_source} to apply
-    new_entries: list[dict] = []
+    new_count = 0
     counts = {"candidates": 0, "from_index": 0, "pdf_meta": 0, "wayback": 0, "unresolved": 0}
 
-    for row in storage.iter_manifest():
-        if (row.get("bank_code") not in codes or row.get("doc_type") not in ("D1", "D2")
-                or row.get("date_precision") == "day"):
-            continue
-        counts["candidates"] += 1
-        key = row_key(row)
-        hit = idx.get(key) if key else None
-        if hit is None:
-            yr = (_row_ym(row) or (0, 0))[0]
-            # PDF meta is free for any year; Wayback only worth it from ~the online era.
-            r = recover(fetcher, row) if yr >= since_year or row.get("local_path") else None
-            if r and key:
-                entry = {"key": key, "title_norm": normalize_title(row.get("title") or ""),
-                         **r, "date_precision": "day", "resolved_at": date.today().isoformat()}
-                new_entries.append(entry)
-                idx[key] = entry
-                hit = entry
-        else:
-            counts["from_index"] += 1
-        if hit:
-            counts[hit["date_source"]] = counts.get(hit["date_source"], 0) + 1
-            by_id[row["doc_id"]] = {"date": hit["date"], "date_source": hit["date_source"]}
-        else:
-            counts["unresolved"] += 1
+    try:
+        for row in storage.iter_manifest():
+            if (row.get("bank_code") not in codes or row.get("doc_type") not in ("D1", "D2")
+                    or row.get("date_precision") == "day"):
+                continue
+            counts["candidates"] += 1
+            key = row_key(row)
+            hit = idx.get(key) if key else None
+            if hit is None:
+                yr = (_row_ym(row) or (0, 0))[0]
+                # PDF meta is free for any year; Wayback only worth it from ~the online era.
+                r = recover(fetcher, row) if yr >= since_year or row.get("local_path") else None
+                if r and key:
+                    hit = {"key": key, "title_norm": normalize_title(row.get("title") or ""),
+                           **r, "date_precision": "day", "resolved_at": date.today().isoformat()}
+                    idx[key] = hit
+                    new_count += 1
+                    if idx_fh is not None:
+                        idx_fh.write(json.dumps(hit, ensure_ascii=False) + "\n")
+                        idx_fh.flush()
+            else:
+                counts["from_index"] += 1
+            if hit:
+                counts[hit["date_source"]] = counts.get(hit["date_source"], 0) + 1
+                by_id[row["doc_id"]] = {"date": hit["date"], "date_source": hit["date_source"]}
+            else:
+                counts["unresolved"] += 1
+            if counts["candidates"] % 100 == 0:
+                print(f"wp-dates: {counts['candidates']} scanned, {len(by_id)} resolved "
+                      f"({new_count} new) …", file=sys.stderr, flush=True)
+    finally:
+        if idx_fh is not None:
+            idx_fh.close()
 
     print(f"wp-dates: {dict(counts)} (resolved {len(by_id)} / {counts['candidates']} candidates)")
 
@@ -217,11 +230,7 @@ def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
                 applied += 1
             rows.append(row)
         write_per_bank(cfg, rows)
-        if new_entries:
-            with index_path(cfg).open("a") as fh:
-                for e in new_entries:
-                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
-        print(f"wp-dates: applied {applied} day-precision date(s); "
-              f"appended {len(new_entries)} index entr(y/ies) to {index_path(cfg)}",
+        print(f"wp-dates: applied {applied} day-precision date(s) to the manifest; "
+              f"{new_count} new index entr(y/ies) appended to {index_path(cfg)}",
               file=sys.stderr)
     return counts
