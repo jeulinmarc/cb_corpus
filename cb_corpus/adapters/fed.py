@@ -102,7 +102,10 @@ def parse_statement_links(html: str, base_url: str = FED) -> list[tuple[date, st
 
 @register("us")
 class FedAdapter(BankAdapter):
-    native_types = (DocType.A2, DocType.A3, DocType.F1)
+    # D1 = FEDS + IFDP working papers, native from federalreserve.gov (exact day
+    # via each paper's landing page) rather than RePEc. Flip is safe post-migration
+    # (native URLs registered in alt_urls -> zero re-download).
+    native_types = (DocType.A2, DocType.A3, DocType.F1, DocType.D1)
     expected_per_year = {DocType.A2: 8, DocType.A3: 8, DocType.F1: 4}
 
     # parser, title label, mime ("" => HTML, rendered to PDF by Storage)
@@ -124,6 +127,10 @@ class FedAdapter(BankAdapter):
 
     def _discover_native(self, doc_type: DocType,
                          since: Optional[date]) -> Iterator[DocRecord]:
+        if doc_type == DocType.D1:
+            from ..sources.fed_wp import discover_fed_wp
+            yield from discover_fed_wp(self.fetcher, since)
+            return
         spec = self._SPECS.get(doc_type)
         if spec is None:
             return

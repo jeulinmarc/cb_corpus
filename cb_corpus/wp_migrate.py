@@ -29,18 +29,23 @@ from typing import Iterable, Optional
 from .config import Config
 from .http import Fetcher
 from .sources.ecb_foedb import discover_ecb_wp, ecb_wp_number, repec_ecb_number
+from .sources.fed_wp import discover_fed_wp, fed_key_from_url, fed_key_from_handle
 from .storage import Storage
 
 # Native discovery per bank. doc_type ∈ {D1, D2}; returns DocRecords with day dates.
 _NATIVE = {
     "ecb": discover_ecb_wp,
+    "us": discover_fed_wp,
 }
-# Per-bank (pdf_url -> key) and (source_url/handle -> key) extractors.
+# Per-bank join-key extractors: (pdf_url -> key) and (source_url/handle -> key).
+# Native records and manifest rows are matched on equality of these keys.
 _KEY_FROM_PDF = {
     "ecb": ecb_wp_number,
+    "us": fed_key_from_url,
 }
 _KEY_FROM_HANDLE = {
     "ecb": repec_ecb_number,
+    "us": fed_key_from_handle,
 }
 
 _IDEAS_PATH = re.compile(r"/p/([^/]+)/([^/]+)/([^/.]+)")
@@ -78,10 +83,11 @@ def build_report(bank: str, fetcher: Fetcher,
     manifest document and the metadata rewrite that the migration would apply.
     """
     # Index native discovery by join key and by normalized URL.
+    key_from_pdf = _KEY_FROM_PDF[bank]
     native_by_key: dict = {}
     native_by_url: dict = {}
     for rec in _NATIVE[bank](fetcher):
-        key = ecb_wp_number(rec.pdf_url) if bank == "ecb" else None
+        key = key_from_pdf(rec.pdf_url)
         if key is not None:
             native_by_key.setdefault(key, rec)
         native_by_url.setdefault(normalize_url(rec.pdf_url), rec)
@@ -109,8 +115,10 @@ def build_report(bank: str, fetcher: Fetcher,
         if key is not None:
             matched_native_keys.add(key)
 
-        # Already migrated? (idempotent — skip rows already at day/bank_site.)
-        if row.get("date_precision") == "day" and row.get("date_source") == "bank_site":
+        # Already migrated? (idempotent — once a row's date came from the bank
+        # site we don't touch it again, whatever its precision: a Fed paper can
+        # legitimately settle at month precision.)
+        if row.get("date_source") == "bank_site":
             summary["already_day"] += 1
             continue
 
@@ -121,6 +129,9 @@ def build_report(bank: str, fetcher: Fetcher,
             "doc_type": row.get("doc_type"),
             "old_date": row.get("date"),
             "new_date": new_date,
+            # the native source's own precision (e.g. Fed papers without a confirmed
+            # day, or revisions outside the listing month, stay "month")
+            "date_precision": native.date_precision,
             "match_type": match_type,
             "old_url": row.get("pdf_url"),
             "native_url": native_url,
@@ -140,7 +151,10 @@ def apply_change(row: dict, change: dict) -> None:
     / pdf_url are deliberately left untouched — the file on disk is the same.
     """
     row["date"] = change["new_date"]
-    row["date_precision"] = "day"
+    # keep the derived `year` field consistent with the (possibly year-shifted) date
+    if change.get("new_date"):
+        row["year"] = int(change["new_date"][:4])
+    row["date_precision"] = change.get("date_precision") or "day"
     row["date_source"] = "bank_site"
     if change.get("repec_handle"):
         row["repec_handle"] = change["repec_handle"]
@@ -186,7 +200,7 @@ def run_wp_migrate(bank_codes: Optional[Iterable[str]] = None,
     if all_changes:
         out = csv_path or str(cfg.reports_dir / "wp_migrate.csv")
         cfg.reports_dir.mkdir(parents=True, exist_ok=True)
-        fields = ["bank", "doc_id", "doc_type", "old_date", "new_date",
+        fields = ["bank", "doc_id", "doc_type", "old_date", "new_date", "date_precision",
                   "match_type", "old_url", "native_url", "repec_handle", "alt_url_added"]
         with open(out, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=fields)

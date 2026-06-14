@@ -281,6 +281,100 @@ def test_ecb_d1_d2_are_native_and_skip_known_urls(monkeypatch):
     assert [r.title for r in ad.discover(DocType.D1)] == ["b"]
 
 
+# ---- Fed (us) FEDS/IFDP scraper -------------------------------------
+from cb_corpus.sources.fed_wp import (
+    parse_year_links, parse_landing, fed_key_from_url, fed_key_from_handle,
+    discover_fed_wp, FED,
+)
+
+_FEDS_YEAR_HTML = """
+<div class="heading feds-note" id="2025110">
+  <span class="badge badge--feds"><strong>FEDS</strong> 2025-110 </span>
+  <div><time datetime="December 2025"> December 2025 </time>
+    <h5><a href="/econres/feds/slug-a.htm">Paper A</a></h5></div>
+</div>
+<div class="heading feds-note" id="2025050">
+  <span class="badge badge--feds"><strong>FEDS</strong> 2025-050 </span>
+  <div><time datetime="March 2025"> March 2025 </time>
+    <h5><a href="/econres/feds/slug-b.htm">Paper B (revised)</a></h5></div>
+</div>
+"""
+# A: landing day falls in the listing month -> day precision.
+_LANDING_A = ('<meta name="citation_publication_date" content="12-22-2025" />'
+              '<a href="/econres/feds/files/2025110pap.pdf">PDF</a>')
+# B: landing date is a later-year revision -> month precision (listing month kept).
+_LANDING_B = ('<meta name="citation_publication_date" content="01-15-2026" />'
+              '<a href="/econres/feds/files/2025050pap.pdf">PDF</a>')
+
+
+def test_parse_year_links_and_landing():
+    entries = parse_year_links(_FEDS_YEAR_HTML, "feds")
+    assert [(e[0], e[1], e[2]) for e in entries] == [("feds", 2025, 110), ("feds", 2025, 50)]
+    assert entries[0][3] == date(2025, 12, 1) and entries[0][4].endswith("/slug-a.htm")
+    cpd, pdf = parse_landing(_LANDING_A)
+    assert cpd == date(2025, 12, 22)
+    assert pdf == FED + "/econres/feds/files/2025110pap.pdf"
+
+
+def test_fed_key_extraction_and_consistency():
+    # URL forms (FEDS modern uses NNNpap.pdf; IFDP modern uses files/ifdp{seq}.pdf)
+    assert fed_key_from_url(FED + "/econres/feds/files/2022086pap.pdf") == ("feds", 2022, 86)
+    assert fed_key_from_url(FED + "/econres/ifdp/files/ifdp1429.pdf") == ("ifdp", 1429)
+    assert fed_key_from_url(FED + "/pubs/feds/1997/199711/199711abs.html") == ("feds", 1997, 11)
+    assert fed_key_from_url(FED + "/pubs/ifdp/2000/694/ifdp694.pdf") == ("ifdp", 694)
+    # revised papers carry an r<N> infix but keep the same number
+    assert fed_key_from_url(FED + "/econres/feds/files/2025101r1pap.pdf") == ("feds", 2025, 101)
+    assert fed_key_from_url(FED + "/econres/ifdp/files/ifdp1429r2.pdf") == ("ifdp", 1429)
+    # handle / IDEAS-path forms
+    assert fed_key_from_handle("https://ideas.repec.org/p/fip/fedgfe/2022-82.html") == ("feds", 2022, 82)
+    assert fed_key_from_handle("RePEc:fip:fedgfe:95-24") == ("feds", 1995, 24)
+    assert fed_key_from_handle("https://ideas.repec.org/p/fip/fedgif/694.html") == ("ifdp", 694)
+    assert fed_key_from_handle("https://ideas.repec.org/p/fip/fedgfe/103343.html") is None
+    # native PDF key == manifest handle key for the same paper (the join works)
+    assert (fed_key_from_url(FED + "/econres/feds/files/2022086pap.pdf")
+            == fed_key_from_handle("RePEc:fip:fedgfe:2022-86"))
+    assert (fed_key_from_url(FED + "/pubs/ifdp/2000/694/ifdp694.pdf")
+            == fed_key_from_handle("RePEc:fip:fedgif:694"))
+
+
+def test_apply_change_preserves_native_precision():
+    """A Fed paper with no confirmed day must migrate to month precision, not be
+    mislabeled 'day'. apply_change honours the change's date_precision."""
+    from cb_corpus.wp_migrate import apply_change
+    row = {"date": "2022-12-01", "pdf_url": "https://x/a.pdf", "alt_urls": []}
+    apply_change(row, {"new_date": "2022-12-01", "date_precision": "month",
+                       "repec_handle": "RePEc:fip:fedgfe:2022-86",
+                       "alt_url_added": "https://y/a.pdf"})
+    assert row["date_precision"] == "month" and row["date_source"] == "bank_site"
+    assert row["repec_handle"] == "RePEc:fip:fedgfe:2022-86"
+    assert "https://y/a.pdf" in row["alt_urls"]
+
+
+def test_discover_fed_wp_month_constraint(monkeypatch):
+    pages = {
+        "feds/all-years": '<a href="/econres/feds/2025.htm">2025</a>',
+        "ifdp/all-years": "",                       # no IFDP years -> skip
+        "feds/2025.htm": _FEDS_YEAR_HTML,
+        "feds/slug-a.htm": _LANDING_A,
+        "feds/slug-b.htm": _LANDING_B,
+    }
+
+    class F:
+        def get_text(self, url):
+            for k, v in pages.items():
+                if k in url:
+                    return v
+            raise AssertionError(f"unexpected {url}")
+
+    recs = list(discover_fed_wp(F()))
+    assert len(recs) == 2 and all(r.bank_code == "us" and r.doc_type == DocType.D1 for r in recs)
+    a = next(r for r in recs if "2025110" in r.pdf_url)
+    b = next(r for r in recs if "2025050" in r.pdf_url)
+    assert a.date == date(2025, 12, 22) and a.date_precision == "day"     # day in listing month
+    assert b.date == date(2025, 3, 1) and b.date_precision == "month"     # revision -> month kept
+    assert a.date_source == "bank_site" and a.provenance == "bank_site"
+
+
 def test_run_wp_migrate_write_applies_in_place_and_is_idempotent(tmp_path, monkeypatch):
     native = [
         DocRecord(bank_code="ecb", doc_type=DocType.D1, title="WP 3244",
