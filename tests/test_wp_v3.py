@@ -325,6 +325,8 @@ def test_fed_key_extraction_and_consistency():
     # revised papers carry an r<N> infix but keep the same number
     assert fed_key_from_url(FED + "/econres/feds/files/2025101r1pap.pdf") == ("feds", 2025, 101)
     assert fed_key_from_url(FED + "/econres/ifdp/files/ifdp1429r2.pdf") == ("ifdp", 1429)
+    # 2015-16-era econresdata path (was the 2015-16 coverage gap)
+    assert fed_key_from_url(FED + "/econresdata/feds/2016/files/2016104pap.pdf") == ("feds", 2016, 104)
     # handle / IDEAS-path forms
     assert fed_key_from_handle("https://ideas.repec.org/p/fip/fedgfe/2022-82.html") == ("feds", 2022, 82)
     assert fed_key_from_handle("RePEc:fip:fedgfe:95-24") == ("feds", 1995, 24)

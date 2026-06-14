@@ -52,12 +52,16 @@ _MONTHS = {m: i for i, m in enumerate(
 #   FEDS modern: /econres/feds/files/{YYYY}{NNN}[r{N}]pap.pdf
 #   IFDP modern: /econres/ifdp/files/ifdp{seq}[r{N}].pdf   (seq is global, no year)
 #   legacy:      /pubs/{feds,ifdp}/{YYYY}/.../...(pap|abs).(pdf|ps|html)
-_FILES_RE = re.compile(r"/econres/feds/files/(\d{4})(\d+)(?:r\d+)?pap\.(?:pdf|ps)", re.I)
-_FILES_IFDP_RE = re.compile(r"/econres/ifdp/files/ifdp(\d+)(?:r\d+)?\.(?:pdf|ps)", re.I)
+# `econres/feds/files/…` (modern) and the 2015-16-era `econresdata/feds/{year}/files/…`
+# are the same scheme under two path roots — accept both.
+_FILES_RE = re.compile(r"/econres(?:data)?/feds/(?:\d{4}/)?files/(\d{4})(\d+)(?:r\d+)?pap\.(?:pdf|ps)", re.I)
+_FILES_IFDP_RE = re.compile(r"/econres(?:data)?/ifdp/(?:\d{4}/)?files/ifdp(\d+)(?:r\d+)?\.(?:pdf|ps)", re.I)
 _PUBS_RE = re.compile(r"/pubs/(feds|ifdp)/(\d{4})/[^/]+/([a-z]*)(\d+)(?:pap|abs)?\.", re.I)
-# A Fed working-paper PDF/PS link on a landing page (modern files/ or legacy pubs/).
+# A Fed working-paper PDF/PS link on a landing page (modern files/, 2015-16
+# econresdata/{year}/files/, or legacy pubs/).
 _PDF_HREF = re.compile(
-    r"/(?:econres/(?:feds|ifdp)/files|pubs/(?:feds|ifdp)/\d{4}/[^/\"']+)/[^\"'\s]+\.(?:pdf|ps)", re.I)
+    r"/(?:econres(?:data)?/(?:feds|ifdp)/(?:\d{4}/)?files|pubs/(?:feds|ifdp)/\d{4}/[^/\"']+)"
+    r"/[^\"'\s]+\.(?:pdf|ps)", re.I)
 # RePEc handle or IDEAS path: fip:fedgfe:2022-82 | /fip/fedgfe/2022-82.html |
 # fedgfe:1997-11 | fedgfe:95-24 | fedgif:694 | fedgfe:103343 (bare global id).
 _HANDLE_RE = re.compile(r"fedg(fe|if)[:/](\d{2,4})(?:-(\d+))?", re.I)
