@@ -375,6 +375,55 @@ def test_discover_fed_wp_month_constraint(monkeypatch):
     assert a.date_source == "bank_site" and a.provenance == "bank_site"
 
 
+# ---- BoJ (jp) Working Paper Series scraper --------------------------
+from cb_corpus.sources.boj_wp import parse_wp_table, boj_code, discover_boj_wp
+
+# 5-column modern row + 3-column legacy row (no "No." column), &nbsp; in dates.
+_BOJ_2025 = """<table><tbody>
+<tr><td>25-E-13</td><td>Nov.&nbsp;13,&nbsp;2025</td><td>A. Author</td>
+<td><a href="/en/research/wps_rev/wps_2025/wp25e13.htm">Interest Rate Sensitivity</a></td>
+<td><a href="/en/research/wps_rev/wps_2025/data/wp25e13.pdf">[PDF 709KB]</a></td></tr>
+</tbody></table>"""
+_BOJ_2002 = """<table><tbody>
+<tr><td>May&nbsp;15,&nbsp;2003</td>
+<td><a href="/en/research/wps_rev/wps_2002/cwp02e08.htm">Time-Varying NAIRU</a></td>
+<td><a href="/en/research/wps_rev/wps_2002/data/cwp02e08.pdf">[PDF]</a></td></tr>
+</tbody></table>"""
+
+
+def test_boj_parse_table_both_layouts():
+    base = "https://www.boj.or.jp/en/research/wps_rev/wps_2025/index.htm"
+    r = parse_wp_table(_BOJ_2025, base)
+    assert len(r) == 1
+    d, prec, title, pdf = r[0]
+    assert d == date(2025, 11, 13) and prec == "day"
+    assert title == "Interest Rate Sensitivity"
+    assert pdf.endswith("/wps_2025/data/wp25e13.pdf")
+    # 3-column legacy row still parsed (date found by content, not column index)
+    r2 = parse_wp_table(_BOJ_2002, "https://www.boj.or.jp/en/research/wps_rev/wps_2002/index.htm")
+    assert r2[0][0] == date(2003, 5, 15) and r2[0][1] == "day"
+
+
+def test_boj_code_key_from_url_and_handle():
+    assert boj_code("https://www.boj.or.jp/.../wps_2025/data/wp25e13.pdf") == (25, "e", 13)
+    assert boj_code("https://ideas.repec.org/p/boj/bojwps/wp25e09.html") == (25, "e", 9)
+    assert boj_code("https://ideas.repec.org/p/boj/bojwps/02-e-2r.html") == (2, "e", 2)
+    assert boj_code("https://www.boj.or.jp/.../wps_2002/data/cwp02e08.pdf") == (2, "e", 8)
+    # native PDF key == manifest handle key for the same paper
+    assert (boj_code(".../wps_2002/data/cwp02e02.pdf") == boj_code(".../bojwps/02-e-2.html"))
+
+
+def test_boj_adapter_routes_d1_native(monkeypatch):
+    from cb_corpus.adapters.boj import BoJAdapter
+    import cb_corpus.sources.boj_wp as boj_mod
+    recs = [DocRecord(bank_code="jp", doc_type=DocType.D1, title="x",
+                      pdf_url="https://www.boj.or.jp/en/research/wps_rev/wps_2025/data/wp25e13.pdf")]
+    monkeypatch.setattr(boj_mod, "discover_boj_wp", lambda fetcher, since=None: iter(recs))
+    ad = BoJAdapter(get_bank("jp"), fetcher=object())
+    assert DocType.D1 in ad.native_types and DocType.A3 in ad.native_types
+    assert [r.title for r in ad.discover(DocType.D1)] == ["x"]
+
+
 def test_run_wp_migrate_write_applies_in_place_and_is_idempotent(tmp_path, monkeypatch):
     native = [
         DocRecord(bank_code="ecb", doc_type=DocType.D1, title="WP 3244",

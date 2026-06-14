@@ -618,15 +618,19 @@ def test_ecb_index_parser():
 # ---- declarative adapters from TOML ---------------------------------
 def test_toml_factories_loaded_for_majors():
     # banks_sources.toml ships with at least these.
-    for code in ("ch", "ca", "fr", "jp"):
+    for code in ("ch", "ca", "fr"):
         assert code in INSTANCE_FACTORIES
-    # Hand-written ADAPTERS override TOML for us/ecb/au.
+    # Hand-written ADAPTERS override TOML for us/ecb/au/jp.
     from cb_corpus.adapters.fed import FedAdapter
     from cb_corpus.adapters.rba import RBAAdapter
+    from cb_corpus.adapters.boj import BoJAdapter
     assert isinstance(get_adapter("us"), FedAdapter)
     # `au` moved from a (frozen-2017) TOML sitemap to the RBAAdapter class.
     assert isinstance(get_adapter("au"), RBAAdapter)
     assert "au" not in INSTANCE_FACTORIES
+    # `jp` moved from a TOML listing to the BoJAdapter class (A3 + native D1 WPs).
+    assert isinstance(get_adapter("jp"), BoJAdapter)
+    assert "jp" not in INSTANCE_FACTORIES
 
 
 def test_sitemap_parser_handles_urlset_and_index():

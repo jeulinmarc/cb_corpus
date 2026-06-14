@@ -30,22 +30,26 @@ from .config import Config
 from .http import Fetcher
 from .sources.ecb_foedb import discover_ecb_wp, ecb_wp_number, repec_ecb_number
 from .sources.fed_wp import discover_fed_wp, fed_key_from_url, fed_key_from_handle
+from .sources.boj_wp import discover_boj_wp, boj_code
 from .storage import Storage
 
 # Native discovery per bank. doc_type ∈ {D1, D2}; returns DocRecords with day dates.
 _NATIVE = {
     "ecb": discover_ecb_wp,
     "us": discover_fed_wp,
+    "jp": discover_boj_wp,
 }
 # Per-bank join-key extractors: (pdf_url -> key) and (source_url/handle -> key).
 # Native records and manifest rows are matched on equality of these keys.
 _KEY_FROM_PDF = {
     "ecb": ecb_wp_number,
     "us": fed_key_from_url,
+    "jp": boj_code,                # paper code works from both the PDF URL and the handle
 }
 _KEY_FROM_HANDLE = {
     "ecb": repec_ecb_number,
     "us": fed_key_from_handle,
+    "jp": boj_code,
 }
 
 _IDEAS_PATH = re.compile(r"/p/([^/]+)/([^/]+)/([^/.]+)")

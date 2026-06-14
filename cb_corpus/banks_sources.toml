@@ -33,7 +33,5 @@ sitemap_url = "https://www.banque-france.fr/sitemap.xml"
 [fr.sitemap.patterns]
 E2 = "/publications/.*stabilite-financiere.*\\.pdf$"
 
-[jp.listing]
-year_range = [2015, 2025]
-[jp.listing.entries]
-A3 = [["https://www.boj.or.jp/en/mopo/mpmsche_minu/minu_{year}/index.htm", "g\\d{6}\\.pdf$"]]
+# jp (BoJ) is a hand-written adapter (cb_corpus/adapters/boj.py): A3 minutes +
+# native D1 working papers. Its A3 listing config lives there, not here.
