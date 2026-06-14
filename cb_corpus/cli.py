@@ -123,6 +123,12 @@ def main(argv: list[str] | None = None) -> int:
     wd.add_argument("--write", action="store_true",
                     help="apply recovered days to the manifest + append to the index")
 
+    rc = sub.add_parser("repec-check",
+                        help="WP v3 phase 2: audit RePEc/IDEAS coverage vs the manifest "
+                             "(missing papers per bank). Never downloads.")
+    rc.add_argument("--banks", default="", help="restrict to wired banks (default: all)")
+    rc.add_argument("--csv", default="", help="CSV output path (default data/reports/repec_check.csv)")
+
     args = p.parse_args(argv)
     banks = _banks(getattr(args, "banks", ""))
 
@@ -203,6 +209,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "wp-dates":
         from .wp_dates import run_wp_dates
         run_wp_dates(bank_codes=banks, csv_path=args.csv or None, write=args.write)
+        return 0
+
+    if args.cmd == "repec-check":
+        from .repec_check import run_repec_check
+        run_repec_check(bank_codes=banks, csv_path=args.csv or None)
         return 0
     return 1
 

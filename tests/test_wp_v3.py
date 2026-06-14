@@ -553,6 +553,25 @@ def test_wp_dates_recover_wayback_month_constrained(monkeypatch):
     assert recover(object(), {"date": "2002-01-01", "pdf_url": "https://x/200201pap.pdf"}) is None
 
 
+# ---- phase 2: repec-check ------------------------------------------
+from cb_corpus.repec_check import parse_series_listing
+
+
+def test_repec_check_parse_series_listing():
+    html = """
+    <a href="/p/ecb/ecbwps/2007722.html">By citations</a>
+    <a href="/p/ecb/ecbwps/20263244.html">Fiscal policy transmission through production networks</a>
+    <a href="/p/ecb/ecbwps/20263243.html">Herding in the foreign exchange market</a>
+    <a href="/p/ecb/ecbwps/20263244.html">By downloads</a>
+    <a href="/cgi-bin/other.html">unrelated</a>
+    """
+    rows = dict(parse_series_listing(html, "ecb", "ecbwps"))
+    assert set(rows) == {"2007722", "20263244", "20263243"}     # ids, deduped
+    # the real title wins over the 'By downloads' sort link for 20263244
+    assert rows["20263244"].startswith("Fiscal policy transmission")
+    assert rows["20263243"] == "Herding in the foreign exchange market"
+
+
 def test_run_wp_migrate_write_applies_in_place_and_is_idempotent(tmp_path, monkeypatch):
     native = [
         DocRecord(bank_code="ecb", doc_type=DocType.D1, title="WP 3244",
