@@ -23,10 +23,22 @@ class DocRecord:
     sha256: Optional[str] = None       # filled after download
     local_path: Optional[str] = None   # filled after download — the canonical artifact (PDF preferred)
     html_path: Optional[str] = None    # set when source was HTML — the original HTML sibling file
-    # Runtime-only ordered fallback PDF URLs (e.g. EconStor/SSRN copies) tried by
-    # Storage when the preferred `pdf_url` download fails (host 403 / dead link).
-    # NOT serialized and NOT part of doc_id, so identity/dedup stay stable on the
-    # preferred URL regardless of which copy actually downloaded.
+    # Date-quality metadata (WP v3). `date_precision` is how precise `date` is;
+    # `date_source` is where that date came from. Defaults describe the common
+    # case — a native bank-site listing with an exact day. Producers that yield a
+    # coarser/different date MUST set these explicitly (e.g. RePEc → month/repec,
+    # a year-only listing → year). This makes date quality auditable per row.
+    date_precision: str = "day"        # day | month | year
+    date_source: str = "bank_site"     # bank_site | repec | wayback | pdf_meta | nep_bound | llm_crawl
+    # RePEc handle (e.g. "RePEc:ecb:ecbwps:20253117"), stamped by repec-check /
+    # the v2 migration when a manifest row is matched to its IDEAS record. Empty
+    # when unknown. Optional metadata only — never part of doc_id.
+    repec_handle: str = ""
+    # Ordered fallback PDF URLs (e.g. EconStor/SSRN copies, or a native URL found
+    # for a paper first ingested via RePEc) tried by Storage when the preferred
+    # `pdf_url` download fails. NOT part of doc_id, so identity/dedup stay stable
+    # on the preferred URL regardless of which copy actually downloaded. Persisted
+    # (since WP v3) so dedup recognises alternate URLs across restarts.
     alt_urls: list[str] = field(default_factory=list)
 
     @property
@@ -48,7 +60,6 @@ class DocRecord:
 
     def to_row(self) -> dict:
         d = asdict(self)
-        d.pop("alt_urls", None)            # runtime-only, not persisted
         d["doc_type"] = self.doc_type.code
         d["date"] = self.date.isoformat() if self.date else None
         d["doc_id"] = self.doc_id

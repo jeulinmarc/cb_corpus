@@ -14,7 +14,6 @@ Strategies tried in order:
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import subprocess
 import sys
 import tempfile
@@ -24,6 +23,7 @@ from typing import Optional
 
 from .config import Config
 from .htmlpdf import find_chrome
+from .storage import iter_manifest_rows, write_per_bank
 
 
 def _try_strategy(chrome: str, url: str, output: Path,
@@ -86,10 +86,6 @@ def retry_failed(config: Optional[Config] = None,
     if chrome is None:
         raise RuntimeError("no Chrome / Chromium binary found")
 
-    manifest = cfg.manifest_path
-    if not manifest.exists():
-        return {}
-
     counts: dict[str, int] = {}
     counts_lock = threading.Lock()
     failures: list[tuple[str, str]] = []
@@ -97,8 +93,9 @@ def retry_failed(config: Optional[Config] = None,
     updates: dict[str, tuple[str, str, Optional[str]]] = {}
     updates_lock = threading.Lock()
 
-    with manifest.open() as fh:
-        rows = [json.loads(l) for l in fh if l.strip()]
+    rows = list(iter_manifest_rows(cfg))
+    if not rows:
+        return {}
 
     # Build worklist of HTML rows + identify already-rendered PDFs.
     worklist: list[tuple[dict, Path, Path]] = []
@@ -174,19 +171,14 @@ def retry_failed(config: Optional[Config] = None,
 
     # Merge updates into a FRESH read of the manifest so concurrent writers
     # (e.g. convert-html still running) don't get their updates overwritten.
-    with manifest.open() as fh:
-        fresh_rows = [json.loads(l) for l in fh if l.strip()]
+    fresh_rows = list(iter_manifest_rows(cfg))
     for row in fresh_rows:
         upd = updates.get(row.get("doc_id"))
         if upd is not None:
             row["mime_type"], row["local_path"], html_path = upd
             if html_path:
                 row["html_path"] = html_path
-    tmp = manifest.with_suffix(".jsonl.tmp")
-    with tmp.open("w") as fh:
-        for row in fresh_rows:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-    tmp.replace(manifest)
+    write_per_bank(cfg, fresh_rows)
 
     # Write failed URLs to a file the user can pick up.
     if failures:

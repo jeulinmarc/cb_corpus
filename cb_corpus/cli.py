@@ -102,6 +102,17 @@ def main(argv: list[str] | None = None) -> int:
                    help="Retry every still-failed text/html with escalating "
                         "strategies; write data/failed_urls.txt at the end.")
 
+    wm = sub.add_parser("wp-migrate",
+                        help="WP v3: replace RePEc YYYY-MM-01 dates on existing "
+                             "D1/D2 rows with native bank-site day dates. Default "
+                             "dry-run (report + CSV, no writes); --write applies "
+                             "the metadata fixes in place. Never downloads PDFs.")
+    wm.add_argument("--banks", default="", help="restrict to wired banks (e.g. ecb)")
+    wm.add_argument("--csv", default="", help="CSV output path (default data/reports/wp_migrate.csv)")
+    wm.add_argument("--write", action="store_true",
+                    help="apply the date fixes to the manifest (metadata only: "
+                         "date/precision/source/handle/alt_urls; doc_id unchanged)")
+
     args = p.parse_args(argv)
     banks = _banks(getattr(args, "banks", ""))
 
@@ -172,6 +183,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "retry-html":
         counts = retry_failed()
         print("retry-html:", counts)
+        return 0
+
+    if args.cmd == "wp-migrate":
+        from .wp_migrate import run_wp_migrate
+        run_wp_migrate(bank_codes=banks, csv_path=args.csv or None, write=args.write)
         return 0
     return 1
 

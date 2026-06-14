@@ -1,0 +1,20 @@
+{
+"name": "publications.en",
+"total_records": 6,
+"chunk_size": 250,
+"header": [
+"id",
+"pub_timestamp",
+"year",
+"issue_number",
+"type",
+"JEL_Code",
+"Taxonomy",
+"boardmember",
+"Authors",
+"documentTypes",
+"publicationProperties",
+"childrenPublication",
+"relatedPublications"
+]
+}

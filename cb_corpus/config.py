@@ -30,7 +30,17 @@ class Config:
 
     @property
     def manifest_path(self) -> Path:
+        """Legacy single-file manifest. Kept as the source for the one-time split
+        into per-bank files (see Storage); current storage is per-bank."""
         return self.data_dir / "manifest.jsonl"
+
+    @property
+    def manifest_dir(self) -> Path:
+        """Directory of per-bank manifests: data/manifest/<bank_code>.jsonl."""
+        return self.data_dir / "manifest"
+
+    def manifest_file(self, bank_code: str) -> Path:
+        return self.manifest_dir / f"{bank_code}.jsonl"
 
     @property
     def reports_dir(self) -> Path:

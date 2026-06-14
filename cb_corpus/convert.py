@@ -8,8 +8,6 @@ Idempotent: re-running on an already-converted manifest does nothing.
 """
 from __future__ import annotations
 
-import json
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -17,6 +15,7 @@ from typing import Optional
 
 from .config import Config
 from .htmlpdf import find_chrome, render_url_to_pdf
+from .storage import iter_manifest_rows, write_per_bank
 
 
 def _ext_swap(path: Path, new_ext: str) -> Path:
@@ -37,36 +36,25 @@ def convert_existing(config: Optional[Config] = None,
     cfg = config or Config()
     if find_chrome() is None:
         raise RuntimeError("no Chrome / Chromium binary found")
-    manifest = cfg.manifest_path
-    if not manifest.exists():
+    rewritten: list[dict] = list(iter_manifest_rows(cfg))
+    if not rewritten:
         return {"empty": 0}
 
     counts: dict[str, int] = {}
-    rewritten: list[dict] = []
     n = 0
     # One Chrome profile reused across renders — avoids per-call cold-start
     # (10x speedup vs fresh tempdir per render).
     with tempfile.TemporaryDirectory(prefix="cbc_chrome_convert_") as udd:
-        with manifest.open() as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                status = _convert_one(row, user_data_dir=udd, dry_run=dry_run)
-                counts[status] = counts.get(status, 0) + 1
-                rewritten.append(row)
-                n += 1
-                if n % 50 == 0:
-                    print(f"[convert-html] processed {n} ({dict(counts)})",
-                          file=sys.stderr, flush=True)
+        for row in rewritten:
+            status = _convert_one(row, user_data_dir=udd, dry_run=dry_run)
+            counts[status] = counts.get(status, 0) + 1
+            n += 1
+            if n % 50 == 0:
+                print(f"[convert-html] processed {n} ({dict(counts)})",
+                      file=sys.stderr, flush=True)
 
     if not dry_run:
-        tmp = manifest.with_suffix(".jsonl.tmp")
-        with tmp.open("w") as fh:
-            for row in rewritten:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        tmp.replace(manifest)
+        write_per_bank(cfg, rewritten)
     return counts
 
 

@@ -44,7 +44,8 @@ class _FakeFetcher:
 
 
 def _manifest(cfg):
-    return [json.loads(l) for l in cfg.manifest_path.read_text().splitlines() if l.strip()]
+    from cb_corpus.storage import iter_manifest_rows
+    return list(iter_manifest_rows(cfg))
 
 
 # --- run_ecb_pub_recovery: PRIMARY (per-section/year static include) ---

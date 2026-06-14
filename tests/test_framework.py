@@ -344,8 +344,9 @@ def test_storage_tries_alt_urls_on_download_failure(tmp_path):
                      "https://econstor.eu/fallback.pdf"]        # tried in order
     assert Path(rec.local_path).read_bytes().startswith(b"%PDF")
     assert rec.pdf_url == "https://blocked.fr/preferred.pdf"    # citation/doc_id unchanged
-    # alt_urls is runtime-only — never serialized to the manifest.
-    assert "alt_urls" not in rec.to_row()
+    # alt_urls is persisted (WP v3) so dedup recognises fallback URLs across
+    # restarts — but doc_id stays bound to the preferred pdf_url.
+    assert rec.to_row()["alt_urls"] == ["https://econstor.eu/fallback.pdf"]
 
 
 def test_wayback_cdx_parse_and_raw_url():
@@ -732,15 +733,16 @@ def test_dry_run_does_not_persist_and_never_blocks_real_save(tmp_path):
     rec = DocRecord(bank_code="us", doc_type=DocType.A2, title="x",
                     pdf_url="https://x/a.pdf", date=date(2020, 1, 1),
                     mime_type="application/pdf")
+    from cb_corpus.storage import iter_manifest_rows
     st = Storage(cfg)
     assert st.save(rec, dry_run=True) == "dry-run:indexed"
     # Manifest stays empty — nothing persisted.
-    assert not cfg.manifest_path.exists() or cfg.manifest_path.read_text().strip() == ""
+    assert list(iter_manifest_rows(cfg)) == []
     # A fresh Storage (new process) still downloads it.
     st2 = Storage(cfg)
     st2.fetcher.get_bytes = lambda url: (b"%PDF-1.4 data", "application/pdf")
     assert st2.save(rec) == "saved"
-    assert cfg.manifest_path.read_text().strip().count("\n") == 0  # exactly 1 line
+    assert len(list(iter_manifest_rows(cfg))) == 1  # exactly 1 row
 
 
 def test_sweep_chrome_profiles_removes_dead_pids(tmp_path):
@@ -855,7 +857,8 @@ def test_retry_html_recovers_and_records_failures(tmp_path, monkeypatch):
     assert counts.get("skip") == 1
 
     # Manifest updated correctly.
-    rows = [_json.loads(l) for l in cfg.manifest_path.read_text().splitlines()]
+    from cb_corpus.storage import iter_manifest_rows
+    rows = list(iter_manifest_rows(cfg))
     a_row = next(r for r in rows if r["doc_id"] == "a")
     b_row = next(r for r in rows if r["doc_id"] == "b")
     c_row = next(r for r in rows if r["doc_id"] == "c")
@@ -900,7 +903,8 @@ def test_convert_existing_rewrites_manifest(tmp_path, monkeypatch):
     pdf_path = html_path.with_suffix(".pdf")
     # New policy: keep BOTH the HTML and the rendered PDF.
     assert pdf_path.exists() and html_path.exists()
-    row = _json.loads(cfg.manifest_path.read_text().splitlines()[0])
+    from cb_corpus.storage import iter_manifest_rows
+    row = list(iter_manifest_rows(cfg))[0]
     assert row["mime_type"] == "application/pdf"
     assert row["local_path"].endswith(".pdf")
     assert row["html_path"].endswith(".html")
@@ -1011,6 +1015,9 @@ def test_pipeline_run_converges_and_records_errors(tmp_path, monkeypatch):
     class FakeStorage:
         def __init__(self, *a, **k):
             pass
+
+        def is_known_url(self, url):
+            return False
 
         def save_many(self, recs, dry_run=False, label=""):
             list(recs)

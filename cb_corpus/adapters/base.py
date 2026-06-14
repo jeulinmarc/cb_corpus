@@ -89,8 +89,27 @@ class BankAdapter(ABC):
         if doc_type == DocType.C1:
             yield from self._bis.discover(since=since, only_banks={self.bank.code})
         elif doc_type in (DocType.D1, DocType.D2):
-            yield from (r for r in self._repec.discover_bank(self.bank.code)
-                        if r.doc_type == doc_type)
+            # WP v3: a bank that declares D1/D2 in `native_types` discovers them
+            # from its own site (precise dates, no RePEc lag); every other bank
+            # keeps the RePEc path. No bank opts in until its v2 rows have been
+            # date-migrated (see docs/IMPLEMENTATION_PLAN.md phase 3) — flipping
+            # before migration would re-download papers found under new URLs.
+            if doc_type in self.native_types:
+                recs = self._discover_native(doc_type, since)
+                # Zero re-download after migration: a native scraper often finds a
+                # paper under a different URL than its v2 RePEc-era row, so its
+                # doc_id differs and save() (which dedups by doc_id/sha256, not URL)
+                # would re-fetch it. The migration registered the native URL in the
+                # row's alt_urls, so is_known_url() recognises it — skip those here,
+                # before download. Set by the pipeline (`_skip_known_url`); absent in
+                # reindex/test paths, which want every record.
+                skip = getattr(self, "_skip_known_url", None)
+                if skip is not None:
+                    recs = (r for r in recs if not skip(r.pdf_url))
+                yield from recs
+            else:
+                yield from (r for r in self._repec.discover_bank(self.bank.code)
+                            if r.doc_type == doc_type)
         else:
             yield from self._discover_native(doc_type, since)
 

@@ -182,6 +182,11 @@ class RePEcDiscovery:
                     date=pub_date,
                     provenance="repec_discovery",
                     mime_type="application/pdf",
+                    # RePEc's Creation-Date is month-only (YYYY-MM, padded to day 1
+                    # by _iso_date) — record that honestly so the date-recovery
+                    # waterfall and repec-check can target these rows.
+                    date_precision="month",
+                    date_source="repec",
                 )
 
 

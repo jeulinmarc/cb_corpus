@@ -1,5 +1,10 @@
-# Downloaded corpus (large, regenerable)
-data/
+# Downloaded corpus (large, regenerable) — PDFs/reports/backups stay ignored,
+# but the per-bank manifests (data/manifest/<bank>.jsonl) ARE committed so the
+# corpus metadata is versioned and replayable.
+data/*
+!data/manifest/
+data/manifest/*
+!data/manifest/*.jsonl
 
 # Python
 __pycache__/

@@ -196,12 +196,25 @@ def parse_index(html: str, base_url: str = ECB,
 
 @register("ecb")
 class ECBAdapter(BankAdapter):
-    native_types = (DocType.A1, DocType.A2, DocType.A3, DocType.E4)
+    # D1/D2 are native (foedb JSON DB, see sources/ecb_foedb.py) rather than RePEc:
+    # exact day dates, no indexing lag, full archive. Safe to flip only because the
+    # WP v3 migration ran first (registered native URLs in alt_urls → zero
+    # re-download; see docs/IMPLEMENTATION_PLAN.md phase 3).
+    native_types = (DocType.A1, DocType.A2, DocType.A3, DocType.E4,
+                    DocType.D1, DocType.D2)
     expected_per_year = {DocType.A1: 8, DocType.A2: 8, DocType.A3: 8, DocType.E4: 8}
 
     def _discover_native(self, doc_type: DocType,
                          since: Optional[date]) -> Iterator[DocRecord]:
-        if doc_type == DocType.A1:
+        if doc_type in (DocType.D1, DocType.D2):
+            # Native WP/OP via the ECB foedb JSON DB (day precision, full archive).
+            # Reached only once D1/D2 are added to `native_types` (post-migration);
+            # until then base.py routes D1/D2 to RePEc. The migration command calls
+            # discover_ecb_wp directly.
+            from ..sources.ecb_foedb import discover_ecb_wp
+            yield from (r for r in discover_ecb_wp(self.fetcher, since)
+                        if r.doc_type == doc_type)
+        elif doc_type == DocType.A1:
             yield from self._discover_index(MOPO_INDEX, since, parse_decision_items,
                                             DocType.A1, "Monetary policy decision")
         elif doc_type == DocType.A2:
@@ -272,4 +285,6 @@ class ECBAdapter(BankAdapter):
                 date=d,
                 provenance="bank_site",
                 mime_type="application/pdf",
+                # The all-releases page gives no day; date is Jan 1 of the year.
+                date_precision="year",
             )
