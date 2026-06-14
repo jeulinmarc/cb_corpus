@@ -31,6 +31,8 @@ from .http import Fetcher
 from .sources.ecb_foedb import discover_ecb_wp, ecb_wp_number, repec_ecb_number
 from .sources.fed_wp import discover_fed_wp, fed_key_from_url, fed_key_from_handle
 from .sources.boj_wp import discover_boj_wp, boj_code
+from .sources.boe_wp import discover_boe_wp, boe_slug
+from .sources.buba_wp import discover_buba_wp, de_blob_key, de_handle_key
 from .storage import Storage
 
 # Native discovery per bank. doc_type ∈ {D1, D2}; returns DocRecords with day dates.
@@ -38,18 +40,26 @@ _NATIVE = {
     "ecb": discover_ecb_wp,
     "us": discover_fed_wp,
     "jp": discover_boj_wp,
+    "gb": discover_boe_wp,
+    "de": discover_buba_wp,
 }
 # Per-bank join-key extractors: (pdf_url -> key) and (source_url/handle -> key).
-# Native records and manifest rows are matched on equality of these keys.
+# Native records and manifest rows are matched on equality of these keys. Banks
+# whose manifest rows carry neither a usable number nor URL (de = EconStor copies)
+# lean on the exact-normalized-title tier in build_report().
 _KEY_FROM_PDF = {
     "ecb": ecb_wp_number,
     "us": fed_key_from_url,
     "jp": boj_code,                # paper code works from both the PDF URL and the handle
+    "gb": boe_slug,                # BoE WP numbers aren't in the URL — match on the slug
+    "de": de_blob_key,             # DP number from the Bundesbank blob filename
 }
 _KEY_FROM_HANDLE = {
     "ecb": repec_ecb_number,
     "us": fed_key_from_handle,
     "jp": boj_code,
+    "gb": lambda h: None,          # RePEc handle (boe:boeewp:NNNN) has no slug
+    "de": de_handle_key,           # DP number from zbw:bubdps:{NN}{YYYY} (None if global id)
 }
 
 _IDEAS_PATH = re.compile(r"/p/([^/]+)/([^/]+)/([^/.]+)")
@@ -73,6 +83,16 @@ def normalize_url(u: str) -> str:
     return u
 
 
+def normalize_title(s: str) -> str:
+    """Canonicalise a title for an EXACT dedup match (the rule in
+    docs/REPEC_AS_CHECK.md): lowercase, strip accents, non-alphanumeric runs ->
+    single space, trimmed. Only EXACT normalized equality is ever auto-acted."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
 def _row_key(bank: str, row: dict):
     """(doc_type, number) join key for a manifest row: from pdf_url, else handle."""
     return (_KEY_FROM_PDF[bank](row.get("pdf_url") or "")
@@ -86,20 +106,28 @@ def build_report(bank: str, fetcher: Fetcher,
     Returns (summary_counts, change_rows). Each change row describes one matched
     manifest document and the metadata rewrite that the migration would apply.
     """
-    # Index native discovery by join key and by normalized URL.
+    # Index native discovery by join key, by normalized URL, and by normalized
+    # title (the title index keeps only UNAMBIGUOUS titles — see below).
     key_from_pdf = _KEY_FROM_PDF[bank]
     native_by_key: dict = {}
     native_by_url: dict = {}
+    title_recs: dict = {}
     for rec in _NATIVE[bank](fetcher):
         key = key_from_pdf(rec.pdf_url)
         if key is not None:
             native_by_key.setdefault(key, rec)
         native_by_url.setdefault(normalize_url(rec.pdf_url), rec)
+        t = normalize_title(rec.title)
+        if t:
+            title_recs.setdefault(t, []).append(rec)
+    # An exact normalized title is safe to match ONLY when it is unique in the
+    # native set (otherwise we can't tell which paper it is).
+    native_by_title = {t: recs[0] for t, recs in title_recs.items() if len(recs) == 1}
 
     summary = {"native_total": len(native_by_url), "manifest_total": 0,
-               "matched_key": 0, "matched_url": 0, "already_day": 0,
-               "unmatched_manifest": 0}
-    matched_native_keys: set = set()
+               "matched_key": 0, "matched_url": 0, "matched_title": 0,
+               "already_day": 0, "unmatched_manifest": 0}
+    matched_native_urls: set = set()
     changes: list[dict] = []
 
     for row in manifest_rows:
@@ -113,11 +141,13 @@ def build_report(bank: str, fetcher: Fetcher,
             native = native_by_url.get(normalize_url(row.get("pdf_url") or ""))
             match_type = "url" if native is not None else ""
         if native is None:
+            native = native_by_title.get(normalize_title(row.get("title") or ""))
+            match_type = "title" if native is not None else ""
+        if native is None:
             summary["unmatched_manifest"] += 1
             continue
         summary[f"matched_{match_type}"] += 1
-        if key is not None:
-            matched_native_keys.add(key)
+        matched_native_urls.add(normalize_url(native.pdf_url))
 
         # Already migrated? (idempotent — once a row's date came from the bank
         # site we don't touch it again, whatever its precision: a Fed paper can
@@ -143,7 +173,7 @@ def build_report(bank: str, fetcher: Fetcher,
             "alt_url_added": native_url if native_url != (row.get("pdf_url") or "") else "",
         })
 
-    summary["native_only"] = sum(1 for k in native_by_key if k not in matched_native_keys)
+    summary["native_only"] = sum(1 for u in native_by_url if u not in matched_native_urls)
     return summary, changes
 
 

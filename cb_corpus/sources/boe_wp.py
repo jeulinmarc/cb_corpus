@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
 from ..http import Fetcher
+from ..models import DocRecord
+from ..taxonomy import DocType
 
 BOE = "https://www.bankofengland.co.uk"
 WP_SITEMAP = BOE + "/sitemap/staff-working-paper"
@@ -27,6 +29,88 @@ _PDF_RE = re.compile(r"/-/media/boe/files/working-paper/\d{4}/[^\"'>\s]+?\.pdf",
 # Any BoE media PDF (used for non-working-paper docs: minutes, reports, ...).
 _ANY_PDF_RE = re.compile(r"/-/media/boe/files/[^\"'>\s]+?\.pdf", re.I)
 _YEAR_IN_URL = re.compile(r"/(\d{4})/")
+# Slug join key: from a paper page (/working-paper/2025/slug) or its media PDF
+# (/-/media/boe/files/working-paper/2025/slug.pdf) — same slug either way.
+_SLUG_RE = re.compile(r"/working-paper/\d{4}/([a-z0-9][a-z0-9\-]*?)(?:\.pdf)?$", re.I)
+# "Published on 30 May 2025" on the paper page = the exact publication day.
+_PUBLISHED_RE = re.compile(r"Published on\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", re.I)
+_MON = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def boe_slug(url: str) -> Optional[str]:
+    """Normalised staff-working-paper slug from a page or media-PDF URL."""
+    m = _SLUG_RE.search(url or "")
+    return m.group(1).lower() if m else None
+
+
+def _published_date(html: str) -> Optional[date]:
+    m = _PUBLISHED_RE.search(html or "")
+    if not m or m.group(2)[:3].lower() not in _MON:
+        return None
+    try:
+        return date(int(m.group(3)), _MON[m.group(2)[:3].lower()], int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def paper_meta(fetcher: Fetcher, page_url: str
+               ) -> Optional[tuple[Optional[date], str, str]]:
+    """Fetch a staff-WP page; return (published_date | None, title, real_pdf_url).
+
+    The day comes from the "Published on …" line; None when absent (older pages)
+    so the caller falls back to year precision. PDF/title via :func:`paper_pdf`.
+    """
+    try:
+        html = fetcher.get_text(page_url)
+    except Exception:
+        return None
+    soup = _soup(html)
+    if soup is None:
+        return None
+    pdf = None
+    for a in soup.find_all("a", href=True):
+        if _PDF_RE.search(a["href"]):
+            pdf = urljoin(BOE, a["href"])
+            break
+    if pdf is None:
+        m = _PDF_RE.search(html)
+        pdf = urljoin(BOE, m.group(0)) if m else None
+    if pdf is None:
+        return None
+    title = ""
+    for m in soup.find_all("meta"):
+        if (m.get("property") or "").lower() == "og:title":
+            title = (m.get("content") or "").strip()
+    if not title and soup.title:
+        title = soup.title.get_text(strip=True)
+    return _published_date(html), (title or page_url.rsplit("/", 1)[-1]), pdf
+
+
+def discover_boe_wp(fetcher: Fetcher, since: Optional[date] = None,
+                    years: Optional[set] = None) -> Iterator[DocRecord]:
+    """Yield BoE Staff Working Papers (D1) with the exact day from each paper page.
+
+    Walks the staff-WP sitemap (optionally restricted to `years` / `since` year),
+    then reads each paper page for its "Published on" day + real PDF. Falls back
+    to year precision when a page has no published date.
+    """
+    yrs = set(years) if years is not None else (
+        set(range(since.year, date.today().year + 1)) if since else None)
+    for d_year, page, derived in sitemap_pages(fetcher, yrs):
+        got = paper_meta(fetcher, page)
+        if got is None:
+            continue
+        d, title, pdf = got
+        prec = "day" if d else "year"
+        d = d or d_year                      # d_year is date(y, 1, 1) -> year precision
+        if since and d and d < since:
+            continue
+        yield DocRecord(
+            bank_code="gb", doc_type=DocType.D1, title=title,
+            pdf_url=pdf or derived, source_url=page, date=d, provenance="bank_site",
+            mime_type="application/pdf", date_precision=prec, date_source="bank_site",
+        )
 
 
 def _soup(html: str):

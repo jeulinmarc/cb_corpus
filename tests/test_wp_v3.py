@@ -424,6 +424,82 @@ def test_boj_adapter_routes_d1_native(monkeypatch):
     assert [r.title for r in ad.discover(DocType.D1)] == ["x"]
 
 
+# ---- BoE (gb) staff working papers ----------------------------------
+from cb_corpus.sources.boe_wp import boe_slug, _published_date
+
+
+def test_boe_published_date_and_slug():
+    assert _published_date("<p>Published on 30 May 2025</p>") == date(2025, 5, 30)
+    assert _published_date("<p>Published on 7 January 2016</p>") == date(2016, 1, 7)
+    assert _published_date("<p>no date</p>") is None
+    # slug is identical from the paper page and the media PDF (the join key)
+    assert boe_slug("https://x/working-paper/2025/some-slug") == "some-slug"
+    assert boe_slug("https://x/-/media/boe/files/working-paper/2025/some-slug.pdf") == "some-slug"
+    assert boe_slug("https://x/other") is None
+
+
+def test_build_report_title_tier_matches_slug_drift(monkeypatch):
+    """A BoE paper listed under a different slug than its manifest row still
+    matches via the exact-normalized-title tier (key/URL both miss)."""
+    from cb_corpus.wp_migrate import normalize_title
+    assert normalize_title("ECB-Global:  a Study!") == "ecb global a study"
+    native = [DocRecord(bank_code="gb", doc_type=DocType.D1, title="Some BoE Paper: A Study",
+                        pdf_url="https://x/-/media/boe/files/working-paper/2025/new-slug.pdf",
+                        date=date(2025, 5, 30))]
+    monkeypatch.setitem(wp_migrate._NATIVE, "gb", lambda fetcher: iter(native))
+    manifest = [{"doc_id": "g1", "bank_code": "gb", "doc_type": "D1", "date": "2025-01-01",
+                 "pdf_url": "https://x/-/media/boe/files/working-paper/2025/old-slug.pdf",
+                 "source_url": "https://ideas.repec.org/p/boe/boeewp/1116.html",
+                 "title": "Some BoE Paper: A Study"}]
+    summary, changes = build_report("gb", fetcher=None, manifest_rows=manifest)
+    assert summary["matched_title"] == 1 and summary["matched_key"] == 0
+    assert changes[0]["match_type"] == "title" and changes[0]["new_date"] == "2025-05-30"
+
+
+def test_boe_adapter_routes_d1_native(monkeypatch):
+    from cb_corpus.adapters.boe import BoEAdapter
+    import cb_corpus.sources.boe_wp as boe_mod
+    recs = [DocRecord(bank_code="gb", doc_type=DocType.D1, title="x",
+                      pdf_url="https://x/-/media/boe/files/working-paper/2025/s.pdf")]
+    monkeypatch.setattr(boe_mod, "discover_boe_wp", lambda fetcher, since=None: iter(recs))
+    ad = BoEAdapter(get_bank("gb"), fetcher=object())
+    assert DocType.D1 in ad.native_types
+    assert [r.title for r in ad.discover(DocType.D1)] == ["x"]
+
+
+# ---- Bundesbank (de) discussion papers ------------------------------
+from cb_corpus.sources.buba_wp import parse_de_paper, de_blob_key, de_handle_key
+
+_DE_PAPER = (
+    '<html><head><meta property="og:title" content="Some DP: A Title"/></head>'
+    '<body><a href="/resource/blob/961172/abcdef0123456789/DEF456ABC0/'
+    '2026-05-06-dkp-14-data.pdf">Download</a></body></html>')
+
+
+def test_de_parse_paper_and_keys():
+    d, title, pdf = parse_de_paper(_DE_PAPER)
+    assert d == date(2026, 5, 6) and title == "Some DP: A Title"
+    assert pdf.endswith("/2026-05-06-dkp-14-data.pdf")
+    assert de_blob_key(pdf) == (14, 2026)
+    # handle key: NN+YYYY -> (num, year); global EconStor id -> None (title tier)
+    assert de_handle_key("https://ideas.repec.org/p/zbw/bubdps/032012.html") == (3, 2012)
+    assert de_handle_key("https://ideas.repec.org/p/zbw/bubdps/012012e.html") == (1, 2012)
+    assert de_handle_key("https://ideas.repec.org/p/zbw/bubdps/337465.html") is None
+    # native blob key == manifest handle key for the same DP
+    assert de_blob_key(pdf) == de_handle_key("RePEc:zbw:bubdps:142026")
+
+
+def test_buba_adapter_routes_d1_native(monkeypatch):
+    from cb_corpus.adapters.buba import BubaAdapter
+    import cb_corpus.sources.buba_wp as buba_mod
+    recs = [DocRecord(bank_code="de", doc_type=DocType.D1, title="x",
+                      pdf_url="https://www.bundesbank.de/resource/blob/1/a/B/2026-05-06-dkp-14-data.pdf")]
+    monkeypatch.setattr(buba_mod, "discover_buba_wp", lambda fetcher, since=None: iter(recs))
+    ad = BubaAdapter(get_bank("de"), fetcher=object())
+    assert DocType.D1 in ad.native_types
+    assert [r.title for r in ad.discover(DocType.D1)] == ["x"]
+
+
 def test_run_wp_migrate_write_applies_in_place_and_is_idempotent(tmp_path, monkeypatch):
     native = [
         DocRecord(bank_code="ecb", doc_type=DocType.D1, title="WP 3244",
