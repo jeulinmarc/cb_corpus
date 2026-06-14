@@ -468,7 +468,20 @@ def test_boe_adapter_routes_d1_native(monkeypatch):
 
 
 # ---- Bundesbank (de) discussion papers ------------------------------
-from cb_corpus.sources.buba_wp import parse_de_paper, de_blob_key, de_handle_key
+from cb_corpus.sources.buba_wp import parse_de_paper, parse_listing_page, de_blob_key, de_handle_key
+
+
+def test_de_listing_page_blob_and_slug_items():
+    html = (
+        '<div class="resultlist__item"><span class="teasable__title">Old Paper</span>'
+        '<a href="/resource/blob/1/abcdef01/DEF0/2018-06-04-dkp-14-data.pdf">Open file</a></div>'
+        '<div class="resultlist__item"><span class="teasable__title">Recent Paper</span>'
+        '<a href="/en/publications/research/discussion-papers/recent-paper-998888">link</a></div>')
+    rows = parse_listing_page(html)
+    assert len(rows) == 2
+    (t0, blob0, page0), (t1, blob1, page1) = rows
+    assert t0 == "Old Paper" and blob0.endswith("/2018-06-04-dkp-14-data.pdf") and page0 is None
+    assert t1 == "Recent Paper" and blob1 is None and page1.endswith("recent-paper-998888")
 
 _DE_PAPER = (
     '<html><head><meta property="og:title" content="Some DP: A Title"/></head>'
