@@ -78,6 +78,40 @@ python -m cb_corpus discover   --banks de --types D1 --download    # fetch newly
 clone replays every date with **no re-crawl**; PDFs are rebuilt from the manifest
 (`fetch-from-manifest`, planned). The expensive Wayback/foedb work runs once.
 
+## Day recovery — results (phase 4, corpus-wide)
+
+`wp-dates` ran across all 13 WP banks (9,589 legacy/month D1/D2 rows):
+
+- **1,328 days recovered (~14%)** from month-constrained PDF `/CreationDate`
+  (free, on-disk): es 395, it 228, ca 216, au 151, us 112, nl 102, se 91, fr 33.
+  Applied to the manifest + recorded in the committed `wp_dates_index.jsonl`.
+- The remaining ~8,261 have no in-month PDF date. A Wayback pass extends the
+  index (slow, archive.org-bound; resumable; yield is bank-dependent — high for
+  promptly-archived 2000s papers, ~0 for pre-2000/digitised). It is a **scheduled
+  job**, not a one-shot — materialise its results anytime with
+  `wp-dates --apply-only --write` (the same command a fresh clone runs to replay
+  the committed index, no network).
+- **Honest ceiling:** many legacy WPs (esp. pre-2000 and Fed pre-2017) have **no
+  publication day published anywhere** — they stay month precision by design, not
+  by tooling failure (see FED_MIGRATION_NOTES.md).
+
+## Future work (documented, not done)
+
+- **Wayback tail** — run `wp-dates` on a cron (the docs' model) to keep extending
+  the committed index; `--apply-only` to materialise.
+- **es/gb match-key tightening** — repec-check shows `manifest > RePEc total` for
+  es (100) and gb (34): handle/number-format match misses, not real gaps. Normalise
+  the IDEAS id ↔ stored handle, re-run repec-check, ingest any true leftovers.
+- **D2 for the non-five banks (Q3)** — wire each bank's occasional/discussion-paper
+  RePEc series handle into `SERIES` (one-off IDEAS research per bank).
+- **Missing papers** — the ~462 Bundesbank DPs (and small tails elsewhere) the
+  corpus lacks: `discover --download` to fetch.
+- **`fetch-from-manifest` (phase 6)** — rebuild `data/raw/` PDFs from a committed
+  manifest (fast clone path).
+- **A–F native coverage for all 63 banks** — currently only the hand-coded majors
+  have A/B/E/F native listings; extending to every bank is a large per-bank
+  investigation project (each like the 5 WP banks), not an automated sweep.
+
 ## Status of the v3 phases
 
 - Phase 0 (schema) ✅ · Phase 1 (5 native scrapers) ✅ · Phase 3 (migration) ✅ ·
