@@ -124,6 +124,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="apply recovered days to the manifest + append to the index")
     wd.add_argument("--no-wayback", action="store_true",
                     help="PDF /CreationDate only — skip the (slow) Wayback rung")
+    wd.add_argument("--apply-only", action="store_true",
+                    help="replay the committed index onto the manifest (no recovery, "
+                         "no network) — what a fresh clone runs to materialise dates")
 
     rc = sub.add_parser("repec-check",
                         help="WP v3 phase 2: audit RePEc/IDEAS coverage vs the manifest "
@@ -211,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "wp-dates":
         from .wp_dates import run_wp_dates
         run_wp_dates(bank_codes=banks, csv_path=args.csv or None, write=args.write,
-                     use_wayback=not args.no_wayback)
+                     use_wayback=not args.no_wayback, apply_only=args.apply_only)
         return 0
 
     if args.cmd == "repec-check":

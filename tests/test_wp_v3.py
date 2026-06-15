@@ -572,6 +572,29 @@ def test_repec_check_parse_series_listing():
     assert rows["20263243"] == "Herding in the foreign exchange market"
 
 
+def test_wp_dates_apply_only_replays_index(tmp_path):
+    """A fresh clone materialises committed dates with no recovery/network:
+    apply-only loads the index and rewrites matching manifest rows."""
+    from cb_corpus.wp_dates import index_path, row_key
+    cfg = Config(data_dir=tmp_path)
+    Storage(cfg)
+    row = {"doc_id": "d1", "bank_code": "ecb", "doc_type": "D1", "date": "2010-01-01",
+           "date_precision": "month", "date_source": "repec",
+           "source_url": "https://ideas.repec.org/p/ecb/ecbwps/2010100.html",
+           "title": "X", "pdf_url": "https://x/wp.pdf", "year": 2010}
+    cfg.manifest_file("ecb").parent.mkdir(parents=True, exist_ok=True)
+    cfg.manifest_file("ecb").write_text(json.dumps(row) + "\n")
+    index_path(cfg).write_text(json.dumps({
+        "key": row_key(row), "date": "2010-03-15", "date_source": "wayback",
+        "date_precision": "day", "evidence_url": "https://web.archive.org/x"}) + "\n")
+
+    wp_dates.run_wp_dates(bank_codes=["ecb"], write=True, apply_only=True, config=cfg)
+    after = json.loads(cfg.manifest_file("ecb").read_text().splitlines()[0])
+    assert after["date"] == "2010-03-15" and after["date_precision"] == "day"
+    assert after["date_source"] == "wayback" and after["year"] == 2010
+    assert after["doc_id"] == "d1" and after["pdf_url"] == row["pdf_url"]   # identity intact
+
+
 def test_run_wp_migrate_write_applies_in_place_and_is_idempotent(tmp_path, monkeypatch):
     native = [
         DocRecord(bank_code="ecb", doc_type=DocType.D1, title="WP 3244",

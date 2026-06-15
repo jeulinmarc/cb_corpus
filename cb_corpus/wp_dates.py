@@ -153,7 +153,7 @@ def recover(fetcher: Fetcher, row: dict, use_wayback: bool = True) -> Optional[d
 def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
                  write: bool = False, csv_path: Optional[str] = None,
                  since_year: int = 1997, use_wayback: bool = True,
-                 config: Optional[Config] = None) -> dict:
+                 apply_only: bool = False, config: Optional[Config] = None) -> dict:
     """Recover days for non-day D1/D2 rows of the requested banks (default: the 5
     natively-covered banks). Default is a dry-run report; `write` rewrites the
     matched manifest rows (date/date_precision=day/date_source) and appends new
@@ -165,10 +165,11 @@ def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
     storage = Storage(cfg, fetcher)
     codes = set(bank_codes) if bank_codes else set(_LEGACY_BANKS)
     idx = load_index(cfg)
-    # Resumable: in write mode each new resolution is appended to the committed
-    # index immediately, so an interrupted long crawl keeps its progress and a
-    # re-run short-circuits the already-resolved rows (no repeat Wayback queries).
-    idx_fh = index_path(cfg).open("a") if write else None
+    # apply_only = replay the committed index onto the manifest with no recovery /
+    # network (what a fresh clone runs to materialise the dates). Otherwise, in
+    # write mode each new resolution is appended to the committed index immediately
+    # (resumable: an interrupted crawl keeps progress; a re-run short-circuits).
+    idx_fh = index_path(cfg).open("a") if (write and not apply_only) else None
 
     by_id: dict[str, dict] = {}          # doc_id -> {date, date_source} to apply
     new_count = 0
@@ -182,7 +183,7 @@ def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
             counts["candidates"] += 1
             key = row_key(row)
             hit = idx.get(key) if key else None
-            if hit is None:
+            if hit is None and not apply_only:
                 yr = (_row_ym(row) or (0, 0))[0]
                 # PDF meta is free (any year); Wayback only from ~the online era.
                 r = recover(fetcher, row, use_wayback=(use_wayback and yr >= since_year))
