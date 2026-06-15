@@ -111,6 +111,8 @@ clone replays every date with **no re-crawl**; PDFs are rebuilt from the manifes
 - **A–F native coverage for all 63 banks** — currently only the hand-coded majors
   have A/B/E/F native listings; extending to every bank is a large per-bank
   investigation project (each like the 5 WP banks), not an automated sweep.
+  See [SCALING_TO_ALL_BANKS.md](SCALING_TO_ALL_BANKS.md) for the effort estimate
+  and the parallel-agent plan (auto-registration refactor first).
 
 ## Status of the v3 phases
 
