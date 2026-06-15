@@ -26,11 +26,13 @@ from typing import Iterable, Optional
 
 from bs4 import BeautifulSoup
 
+from .banks import get_bank
 from .config import Config
 from .http import Fetcher
-from .sources.repec import IDEAS, SERIES
+from .sources.repec import IDEAS, SERIES, _paper_meta, extract_pdf_candidates
 from .storage import Storage
-from .wp_migrate import _KEY_FROM_HANDLE, _KEY_FROM_PDF, normalize_title, repec_handle_from_source_url
+from .wp_migrate import (_KEY_FROM_HANDLE, _KEY_FROM_PDF, normalize_title,
+                         normalize_url, repec_handle_from_source_url)
 
 _GRACE_DAYS = 45
 
@@ -90,10 +92,13 @@ def run_repec_check(bank_codes: Optional[Iterable[str]] = None,
     results: dict[str, dict] = {}
     missing_rows: list[dict] = []
     for bank in codes:
-        # Manifest coverage sets for this bank.
+        # Manifest coverage sets for this bank: handles, native keys, normalized
+        # titles, and normalized PDF/alt URLs (the last catches non-RePEc-sourced
+        # rows, e.g. es BdE-repository copies, when we fetch a leftover's page).
         handles: set[str] = set()
         keys: set = set()
         titles: set[str] = set()
+        urls: set[str] = set()
         manifest_n = 0
         key_pdf, key_handle = _KEY_FROM_PDF.get(bank), _KEY_FROM_HANDLE.get(bank)
         for row in storage.iter_manifest(bank):
@@ -110,29 +115,51 @@ def run_repec_check(bank_codes: Optional[Iterable[str]] = None,
             t = normalize_title(row.get("title") or "")
             if t:
                 titles.add(t)
+            for u in [row.get("pdf_url"), *(row.get("alt_urls") or [])]:
+                if u:
+                    urls.add(normalize_url(u))
 
-        summary = {"repec_total": 0, "covered": 0, "missing_recent": 0, "missing_legacy": 0,
-                   "manifest_total": manifest_n}
+        summary = {"repec_total": 0, "covered": 0, "recovered_pagefetch": 0,
+                   "missing_recent": 0, "missing_legacy": 0, "manifest_total": manifest_n}
+        bank_home = get_bank(bank).homepage
         for handle, doc_type in SERIES[bank]:
             arch, series = handle.split(":")
+            leftovers: list[tuple[str, str, str]] = []
             for pid, title in enumerate_series(fetcher, handle):
                 summary["repec_total"] += 1
                 full_handle = f"RePEc:{arch}:{series}:{pid}"
                 covered = full_handle in handles
                 if not covered and key_handle:
-                    k = key_handle(f"{series}:{pid}") or key_handle(f"{series}/{pid}")
+                    k = key_handle(f"{series}:{pid}")
                     covered = bool(k and k in keys)
                 if not covered and title:
                     covered = normalize_title(title) in titles
                 if covered:
                     summary["covered"] += 1
                 else:
-                    # IDEAS pid is <YYYY><n> for some series; approximate recency by year.
-                    yr = int(pid[:4]) if pid[:4].isdigit() and 1990 <= int(pid[:4]) <= cutoff.year + 1 else 0
-                    recent = yr >= cutoff.year
-                    summary["missing_recent" if recent else "missing_legacy"] += 1
-                    missing_rows.append({"bank": bank, "handle": full_handle,
-                                         "title": title, "bucket": "recent" if recent else "legacy"})
+                    leftovers.append((pid, title, full_handle))
+            # Second pass (cheap — only the leftovers): fetch each unmatched paper's
+            # IDEAS page and re-match by the bank PDF URL or the full canonical
+            # title. Catches rows the listing title/handle missed.
+            for pid, title, full_handle in leftovers:
+                recovered = False
+                try:
+                    html = fetcher.get_text(f"{IDEAS}/p/{arch}/{series}/{pid}.html")
+                    ftitle, _ = _paper_meta(html)
+                    cands = extract_pdf_candidates(html, bank_home)
+                    recovered = (any(normalize_url(c) in urls for c in cands)
+                                 or bool(ftitle and normalize_title(ftitle) in titles))
+                except Exception:
+                    recovered = False
+                if recovered:
+                    summary["covered"] += 1
+                    summary["recovered_pagefetch"] += 1
+                    continue
+                yr = int(pid[:4]) if pid[:4].isdigit() and 1990 <= int(pid[:4]) <= cutoff.year + 1 else 0
+                recent = yr >= cutoff.year
+                summary["missing_recent" if recent else "missing_legacy"] += 1
+                missing_rows.append({"bank": bank, "handle": full_handle,
+                                     "title": title, "bucket": "recent" if recent else "legacy"})
         results[bank] = summary
         print(f"{bank}: {summary}")
 

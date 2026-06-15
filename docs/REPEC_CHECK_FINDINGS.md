@@ -24,19 +24,25 @@ papers per series are covered by the manifest, and how many are missing. Read-on
 **Headline:** coverage is high everywhere (≥ 91%); **0 `missing_recent`** for every
 bank — native discovery is keeping up. au/ch/nl are 100%.
 
-**Two banks worth a look (likely a matching artifact, not real gaps):**
-- **es (100 missing, yet manifest 1289 > RePEc 1091):** the manifest has *more*
-  Spain rows than IDEAS lists, so the 100 "missing" are almost certainly
-  handle/number-format mismatches (the IDEAS `bde:wpaper` id format vs the stored
-  `source_url` handle), not absent papers. Needs a quick key-normalization check.
-- **gb (34 missing, manifest 1248 > RePEc 1128):** similar — BoE WP numbers aren't
-  in URLs, so a few IDEAS papers may not exact-title-match the bank-site titles.
+**es / gb — investigated (a `--write`-free, paper-page second pass was added).**
+`repec-check` now matches in cascade handle → key → listing-title → **fetch the
+IDEAS paper page for the leftovers** and re-match by the bank PDF URL or the full
+canonical title. That recovered only +2 each, so the remainder are **not** a
+handle-format artifact — they are real discrepancies of two kinds:
 
-> The `manifest > repec_total` cases confirm these are match misses, not corpus
-> gaps. The genuinely-actionable small counts (us 14, se 25, fr 15, it 6, ca 5,
-> jp 3, de 2) are candidate papers to ingest — but every one is `missing_legacy`,
-> so they go through the normal RePEc + `wp-dates` path, not a native re-run.
+- **Language-variant duplicates:** IDEAS lists e.g. `bde:wpaper:2618` (Spanish)
+  *and* `bde:wpaper:2618e` (English) as separate papers; the corpus holds one, so
+  the other language reads as "missing". Cosmetic — same paper.
+- **Genuinely old papers** the corpus lacks (e.g. es `9918/9919/9922`, 1999; the
+  old BoE WPs IDEAS keeps under dead pre-2014 URLs). These are real
+  `missing_legacy` candidates → ingest via RePEc + `wp-dates`.
 
-**Next:** tighten the es/gb match keys (normalize the IDEAS id ↔ stored handle),
-re-run `repec-check`, then ingest any true leftovers. No `missing_recent` means
-the daily native cadence needs no change.
+Refined counts after the page-fetch pass: **es 98, gb 32**; small genuine tails
+elsewhere (us 14, se 25, fr 15, it 6, ca 5, jp 3, de 2). Full list:
+`data/reports/repec_check.csv`.
+
+> **Conclusion:** not a matching bug — the audit is correctly surfacing language
+> duplicates (ignore) + a real legacy tail (ingest). `0 missing_recent` everywhere,
+> so the daily native cadence needs no change. A future refinement could fold
+> `{id}e`/`{id}r` language/revision variants onto their base id to drop the
+> cosmetic duplicates from the report.
