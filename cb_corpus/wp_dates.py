@@ -195,7 +195,7 @@ def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
                     if idx_fh is not None:
                         idx_fh.write(json.dumps(hit, ensure_ascii=False) + "\n")
                         idx_fh.flush()
-            else:
+            elif hit is not None:
                 counts["from_index"] += 1
             if hit:
                 counts[hit["date_source"]] = counts.get(hit["date_source"], 0) + 1
