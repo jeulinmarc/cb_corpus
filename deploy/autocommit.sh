@@ -19,7 +19,12 @@ trap 'rm -rf "$TMP"' EXIT
 git clone -q --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMP/repo"
 
 mkdir -p "$TMP/repo/data/manifest"
-cp "$DATA_DIR"/manifest/*.jsonl "$TMP/repo/data/manifest/"
+shopt -s nullglob
+manifests=("$DATA_DIR"/manifest/*.jsonl)
+shopt -u nullglob
+if [ "${#manifests[@]}" -gt 0 ]; then
+  cp "${manifests[@]}" "$TMP/repo/data/manifest/"
+fi
 if [ -f "$DATA_DIR/wp_dates_index.jsonl" ]; then
   cp "$DATA_DIR/wp_dates_index.jsonl" "$TMP/repo/data/"
 fi

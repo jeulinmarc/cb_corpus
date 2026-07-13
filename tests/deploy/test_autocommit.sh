@@ -53,4 +53,19 @@ git clone -q "$WORK/origin.git" "$CHECK3/c"
 grep -q '"doc_id":"c"' "$CHECK3/c/data/manifest/us.jsonl" || fail "us.jsonl non mis à jour"
 [ -f "$CHECK3/c/data/wp_dates_index.jsonl" ] || fail "index supprimé à tort"
 
+# Adversarial : dossier manifest vide -> no-op propre (exit 0), pas de crash.
+D3=$(mktemp -d)
+mkdir -p "$D3/manifest"
+export CB_DATA_DIR="$D3"
+# Baseline after all prior changes (discover call has already incremented origin)
+CHECK4_BEFORE=$(mktemp -d)
+git clone -q "$WORK/origin.git" "$CHECK4_BEFORE/c"
+N_BASELINE=$(git -C "$CHECK4_BEFORE/c" rev-list --count HEAD)
+OUT=$(/app/deploy/autocommit.sh refresh) || fail "manifest vide ne doit pas crasher"
+echo "$OUT" | grep -q "aucun changement" || fail "no-op attendu sur manifest vide"
+CHECK4=$(mktemp -d)
+git clone -q "$WORK/origin.git" "$CHECK4/c"
+N3=$(git -C "$CHECK4/c" rev-list --count HEAD)
+[ "$N_BASELINE" = "$N3" ] || fail "commit créé sur manifest vide"
+
 echo "AUTOCOMMIT_OK"
