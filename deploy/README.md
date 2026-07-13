@@ -1,83 +1,83 @@
-# Déploiement NAS (Dockge) — runbook
+# NAS Deployment (Dockge) — runbook
 
-Spécification : `docs/superpowers/specs/2026-07-12-nas-docker-deploy-design.md`
-sur la branche `documentation` (les artefacts de processus ne vivent pas sur master).
-Règle absolue : **aucune valeur d'infra réelle** (IP, hostname, chemins /mnt réels,
-UID) ne doit être commitée — les valeurs vivent dans Dockge et dans des notes
-locales non versionnées (`*.local.md`).
+Spec: `docs/superpowers/specs/2026-07-12-nas-docker-deploy-design.md`
+on the `documentation` branch (process artifacts don't live on master).
+Absolute rule: **no real infra value** (IP, hostname, real /mnt paths,
+UID) must ever be committed — values live in Dockge and in untracked
+local notes (`*.local.md`).
 
-## 0. Prérequis (une fois)
+## 0. Prerequisites (one-time)
 
-1. **Deploy key** (sur le Mac) :
+1. **Deploy key** (on the Mac):
    `ssh-keygen -t ed25519 -f nas_deploy_key -N "" -C "cb-corpus-nas-state"`
-   GitHub → repo → Settings → Deploy keys → « Add deploy key », coller
-   `nas_deploy_key.pub`, **cocher "Allow write access"**.
-2. **Visibilité GHCR** : après le premier build CI, GitHub → profil → Packages →
+   GitHub → repo → Settings → Deploy keys → "Add deploy key", paste
+   `nas_deploy_key.pub`, **check "Allow write access"**.
+2. **GHCR visibility**: after the first CI build, GitHub → profile → Packages →
    `cb_corpus` → Package settings → Change visibility → **Public**
-   (sinon le NAS ne peut pas puller sans authentification).
+   (otherwise the NAS can't pull without authentication).
 
-## 1. Découverte chemins/UID (stack jetable)
+## 1. Path/UID discovery (disposable stack)
 
-Dockge → nouveau stack `cb-probe` → coller `compose.discover-ids.example.yml`
-→ Deploy → lire les logs : noter le chemin `/mnt/<pool>/<dataset>` du partage
-SMB et l'UID/GID propriétaire (fichiers créés via le partage SMB). Supprimer le stack.
+Dockge → new stack `cb-probe` → paste `compose.discover-ids.example.yml`
+→ Deploy → read the logs: note the `/mnt/<pool>/<dataset>` path of the
+SMB share and the owning UID/GID (files created via the SMB share). Delete the stack.
 
-## 2. Seed initial (OBLIGATOIRE avant le premier run)
+## 2. Initial seed (MANDATORY before the first run)
 
-Sans seed, le premier run re-téléchargerait ~38 000 documents et l'état
-Wayback non re-crawlable serait perdu. Depuis le Mac, partage SMB monté :
+Without a seed, the first run would re-download ~38,000 documents and the
+non-recrawlable Wayback state would be lost. From the Mac, with the SMB share mounted:
 
 ```bash
-# adapter la destination au partage monté dans le Finder
-DST="/Volumes/<share>/<chemin_dataset>"
+# adjust the destination to the share mounted in Finder
+DST="/Volumes/<share>/<dataset_path>"
 rsync -rt --progress "data/manifest" "$DST/"
 rsync -rt --progress "data/wp_dates_index.jsonl" "$DST/"
-rsync -rt --progress "data/raw" "$DST/"      # 8,2 GB — plusieurs heures
+rsync -rt --progress "data/raw" "$DST/"      # 8.2 GB — several hours
 
-# vérification d'intégrité (les comptes doivent être identiques)
+# integrity check (counts must match)
 find data/raw -type f | wc -l
 find "$DST/raw" -type f | wc -l
 ls data/manifest/*.jsonl | wc -l
 ls "$DST/manifest/"*.jsonl | wc -l
 ```
 
-Après le seed : le Mac **cesse de crawler** ; son `data/` devient une archive
-(ne pas supprimer sans décision explicite).
+After the seed: the Mac **stops crawling**; its `data/` becomes an archive
+(do not delete without an explicit decision).
 
-Le conteneur **refuse** de tourner sur un volume sans manifests (statut
-`REFUSED` dans `nas_runs.log`) — c'est la protection anti-seed-manquant ;
-`CB_ALLOW_EMPTY_DATA=1` pour un bootstrap volontairement vide.
+The container **refuses** to run on a volume without manifests (status
+`REFUSED` in `nas_runs.log`) — this is the missing-seed protection;
+`CB_ALLOW_EMPTY_DATA=1` for a deliberately empty bootstrap.
 
-## 3. Stack `cb-refresh`
+## 3. `cb-refresh` stack
 
-Dockge → nouveau stack `cb-refresh` → coller `compose.refresh.example.yml` →
-remplacer `POOL/DATASET/PUID/PGID` → déposer la clé privée `nas_deploy_key`
-dans le dossier du stack sous le nom `deploy_key` (éditeur de fichiers Dockge)
+Dockge → new stack `cb-refresh` → paste `compose.refresh.example.yml` →
+replace `POOL/DATASET/PUID/PGID` → drop the private key `nas_deploy_key`
+into the stack's folder under the name `deploy_key` (Dockge file editor)
 → Deploy.
 
-Le fichier `deploy_key` doit être **lisible** par l'utilisateur PUID :
-autocommit recopie la clé en 0600 dans un répertoire temporaire privé (0700, supprimé en fin de run), donc une clé 0644 fonctionne ;
-une clé root:0600 échouera avec un message clair dans `nas_runs.log`.
+The `deploy_key` file must be **readable** by the PUID user:
+autocommit copies the key as 0600 into a private temp directory (0700, removed at the end of the run), so a 0644 key works;
+a root:0600 key will fail with a clear message in `nas_runs.log`.
 
-## 4. Stack `cb-campaign` (à la demande)
+## 4. `cb-campaign` stack (on demand)
 
-Dockge → stack `cb-campaign` → coller `compose.campaign.example.yml` →
-remplacer les placeholders et la ligne `command:` → déposer la clé privée `nas_deploy_key`
-dans le dossier du stack sous le nom `deploy_key` → Deploy. Le conteneur
-attend la fin d'un éventuel refresh (lock), exécute, pousse l'état, s'arrête.
-Relancer une autre campagne = rééditer `command:` + Deploy.
+Dockge → stack `cb-campaign` → paste `compose.campaign.example.yml` →
+replace the placeholders and the `command:` line → drop the private key `nas_deploy_key`
+into the stack's folder under the name `deploy_key` → Deploy. The container
+waits for any running refresh to finish (lock), runs, pushes the state, stops.
+To launch another campaign: re-edit `command:` + Deploy.
 
-## 5. Vérifications de bon fonctionnement
+## 5. Sanity checks
 
-- `data/reports/nas_runs.log` et `last_run_status` visibles dans le Finder (SMB).
-- Un PDF récent apparaît sous `raw/<bank>/...` dans le Finder.
-- Un commit `data: NAS refresh <date>` apparaît sur GitHub après un run utile.
-- Les fichiers créés par le conteneur t'appartiennent via SMB (sinon revoir PUID/PGID).
-- Un stop/redeploy Dockge en plein run tue le job en cours (statut `FAILED` ou
-  absent) — le lock est libéré automatiquement et le prochain tick cron
-  reprend ; c'est attendu.
+- `data/reports/nas_runs.log` and `last_run_status` visible in Finder (SMB).
+- A recent PDF appears under `raw/<bank>/...` in Finder.
+- A `data: NAS refresh <date>` commit appears on GitHub after a useful run.
+- Files created by the container belong to you via SMB (otherwise revisit PUID/PGID).
+- A Dockge stop/redeploy mid-run kills the current job (status `FAILED` or
+  absent) — the lock is released automatically and the next cron tick
+  picks up again; this is expected.
 
-## 6. Mise à jour du code
+## 6. Code updates
 
-Push sur master → CI rebuilde `ghcr.io/.../cb_corpus:latest` → dans Dockge :
-re-pull de l'image + redéploiement des stacks.
+Push to master → CI rebuilds `ghcr.io/.../cb_corpus:latest` → in Dockge:
+re-pull the image and redeploy the stacks.

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Runner host : builde l'image puis exécute chaque test dedans.
-# deploy/ et tests/ sont montés par-dessus l'image pour itérer sans rebuild.
+# Host runner: builds the image then runs each test inside it.
+# deploy/ and tests/ are mounted over the image so we can iterate without rebuilding.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 docker build -f deploy/Dockerfile -t cb_corpus:test .

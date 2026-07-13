@@ -4,7 +4,7 @@ on:
   push:
     branches: [master]
     paths-ignore:
-      - "data/**"     # les auto-commits d'état du NAS ne doivent PAS rebuilder
+      - "data/**"     # NAS state auto-commits must NOT trigger a rebuild
       - "docs/**"
       - "**.md"
   pull_request:

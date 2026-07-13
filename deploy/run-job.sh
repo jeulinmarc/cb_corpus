@@ -1,6 +1,6 @@
 #!/bin/bash
-# Wrapper de job : verrou global + exécution + journal + auto-commit d'état.
-# Usage : run-job.sh refresh | discover | campaign <sous-commande cb_corpus...>
+# Job wrapper: global lock + execution + log + state auto-commit.
+# Usage: run-job.sh refresh | discover | campaign <cb_corpus sub-command...>
 set -uo pipefail
 
 JOB="${1:-}"; shift || true
@@ -11,17 +11,17 @@ LOG="$DATA_DIR/reports/nas_runs.log"
 STATUS="$DATA_DIR/reports/last_run_status"
 
 mkdir -p "$DATA_DIR/reports"
-cd "$APP_DIR"   # le crawler écrit dans ./data (relatif)
+cd "$APP_DIR"   # the crawler writes to ./data (relative)
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "$(ts) [$JOB] $*" >> "$LOG"; }
 
-# Garde anti-écrasement : un volume sans manifests = seed manquant ou chemin
-# de dataset erroné. On refuse de crawler (et donc de committer un état
-# partiel par-dessus le vrai). CB_ALLOW_EMPTY_DATA=1 pour un bootstrap voulu.
+# Anti-overwrite guard: a volume without manifests means a missing seed or a
+# wrong dataset path. We refuse to crawl (and thus to commit a partial state
+# over the real one). CB_ALLOW_EMPTY_DATA=1 for a deliberate bootstrap.
 if [ "${CB_ALLOW_EMPTY_DATA:-0}" != "1" ]; then
   if ! ls "$DATA_DIR"/manifest/*.jsonl >/dev/null 2>&1; then
-    log "REFUSED (volume sans manifests — seed manquant ? CB_ALLOW_EMPTY_DATA=1 pour forcer)"
+    log "REFUSED (volume without manifests — missing seed? CB_ALLOW_EMPTY_DATA=1 to force)"
     echo "$(ts) REFUSED [$JOB]" > "$STATUS"
     exit 3
   fi
@@ -29,7 +29,7 @@ fi
 
 case "$JOB" in
   refresh|discover|campaign) ;;
-  *) echo "run-job: job inconnu '$JOB'" >&2; exit 2 ;;
+  *) echo "run-job: unknown job '$JOB'" >&2; exit 2 ;;
 esac
 
 run_job() {
@@ -39,10 +39,10 @@ run_job() {
         && python -m cb_corpus repec --download ;;
     discover)
       if [ -z "${DISCOVER_ARGS:-}" ]; then
-        echo "run-job: DISCOVER_ARGS non défini — refus d'un discover complet A-F implicite" >&2
+        echo "run-job: DISCOVER_ARGS not set — refusing an implicit full A-F discover" >&2
         return 2
       fi
-      # DISCOVER_ARGS est volontairement splitté (liste d'options).
+      # DISCOVER_ARGS is deliberately word-split (list of options).
       # shellcheck disable=SC2086
       python -m cb_corpus discover ${DISCOVER_ARGS:-} --download ;;
     campaign)
@@ -52,10 +52,10 @@ run_job() {
 
 exec 9>"$LOCK"
 if [ "$JOB" = "campaign" ]; then
-  flock 9   # une campagne attend son tour (refresh en cours, etc.)
+  flock 9   # a campaign waits its turn (refresh in progress, etc.)
 else
   if ! flock -n 9; then
-    log "SKIPPED (lock occupé)"
+    log "SKIPPED (lock busy)"
     exit 0
   fi
 fi
@@ -66,7 +66,7 @@ if run_job "$@"; then
   echo "$(ts) OK [$JOB]" > "$STATUS"
   if [ "${AUTOCOMMIT:-1}" = "1" ]; then
     "${AUTOCOMMIT_BIN:-/app/deploy/autocommit.sh}" "$JOB" >> "$LOG" 2>&1 \
-      || log "AUTOCOMMIT FAILED (état local intact, retentera au prochain run)"
+      || log "AUTOCOMMIT FAILED (local state intact, will retry on next run)"
   fi
   exit 0
 else
