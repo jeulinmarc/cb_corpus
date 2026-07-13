@@ -5,7 +5,7 @@ services:
   cb-refresh:
     image: ghcr.io/jeulinmarc/cb_corpus:latest
     restart: unless-stopped
-    user: "PUID:PGID"          # UID:GID de marc sur TrueNAS (stack discover-ids)
+    user: "PUID:PGID"          # UID:GID du propriétaire du dataset (stack discover-ids)
     environment:
       TZ: Europe/Paris
       DISCOVER_ARGS: "--banks us,ecb --types A3 --rounds 1"  # périmètre hebdo, à ajuster

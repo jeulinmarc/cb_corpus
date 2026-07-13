@@ -20,7 +20,7 @@ locales non versionnées (`*.local.md`).
 
 Dockge → nouveau stack `cb-probe` → coller `compose.discover-ids.example.yml`
 → Deploy → lire les logs : noter le chemin `/mnt/<pool>/<dataset>` du partage
-SMB et l'UID/GID propriétaire (fichiers créés par marc via SMB). Supprimer le stack.
+SMB et l'UID/GID propriétaire (fichiers créés via le partage SMB). Supprimer le stack.
 
 ## 2. Seed initial (OBLIGATOIRE avant le premier run)
 
