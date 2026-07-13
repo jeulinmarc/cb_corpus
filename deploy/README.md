@@ -53,7 +53,8 @@ dans le dossier du stack sous le nom `deploy_key` (éditeur de fichiers Dockge)
 ## 4. Stack `cb-campaign` (à la demande)
 
 Dockge → stack `cb-campaign` → coller `compose.campaign.example.yml` →
-remplacer les placeholders et la ligne `command:` → Deploy. Le conteneur
+remplacer les placeholders et la ligne `command:` → déposer la clé privée `nas_deploy_key`
+dans le dossier du stack sous le nom `deploy_key` → Deploy. Le conteneur
 attend la fin d'un éventuel refresh (lock), exécute, pousse l'état, s'arrête.
 Relancer une autre campagne = rééditer `command:` + Deploy.
 
