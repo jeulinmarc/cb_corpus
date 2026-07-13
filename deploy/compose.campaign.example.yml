@@ -1,0 +1,16 @@
+# Stack Dockge « cb-campaign » — campagne longue à la demande.
+# Éditer `command:` (sous-commande cb_corpus complète) puis Deploy.
+# Le conteneur attend le lock si un refresh tourne, puis s'arrête à la fin.
+services:
+  cb-campaign:
+    image: ghcr.io/jeulinmarc/cb_corpus:latest
+    restart: "no"
+    user: "PUID:PGID"
+    environment:
+      TZ: Europe/Paris
+      AUTOCOMMIT: "1"
+    command: ["/app/deploy/run-job.sh", "campaign",
+              "discover", "--banks", "fr,it", "--types", "A3", "--download", "--rounds", "3"]
+    volumes:
+      - /mnt/POOL/DATASET:/app/data
+      - ./deploy_key:/run/secrets/deploy_key:ro
