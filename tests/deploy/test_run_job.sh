@@ -85,6 +85,7 @@ if /app/deploy/run-job.sh bogus; then fail "job inconnu accepté"; fi
 
 # T8 — volume vide : refus (exit 3), REFUSED logué, python jamais appelé.
 D=$(mktemp -d); export CB_DATA_DIR="$D" PY_LOG="$D/py.log"
+export AUTOCOMMIT=0
 set +e; /app/deploy/run-job.sh refresh; rc=$?; set -e
 [ "$rc" = "3" ] || fail "volume vide doit sortir en 3 (rc=$rc)"
 grep -q "REFUSED" "$D/reports/nas_runs.log" || fail "REFUSED non logué"

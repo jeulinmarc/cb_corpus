@@ -22,7 +22,7 @@ export GIT_COMMITTER_NAME="cb-corpus-nas" GIT_COMMITTER_EMAIL="jeulinmarc@gmail.
 if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
   printf 'cbcorpus:x:%s:%s:cb-corpus:/tmp:/bin/sh\n' "$(id -u)" "$(id -g)" > "$TMP/passwd"
   printf 'cbcorpus:x:%s:\n' "$(id -g)" > "$TMP/group"
-  wrapper=$(ls /usr/lib/*/libnss_wrapper.so 2>/dev/null | head -1)
+  wrapper=$(ls /usr/lib/*/libnss_wrapper.so 2>/dev/null | head -1 || true)
   if [ -n "$wrapper" ]; then
     export LD_PRELOAD="$wrapper" NSS_WRAPPER_PASSWD="$TMP/passwd" NSS_WRAPPER_GROUP="$TMP/group"
   fi

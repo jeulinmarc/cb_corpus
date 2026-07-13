@@ -55,7 +55,7 @@ dans le dossier du stack sous le nom `deploy_key` (éditeur de fichiers Dockge)
 → Deploy.
 
 Le fichier `deploy_key` doit être **lisible** par l'utilisateur PUID :
-autocommit recopie la clé en 0600 dans un tmpfs, donc une clé 0644 fonctionne ;
+autocommit recopie la clé en 0600 dans un répertoire temporaire privé (0700, supprimé en fin de run), donc une clé 0644 fonctionne ;
 une clé root:0600 échouera avec un message clair dans `nas_runs.log`.
 
 ## 4. Stack `cb-campaign` (à la demande)
