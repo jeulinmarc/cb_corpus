@@ -37,8 +37,8 @@ DISCOVERY_AUDIT.md
 COMPLETENESS.md
 ECB_DOC_TYPES.md
 
-# SDD scratch (ledger, briefs) — jamais committé
+# SDD scratch (ledger, briefs) — never committed
 .superpowers/
 
-# Artefacts de processus superpowers (specs/plans) — vivent sur la branche documentation
+# Superpowers process artifacts (specs/plans) — live on the documentation branch
 docs/superpowers/

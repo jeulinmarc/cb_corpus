@@ -23,8 +23,8 @@ COPY cb_corpus /app/cb_corpus
 COPY deploy /app/deploy
 RUN chmod +x /app/deploy/*.sh || true
 
-# HOME=/tmp : le conteneur tourne sous un UID arbitraire (compose `user:`)
-# absent de /etc/passwd ; ssh/git/chromium ont besoin d'un HOME inscriptible.
+# HOME=/tmp: the container runs under an arbitrary UID (compose `user:`)
+# absent from /etc/passwd; ssh/git/chromium need a writable HOME.
 ENV PYTHONUNBUFFERED=1 HOME=/tmp
 
 CMD ["/app/deploy/entrypoint.sh"]

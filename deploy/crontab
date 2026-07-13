@@ -1,5 +1,5 @@
-# refresh (bis-sitemap + repec) toutes les 12 h ; discover hebdo dimanche 03:00.
-# Cadence = paramètre : éditer ici (l'image doit être rebuildée) ou surcharger
-# la commande du service dans Dockge pour pointer un crontab monté en volume.
+# refresh (bis-sitemap + repec) every 12 h; weekly discover on Sunday 03:00.
+# Schedule = parameter: edit here (the image must be rebuilt) or override
+# the service command in Dockge to point to a crontab mounted as a volume.
 0 */12 * * * /app/deploy/run-job.sh refresh
 0 3 * * 0 /app/deploy/run-job.sh discover

@@ -1,17 +1,17 @@
 #!/bin/bash
-# Reproduit l'environnement NAS : UID arbitraire sans entrée passwd.
+# Reproduces the NAS environment: arbitrary UID with no passwd entry.
 set -euo pipefail
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 if [ "$(id -u)" = "0" ] && [ "${1:-}" != "inner" ]; then
   exec setpriv --reuid 12345 --regid 12345 --clear-groups bash "$0" inner
 fi
-[ "${1:-}" = "inner" ] || fail "doit démarrer root puis dropper"
-getent passwd 12345 >/dev/null && fail "l'UID 12345 ne devrait pas exister dans passwd"
+[ "${1:-}" = "inner" ] || fail "must start as root then drop"
+getent passwd 12345 >/dev/null && fail "UID 12345 should not exist in passwd"
 
 export HOME=/tmp
 
-# 1) autocommit complet sous UID arbitraire (remote local : couvre git+identité+HOME)
+# 1) full autocommit under an arbitrary UID (local remote: covers git+identity+HOME)
 WORK=$(mktemp -d)
 git init -q --bare -b master "$WORK/origin.git"
 SEED=$(mktemp -d)
@@ -25,19 +25,19 @@ D=$(mktemp -d)
 mkdir -p "$D/manifest"
 echo '{"doc_id":"z"}' > "$D/manifest/us.jsonl"
 export CB_DATA_DIR="$D" STATE_REPO_URL="$WORK/origin.git" GIT_SSH_KEY=/dev/null
-/app/deploy/autocommit.sh refresh || fail "autocommit sous UID arbitraire"
+/app/deploy/autocommit.sh refresh || fail "autocommit under arbitrary UID"
 CHECK=$(mktemp -d)
 git clone -q "$WORK/origin.git" "$CHECK/c"
-grep -q '"doc_id":"z"' "$CHECK/c/data/manifest/us.jsonl" || fail "état non poussé sous UID arbitraire"
+grep -q '"doc_id":"z"' "$CHECK/c/data/manifest/us.jsonl" || fail "state not pushed under arbitrary UID"
 
-# 2) ssh doit être utilisable avec l'env nss_wrapper qu'autocommit fabrique
+# 2) ssh must be usable with the nss_wrapper env that autocommit builds
 wrapper=$(ls /usr/lib/*/libnss_wrapper.so | head -1)
-[ -n "$wrapper" ] || fail "libnss_wrapper.so absent de l'image"
+[ -n "$wrapper" ] || fail "libnss_wrapper.so missing from the image"
 NSSD=$(mktemp -d)
 printf 'cbcorpus:x:%s:%s:cb:/tmp:/bin/sh\n' "$(id -u)" "$(id -g)" > "$NSSD/passwd"
 printf 'cbcorpus:x:%s:\n' "$(id -g)" > "$NSSD/group"
 LD_PRELOAD="$wrapper" NSS_WRAPPER_PASSWD="$NSSD/passwd" NSS_WRAPPER_GROUP="$NSSD/group" ssh -V \
-  || fail "ssh inutilisable même avec nss_wrapper"
-if ssh -V 2>/dev/null; then fail "ssh aurait dû échouer sans nss_wrapper (le test ne prouve plus rien)"; fi
+  || fail "ssh unusable even with nss_wrapper"
+if ssh -V 2>/dev/null; then fail "ssh should have failed without nss_wrapper (test no longer proves anything)"; fi
 
 echo "UID_OK"

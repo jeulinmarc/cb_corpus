@@ -1,11 +1,11 @@
-# Stack JETABLE : découvre le chemin host du dataset SMB et l'UID/GID propriétaire.
-# Deploy -> lire les logs -> noter les valeurs -> SUPPRIMER le stack.
+# DISPOSABLE stack: discovers the host path of the SMB dataset and the owning UID/GID.
+# Deploy -> read the logs -> note the values -> DELETE the stack.
 services:
   probe:
     image: busybox
     restart: "no"
     command: >
-      sh -c "echo '=== datasets sous /mnt ==='; ls -lnR /host-mnt 2>/dev/null | head -80;
-             echo '=== reperer: le dataset du partage SMB, et uid/gid proprietaire ==='"
+      sh -c "echo '=== datasets under /mnt ==='; ls -lnR /host-mnt 2>/dev/null | head -80;
+             echo '=== identify: the SMB share dataset, and its owning uid/gid ==='"
     volumes:
       - /mnt:/host-mnt:ro
