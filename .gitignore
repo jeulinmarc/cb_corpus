@@ -23,6 +23,9 @@ venv/
 .vscode/
 *.swp
 
+# Local-only sensitive notes (infra details, credentials pointers) — NEVER committed.
+*.local.md
+
 # Docs — generated snapshots (regenerate via the scripts) + local working/analysis notes.
 # Committed docs: README, INGESTION_RAG, BANKS, central_bank_corpus_inventory.
 CORPUS.md
@@ -33,3 +36,9 @@ ARCHITECTURE.md
 DISCOVERY_AUDIT.md
 COMPLETENESS.md
 ECB_DOC_TYPES.md
+
+# SDD scratch (ledger, briefs) — jamais committé
+.superpowers/
+
+# Artefacts de processus superpowers (specs/plans) — vivent sur la branche documentation
+docs/superpowers/

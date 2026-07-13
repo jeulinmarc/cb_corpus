@@ -1,0 +1,17 @@
+# Stack Dockge « cb-refresh » — refresh 12 h + discover hebdo.
+# REMPLACER les placeholders (POOL/DATASET/PUID/PGID) dans Dockge UNIQUEMENT.
+# NE JAMAIS committer la version remplie : le repo est public.
+services:
+  cb-refresh:
+    image: ghcr.io/jeulinmarc/cb_corpus:latest
+    restart: unless-stopped
+    user: "PUID:PGID"          # UID:GID du propriétaire du dataset (stack discover-ids)
+    environment:
+      TZ: Europe/Paris
+      DISCOVER_ARGS: "--banks us,ecb --types A3 --rounds 1"  # périmètre hebdo, à ajuster
+      AUTOCOMMIT: "1"
+    volumes:
+      - /mnt/POOL/DATASET:/app/data              # chemin host du dataset SMB
+      - ./deploy_key:/run/secrets/deploy_key:ro  # clé posée dans le dossier du stack
+    # mem_limit: 2g        # décommenter si le NAS est contraint
+    # cpus: "2"
