@@ -1,6 +1,7 @@
 # Déploiement NAS (Dockge) — runbook
 
-Spécification : `docs/superpowers/specs/2026-07-12-nas-docker-deploy-design.md`.
+Spécification : `docs/superpowers/specs/2026-07-12-nas-docker-deploy-design.md`
+sur la branche `documentation` (les artefacts de processus ne vivent pas sur master).
 Règle absolue : **aucune valeur d'infra réelle** (IP, hostname, chemins /mnt réels,
 UID) ne doit être commitée — les valeurs vivent dans Dockge et dans des notes
 locales non versionnées (`*.local.md`).

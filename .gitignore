@@ -39,3 +39,6 @@ ECB_DOC_TYPES.md
 
 # SDD scratch (ledger, briefs) — jamais committé
 .superpowers/
+
+# Artefacts de processus superpowers (specs/plans) — vivent sur la branche documentation
+docs/superpowers/
