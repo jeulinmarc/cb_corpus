@@ -9,10 +9,33 @@ REPO_URL="${STATE_REPO_URL:-git@github.com:jeulinmarc/cb_corpus.git}"
 BRANCH="${STATE_BRANCH:-master}"
 KEY="${GIT_SSH_KEY:-/run/secrets/deploy_key}"
 
-export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts"
-
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+
+# Identité git via env : vaut aussi pour le rebase (pas seulement le commit),
+# et évite le getpwuid() de git sous un UID sans entrée passwd.
+export GIT_AUTHOR_NAME="cb-corpus-nas" GIT_AUTHOR_EMAIL="jeulinmarc@gmail.com"
+export GIT_COMMITTER_NAME="cb-corpus-nas" GIT_COMMITTER_EMAIL="jeulinmarc@gmail.com"
+
+# UID arbitraire (compose `user: PUID:PGID`) : OpenSSH exige une entrée passwd
+# (getpwuid) — on en fabrique une via nss_wrapper si elle manque.
+if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+  printf 'cbcorpus:x:%s:%s:cb-corpus:/tmp:/bin/sh\n' "$(id -u)" "$(id -g)" > "$TMP/passwd"
+  printf 'cbcorpus:x:%s:\n' "$(id -g)" > "$TMP/group"
+  wrapper=$(ls /usr/lib/*/libnss_wrapper.so 2>/dev/null | head -1)
+  if [ -n "$wrapper" ]; then
+    export LD_PRELOAD="$wrapper" NSS_WRAPPER_PASSWD="$TMP/passwd" NSS_WRAPPER_GROUP="$TMP/group"
+  fi
+fi
+
+# Copie de la clé en 0600 : une clé montée trop ouverte (0644) serait refusée
+# par ssh ; illisible par l'UID, on échoue ici avec un message clair.
+if [ -f "$KEY" ]; then
+  install -m 600 "$KEY" "$TMP/deploy_key" || { echo "autocommit: clé $KEY illisible par uid $(id -u)" >&2; exit 1; }
+  KEY="$TMP/deploy_key"
+fi
+
+export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts"
 
 # --depth 1 : suffisant pour empiler un commit d'état (ignoré pour un remote
 # local en test — sans incidence).

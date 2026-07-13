@@ -43,12 +43,20 @@ ls "$DST/manifest/"*.jsonl | wc -l
 Après le seed : le Mac **cesse de crawler** ; son `data/` devient une archive
 (ne pas supprimer sans décision explicite).
 
+Le conteneur **refuse** de tourner sur un volume sans manifests (statut
+`REFUSED` dans `nas_runs.log`) — c'est la protection anti-seed-manquant ;
+`CB_ALLOW_EMPTY_DATA=1` pour un bootstrap volontairement vide.
+
 ## 3. Stack `cb-refresh`
 
 Dockge → nouveau stack `cb-refresh` → coller `compose.refresh.example.yml` →
 remplacer `POOL/DATASET/PUID/PGID` → déposer la clé privée `nas_deploy_key`
 dans le dossier du stack sous le nom `deploy_key` (éditeur de fichiers Dockge)
 → Deploy.
+
+Le fichier `deploy_key` doit être **lisible** par l'utilisateur PUID :
+autocommit recopie la clé en 0600 dans un tmpfs, donc une clé 0644 fonctionne ;
+une clé root:0600 échouera avec un message clair dans `nas_runs.log`.
 
 ## 4. Stack `cb-campaign` (à la demande)
 
@@ -64,6 +72,9 @@ Relancer une autre campagne = rééditer `command:` + Deploy.
 - Un PDF récent apparaît sous `raw/<bank>/...` dans le Finder.
 - Un commit `data: NAS refresh <date>` apparaît sur GitHub après un run utile.
 - Les fichiers créés par le conteneur t'appartiennent via SMB (sinon revoir PUID/PGID).
+- Un stop/redeploy Dockge en plein run tue le job en cours (statut `FAILED` ou
+  absent) — le lock est libéré automatiquement et le prochain tick cron
+  reprend ; c'est attendu.
 
 ## 6. Mise à jour du code
 

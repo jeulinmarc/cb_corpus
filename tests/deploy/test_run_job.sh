@@ -13,7 +13,7 @@ chmod +x "$STUB/python"
 export PATH="$STUB:$PATH"
 export CB_APP_DIR=/app
 
-newdir() { D=$(mktemp -d); export CB_DATA_DIR="$D" PY_LOG="$D/py.log"; }
+newdir() { D=$(mktemp -d); export CB_DATA_DIR="$D" PY_LOG="$D/py.log"; mkdir -p "$D/manifest"; echo '{}' > "$D/manifest/stub.jsonl"; }
 
 # T1 — refresh succès : bis-sitemap puis repec, log OK, status OK.
 newdir; export AUTOCOMMIT=0
@@ -59,6 +59,12 @@ grep -q "PYARGS:-m cb_corpus discover --banks us --types A3 --rounds 1 --downloa
   || fail "DISCOVER_ARGS non transmis"
 unset DISCOVER_ARGS
 
+# T5b — discover sans DISCOVER_ARGS : refus explicite (pas de discover A-F implicite).
+newdir
+if /app/deploy/run-job.sh discover; then fail "discover sans DISCOVER_ARGS aurait dû échouer"; fi
+grep -q "FAILED \[discover\]" "$D/reports/last_run_status" || fail "status != FAILED (discover sans DISCOVER_ARGS)"
+if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python ne devait pas tourner sans DISCOVER_ARGS"; fi
+
 # T6 — autocommit appelé après succès (AUTOCOMMIT=1), pas après échec.
 newdir; export AUTOCOMMIT=1 AC_LOG="$D/ac.log"
 cat > "$D/ac.sh" <<'EOF'
@@ -76,5 +82,16 @@ unset PY_EXIT AUTOCOMMIT_BIN
 # T7 — job inconnu : erreur.
 newdir
 if /app/deploy/run-job.sh bogus; then fail "job inconnu accepté"; fi
+
+# T8 — volume vide : refus (exit 3), REFUSED logué, python jamais appelé.
+D=$(mktemp -d); export CB_DATA_DIR="$D" PY_LOG="$D/py.log"
+set +e; /app/deploy/run-job.sh refresh; rc=$?; set -e
+[ "$rc" = "3" ] || fail "volume vide doit sortir en 3 (rc=$rc)"
+grep -q "REFUSED" "$D/reports/nas_runs.log" || fail "REFUSED non logué"
+if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python ne devait pas tourner sur volume vide"; fi
+# et avec l'override, ça tourne
+export CB_ALLOW_EMPTY_DATA=1
+/app/deploy/run-job.sh refresh || fail "CB_ALLOW_EMPTY_DATA=1 doit autoriser"
+unset CB_ALLOW_EMPTY_DATA
 
 echo "RUN_JOB_OK"

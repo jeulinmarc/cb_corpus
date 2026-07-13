@@ -5,7 +5,7 @@ ARG SUPERCRONIC_SHA256_AMD64=dcb1403c188a9438c47d4bba82a9c357fc9351ce91627fb2bae
 ARG SUPERCRONIC_SHA256_ARM64=e1124aa34294e2bb8ab7002f347f4363ba35097f3daf4d3c44e9d813c1fb2bb8
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      chromium git openssh-client rsync curl ca-certificates tzdata \
+      chromium git openssh-client rsync curl ca-certificates tzdata libnss-wrapper \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ARCH=$(dpkg --print-architecture) \
