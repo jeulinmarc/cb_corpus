@@ -1,5 +1,7 @@
-# refresh (bis-sitemap + repec) every 12 h; weekly discover on Sunday 03:00.
-# Schedule = parameter: edit here (the image must be rebuilt) or override
-# the service command in Dockge to point to a crontab mounted as a volume.
+# refresh (bis-sitemap + repec) every 12 h; nightly all-banks discover at 04:00
+# (right after the 00:00 refresh, ~4 h observed; discover also waits on the
+# lock up to DISCOVER_LOCK_TIMEOUT). Schedule = parameter: edit here (the
+# image must be rebuilt) or override the service command in Dockge to point
+# to a crontab mounted as a volume.
 0 */12 * * * /app/deploy/run-job.sh refresh
-0 3 * * 0 /app/deploy/run-job.sh discover
+0 4 * * * /app/deploy/run-job.sh discover

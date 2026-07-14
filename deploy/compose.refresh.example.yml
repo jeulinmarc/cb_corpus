@@ -1,4 +1,4 @@
-# Dockge stack "cb-refresh" — 12 h refresh + weekly discover.
+# Dockge stack "cb-refresh" — 12 h refresh + nightly all-banks discover.
 # REPLACE the placeholders (POOL/DATASET/PUID/PGID) in Dockge ONLY.
 # NEVER commit the filled-in version: the repo is public.
 services:
@@ -8,10 +8,13 @@ services:
     user: "PUID:PGID"          # UID:GID of the dataset owner (discover-ids stack)
     environment:
       TZ: Europe/Paris
-      DISCOVER_ARGS: "--banks us,ecb --types A3 --rounds 1"  # weekly scope, adjust as needed
+      DISCOVER_BANKS: all      # "all" or a comma list of bank codes (us,ecb,fr)
+      DISCOVER_TYPES: full     # "full" (= whole A-F scope) or a comma list (A3,E2)
+      DISCOVER_ROUNDS: "1"     # incremental: first listing pages only
+      DISCOVER_WORKERS: "6"    # banks crawled in parallel (bounds CPU/RAM/bandwidth)
       AUTOCOMMIT: "1"
     volumes:
       - /mnt/POOL/DATASET:/app/data              # host path of the SMB dataset
       - ./deploy_key:/run/secrets/deploy_key:ro  # key dropped into the stack's folder
-    # mem_limit: 2g        # uncomment if the NAS is resource-constrained
+    # mem_limit: 4g        # discover peak: ~6 x (python + headless chromium) = 2-3 GB
     # cpus: "2"

@@ -59,6 +59,17 @@ The `deploy_key` file must be **readable** by the PUID user:
 autocommit copies the key as 0600 into a private temp directory (0700, removed at the end of the run), so a 0644 key works;
 a root:0600 key will fail with a clear message in `nas_runs.log`.
 
+Discover scope is controlled by env vars (Dockge, no rebuild needed):
+`DISCOVER_BANKS` (`all` or comma list — required, the job refuses to run
+without it), `DISCOVER_TYPES` (`full` = whole A–F scope, or comma list),
+`DISCOVER_ROUNDS` (1 = incremental), `DISCOVER_WORKERS` (parallel banks,
+default 6 — the single knob bounding CPU/RAM/bandwidth),
+`DISCOVER_LOCK_TIMEOUT` (seconds discover waits for a running refresh,
+default 7200). Schedule: refresh at 00:00/12:00, discover nightly at 04:00
+(Paris). **Migration from DISCOVER_ARGS:** stacks created before 2026-07-14
+used `DISCOVER_ARGS`, which no longer exists — replace it with the variables
+above and recreate the stack.
+
 ## 4. `cb-campaign` stack (on demand)
 
 Dockge → stack `cb-campaign` → paste `compose.campaign.example.yml` →
@@ -76,6 +87,12 @@ To launch another campaign: re-edit `command:` + Deploy.
 - A Dockge stop/redeploy mid-run kills the current job (status `FAILED` or
   absent) — the lock is released automatically and the next cron tick
   picks up again; this is expected.
+- After a nightly discover: per-bank logs under `data/reports/discover/<date>/`,
+  one summary line `OK n/n` or `PARTIAL k/n FAILED: <codes>` in `nas_runs.log`,
+  and a `data: NAS discover <date>` commit on GitHub when something changed.
+- A `PARTIAL` status is not an emergency: failed banks are retried the next
+  night. Investigate a bank only when it fails several nights in a row
+  (its log under `reports/discover/<date>/<code>.log` has the traceback).
 
 ## 6. Code updates
 
