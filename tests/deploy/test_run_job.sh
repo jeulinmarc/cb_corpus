@@ -7,6 +7,28 @@ STUB=$(mktemp -d)
 cat > "$STUB/python" <<'EOF'
 #!/bin/bash
 echo "PYARGS:$*" >> "$PY_LOG"
+if [ "$*" = "-m cb_corpus list-banks" ]; then
+  printf 'aa   Bank Aa                              aa.example\n'
+  printf 'bb   Bank Bb                              bb.example  (verify domain)\n'
+  printf 'cc   Bank Cc                              cc.example\n'
+fi
+case "$*" in
+  *"${PY_FAIL_MATCH:-@@none@@}"*) exit 1 ;;
+esac
+if [ -n "${PY_CONC_DIR:-}" ]; then
+  (
+    flock 8
+    n=$(( $(cat "$PY_CONC_DIR/cur" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$PY_CONC_DIR/cur"
+    m=$(cat "$PY_CONC_DIR/max" 2>/dev/null || echo 0)
+    if [ "$n" -gt "$m" ]; then echo "$n" > "$PY_CONC_DIR/max"; fi
+  ) 8>"$PY_CONC_DIR/lock"
+  sleep "${PY_SLEEP:-0.3}"
+  (
+    flock 8
+    echo "$(( $(cat "$PY_CONC_DIR/cur") - 1 ))" > "$PY_CONC_DIR/cur"
+  ) 8>"$PY_CONC_DIR/lock"
+fi
 exit "${PY_EXIT:-0}"
 EOF
 chmod +x "$STUB/python"
@@ -52,18 +74,59 @@ grep -q "PYARGS:-m cb_corpus discover --banks fr --types A3 --download" "$PY_LOG
   || fail "incorrect campaign args"
 wait "$HOLDER"
 
-# T5 — discover consumes DISCOVER_ARGS.
-newdir; export DISCOVER_ARGS="--banks us --types A3 --rounds 1"
+# T5 — discover: explicit bank list, explicit types → one call per bank + per-bank logs.
+newdir; export DISCOVER_BANKS="us,ecb" DISCOVER_TYPES="A3" DISCOVER_ROUNDS=1
 /app/deploy/run-job.sh discover
 grep -q "PYARGS:-m cb_corpus discover --banks us --types A3 --rounds 1 --download" "$PY_LOG" \
-  || fail "DISCOVER_ARGS not passed through"
-unset DISCOVER_ARGS
+  || fail "us discover call wrong"
+grep -q "PYARGS:-m cb_corpus discover --banks ecb --types A3 --rounds 1 --download" "$PY_LOG" \
+  || fail "ecb discover call wrong"
+DAY=$(date -u +%Y-%m-%d)
+[ -f "$D/reports/discover/$DAY/us.log" ] || fail "per-bank log us missing"
+[ -f "$D/reports/discover/$DAY/ecb.log" ] || fail "per-bank log ecb missing"
+grep -q "\[discover\] OK 2/2" "$D/reports/nas_runs.log" || fail "OK summary missing"
+grep -q "OK 2/2 \[discover\]" "$D/reports/last_run_status" || fail "status summary missing"
+unset DISCOVER_BANKS DISCOVER_TYPES DISCOVER_ROUNDS
 
-# T5b — discover without DISCOVER_ARGS: explicit refusal (no implicit A-F discover).
+# T5b — discover without DISCOVER_BANKS: explicit refusal (no implicit all-banks discover).
 newdir
-if /app/deploy/run-job.sh discover; then fail "discover without DISCOVER_ARGS should have failed"; fi
-grep -q "FAILED \[discover\]" "$D/reports/last_run_status" || fail "status != FAILED (discover without DISCOVER_ARGS)"
-if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python should not have run without DISCOVER_ARGS"; fi
+if /app/deploy/run-job.sh discover; then fail "discover without DISCOVER_BANKS should have failed"; fi
+grep -q "FAILED \[discover\]" "$D/reports/last_run_status" || fail "status != FAILED (no DISCOVER_BANKS)"
+if [ -f "$PY_LOG" ] && grep -q "PYARGS:-m cb_corpus discover" "$PY_LOG"; then
+  fail "python discover should not have run without DISCOVER_BANKS"
+fi
+
+# T5c — DISCOVER_BANKS=all resolves via list-banks; DISCOVER_TYPES=full omits --types.
+newdir; export DISCOVER_BANKS="all" DISCOVER_TYPES="full"
+/app/deploy/run-job.sh discover
+grep -q "PYARGS:-m cb_corpus list-banks" "$PY_LOG" || fail "list-banks not called for all"
+grep -q "PYARGS:-m cb_corpus discover --banks aa --rounds 1 --download" "$PY_LOG" \
+  || fail "aa call wrong (types must be omitted when full)"
+grep -q "PYARGS:-m cb_corpus discover --banks bb --rounds 1 --download" "$PY_LOG" || fail "bb call missing"
+grep -q "PYARGS:-m cb_corpus discover --banks cc --rounds 1 --download" "$PY_LOG" || fail "cc call missing"
+grep -q "\[discover\] OK 3/3" "$D/reports/nas_runs.log" || fail "OK 3/3 summary missing"
+unset DISCOVER_BANKS DISCOVER_TYPES
+
+# T5d — partial failure: PARTIAL summary, exit 0, autocommit still runs.
+newdir; export AUTOCOMMIT=1 AC_LOG="$D/ac.log"
+cat > "$D/ac.sh" <<'EOF'
+#!/bin/bash
+echo "AC:$1" >> "$AC_LOG"
+EOF
+chmod +x "$D/ac.sh"; export AUTOCOMMIT_BIN="$D/ac.sh"
+export DISCOVER_BANKS="aa,bb,cc" PY_FAIL_MATCH="--banks bb"
+/app/deploy/run-job.sh discover || fail "partial failure must exit 0"
+grep -q "\[discover\] PARTIAL 2/3 FAILED: bb" "$D/reports/nas_runs.log" || fail "PARTIAL summary missing"
+grep -q "PARTIAL 2/3 FAILED: bb \[discover\]" "$D/reports/last_run_status" || fail "PARTIAL status missing"
+grep -q "AC:discover" "$AC_LOG" || fail "autocommit not called on PARTIAL"
+unset PY_FAIL_MATCH AUTOCOMMIT_BIN DISCOVER_BANKS; export AUTOCOMMIT=0
+
+# T5e — all banks failed: FAILED status, non-zero exit.
+newdir; export DISCOVER_BANKS="aa,bb" PY_EXIT=1
+if /app/deploy/run-job.sh discover; then fail "all-failed discover must exit non-zero"; fi
+grep -q "\[discover\] FAILED 0/2 banks: aa,bb" "$D/reports/nas_runs.log" || fail "all-failed summary missing"
+grep -q "FAILED \[discover\]" "$D/reports/last_run_status" || fail "status != FAILED (all banks)"
+unset PY_EXIT DISCOVER_BANKS
 
 # T6 — autocommit called after success (AUTOCOMMIT=1), not after failure.
 newdir; export AUTOCOMMIT=1 AC_LOG="$D/ac.log"

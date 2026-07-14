@@ -32,19 +32,80 @@ case "$JOB" in
   *) echo "run-job: unknown job '$JOB'" >&2; exit 2 ;;
 esac
 
+# ---- discover: parallel per-bank fan-out ------------------------------------
+# One bank = one process = one host: the 0.5s per-host politeness throttle is
+# untouched, and manifest/raw writes are per-bank hence disjoint between
+# processes. data/discovery_errors.jsonl is shared across banks: O_APPEND
+# line-sized writes, accepted limitation.
+
+resolve_banks() {
+  if [ "$DISCOVER_BANKS" = "all" ]; then
+    python -m cb_corpus list-banks | awk '{print $1}'
+  else
+    echo "$DISCOVER_BANKS" | tr ',' '\n' | sed '/^$/d'
+  fi
+}
+
+discover_one() {
+  bank="$1"
+  set -- python -m cb_corpus discover --banks "$bank"
+  if [ "$DISCOVER_TYPES" != "full" ]; then
+    set -- "$@" --types "$DISCOVER_TYPES"
+  fi
+  set -- "$@" --rounds "$DISCOVER_ROUNDS" --download
+  if "$@" > "$DISCOVER_LOG_DIR/$bank.log" 2>&1; then
+    echo "$bank" >> "$DISCOVER_LOG_DIR/.ok"
+  else
+    echo "$bank" >> "$DISCOVER_LOG_DIR/.failed"
+  fi
+  return 0   # one failing bank must not abort the batch
+}
+export -f discover_one
+
+JOB_SUMMARY=""
+
+run_discover() {
+  if [ -z "${DISCOVER_BANKS:-}" ]; then
+    echo "run-job: DISCOVER_BANKS not set — refusing an implicit all-banks discover" >&2
+    return 2
+  fi
+  export DISCOVER_TYPES="${DISCOVER_TYPES:-full}"
+  export DISCOVER_ROUNDS="${DISCOVER_ROUNDS:-1}"
+  export DISCOVER_LOG_DIR="$DATA_DIR/reports/discover/$(date -u +%Y-%m-%d)"
+  mkdir -p "$DISCOVER_LOG_DIR"
+  rm -f "$DISCOVER_LOG_DIR/.ok" "$DISCOVER_LOG_DIR/.failed"
+
+  local banks total ok failed
+  banks=$(resolve_banks)
+  if [ -z "$banks" ]; then
+    echo "run-job: empty bank list" >&2
+    return 2
+  fi
+  echo "$banks" | xargs -n1 -P "${DISCOVER_WORKERS:-6}" bash -c 'discover_one "$1"' _
+
+  total=$(echo "$banks" | wc -l | tr -d ' ')
+  ok=0
+  if [ -f "$DISCOVER_LOG_DIR/.ok" ]; then ok=$(wc -l < "$DISCOVER_LOG_DIR/.ok" | tr -d ' '); fi
+  failed=$(sort "$DISCOVER_LOG_DIR/.failed" 2>/dev/null | paste -sd, - || true)
+  if [ "$ok" -eq "$total" ]; then
+    JOB_SUMMARY="OK $ok/$total"
+    return 0
+  elif [ "$ok" -gt 0 ]; then
+    JOB_SUMMARY="PARTIAL $ok/$total FAILED: $failed"
+    return 0
+  else
+    JOB_SUMMARY="FAILED 0/$total banks: $failed"
+    return 1
+  fi
+}
+
 run_job() {
   case "$JOB" in
     refresh)
       python -m cb_corpus bis-sitemap --download \
         && python -m cb_corpus repec --download ;;
     discover)
-      if [ -z "${DISCOVER_ARGS:-}" ]; then
-        echo "run-job: DISCOVER_ARGS not set — refusing an implicit full A-F discover" >&2
-        return 2
-      fi
-      # DISCOVER_ARGS is deliberately word-split (list of options).
-      # shellcheck disable=SC2086
-      python -m cb_corpus discover ${DISCOVER_ARGS:-} --download ;;
+      run_discover ;;
     campaign)
       python -m cb_corpus "$@" ;;
   esac
@@ -62,8 +123,8 @@ fi
 
 log "START"
 if run_job "$@"; then
-  log "OK"
-  echo "$(ts) OK [$JOB]" > "$STATUS"
+  log "${JOB_SUMMARY:-OK}"
+  echo "$(ts) ${JOB_SUMMARY:-OK} [$JOB]" > "$STATUS"
   if [ "${AUTOCOMMIT:-1}" = "1" ]; then
     "${AUTOCOMMIT_BIN:-/app/deploy/autocommit.sh}" "$JOB" >> "$LOG" 2>&1 \
       || log "AUTOCOMMIT FAILED (local state intact, will retry on next run)"
@@ -71,6 +132,7 @@ if run_job "$@"; then
   exit 0
 else
   rc=$?
+  if [ -n "$JOB_SUMMARY" ]; then log "$JOB_SUMMARY"; fi
   log "FAILED rc=$rc"
   echo "$(ts) FAILED [$JOB] rc=$rc" > "$STATUS"
   exit "$rc"
