@@ -14,7 +14,7 @@
 - **Never** add `Co-Authored-By: Claude` (or "Generated with Claude") to commits.
 - **No real infra values** (IPs, hostnames, real `/mnt` paths, UIDs) in any committed file — placeholders only, as in the existing `deploy/*.example.yml`.
 - Log/status strings are test-grepped — when changing one, update script and test in the same task.
-- Existing behaviors that must NOT change: `refresh` job content and its `flock -n`; `campaign` blocking lock; empty-volume `REFUSED` guard (exit 3); single autocommit after a successful job; status file format `<ts> OK|FAILED|REFUSED [<job>]` (discover may add detail between the verdict and `[<job>]`).
+- Existing behaviors that must NOT change: `refresh` job content and its `flock -n`; `campaign` blocking lock; empty-volume `REFUSED` guard (exit 3); single autocommit after a successful job; status file format `<ts> <verdict> [<job>]` where the verdict is `OK|FAILED|REFUSED` for refresh/campaign and `OK <n>/<n>|PARTIAL <k>/<n> FAILED: <codes>|FAILED` for discover (per spec §2.4: `last_run_status` reflects OK or PARTIAL).
 - Tests run inside Docker (Linux `flock`/`xargs` semantics — do not run them directly on macOS):
 
   ```bash
