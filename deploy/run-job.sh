@@ -112,14 +112,21 @@ run_job() {
 }
 
 exec 9>"$LOCK"
-if [ "$JOB" = "campaign" ]; then
-  flock 9   # a campaign waits its turn (refresh in progress, etc.)
-else
-  if ! flock -n 9; then
-    log "SKIPPED (lock busy)"
-    exit 0
-  fi
-fi
+case "$JOB" in
+  campaign)
+    flock 9 ;;   # a campaign waits its turn (refresh in progress, etc.)
+  discover)
+    # Wait for an overrunning refresh instead of silently losing the night.
+    if ! flock -w "${DISCOVER_LOCK_TIMEOUT:-7200}" 9; then
+      log "SKIPPED (lock timeout after ${DISCOVER_LOCK_TIMEOUT:-7200}s)"
+      exit 0
+    fi ;;
+  *)
+    if ! flock -n 9; then
+      log "SKIPPED (lock busy)"
+      exit 0
+    fi ;;
+esac
 
 log "START"
 if run_job "$@"; then

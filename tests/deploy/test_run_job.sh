@@ -128,6 +128,42 @@ grep -q "\[discover\] FAILED 0/2 banks: aa,bb" "$D/reports/nas_runs.log" || fail
 grep -q "FAILED \[discover\]" "$D/reports/last_run_status" || fail "status != FAILED (all banks)"
 unset PY_EXIT DISCOVER_BANKS
 
+# T5f — parallelism is real and bounded by DISCOVER_WORKERS.
+newdir; export DISCOVER_BANKS="b1,b2,b3,b4,b5,b6" DISCOVER_WORKERS=2
+export PY_CONC_DIR="$D/conc" PY_SLEEP=0.3
+mkdir -p "$PY_CONC_DIR"
+/app/deploy/run-job.sh discover
+MAXC=$(cat "$PY_CONC_DIR/max")
+[ "$MAXC" -le 2 ] || fail "parallelism exceeded DISCOVER_WORKERS (max=$MAXC)"
+[ "$MAXC" -ge 2 ] || fail "no parallelism observed (max=$MAXC)"
+unset DISCOVER_BANKS DISCOVER_WORKERS PY_CONC_DIR PY_SLEEP
+
+# T5g — discover waits for a busy lock (blocking flock) instead of skipping.
+newdir; export DISCOVER_BANKS="us"
+( exec 9>"$D/.cb.lock"; flock 9; sleep 2 ) &
+HOLDER=$!
+sleep 0.5
+START=$(date +%s)
+/app/deploy/run-job.sh discover
+END=$(date +%s)
+[ $((END - START)) -ge 1 ] || fail "discover did not wait for the lock"
+grep -q "PYARGS:-m cb_corpus discover --banks us" "$PY_LOG" || fail "discover did not run after the wait"
+wait "$HOLDER"
+unset DISCOVER_BANKS
+
+# T5h — discover gives up after DISCOVER_LOCK_TIMEOUT (exit 0, SKIPPED logged).
+newdir; export DISCOVER_BANKS="us" DISCOVER_LOCK_TIMEOUT=1
+( exec 9>"$D/.cb.lock"; flock 9; sleep 3 ) &
+HOLDER=$!
+sleep 0.5
+/app/deploy/run-job.sh discover || fail "lock timeout must exit 0"
+grep -q "\[discover\] SKIPPED (lock timeout" "$D/reports/nas_runs.log" || fail "lock timeout not logged"
+if [ -f "$PY_LOG" ] && grep -q "PYARGS:-m cb_corpus discover" "$PY_LOG"; then
+  fail "python should not have run on lock timeout"
+fi
+wait "$HOLDER"
+unset DISCOVER_BANKS DISCOVER_LOCK_TIMEOUT
+
 # T6 — autocommit called after success (AUTOCOMMIT=1), not after failure.
 newdir; export AUTOCOMMIT=1 AC_LOG="$D/ac.log"
 cat > "$D/ac.sh" <<'EOF'
