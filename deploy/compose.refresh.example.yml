@@ -12,6 +12,8 @@ services:
       DISCOVER_TYPES: full     # "full" (= whole A-F scope) or a comma list (A3,E2)
       DISCOVER_ROUNDS: "1"     # incremental: first listing pages only
       DISCOVER_WORKERS: "6"    # banks crawled in parallel (bounds CPU/RAM/bandwidth)
+      # DISCOVER_LOCK_TIMEOUT: "7200"   # s to wait for a running refresh before skipping
+      # DISCOVER_BANK_TIMEOUT: "10800"  # s per bank before the crawl is killed
       AUTOCOMMIT: "1"
     volumes:
       - /mnt/POOL/DATASET:/app/data              # host path of the SMB dataset

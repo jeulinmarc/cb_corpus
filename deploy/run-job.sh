@@ -40,7 +40,10 @@ esac
 
 resolve_banks() {
   if [ "$DISCOVER_BANKS" = "all" ]; then
-    python -m cb_corpus list-banks | awk '{print $1}'
+    # list-banks output ends with a blank line and an "N banks" footer
+    # (cb_corpus/cli.py); real bank codes are 2-4 lowercase letters, so
+    # filter on that shape to keep the footer out of the bank list.
+    python -m cb_corpus list-banks | awk 'NF && $1 ~ /^[a-z]{2,4}$/ {print $1}'
   else
     echo "$DISCOVER_BANKS" | tr ',' '\n' | sed '/^$/d'
   fi
@@ -53,7 +56,9 @@ discover_one() {
     set -- "$@" --types "$DISCOVER_TYPES"
   fi
   set -- "$@" --rounds "$DISCOVER_ROUNDS" --download
-  if "$@" > "$DISCOVER_LOG_DIR/$bank.log" 2>&1; then
+  # Per-bank wall-clock bound so one wedged bank cannot hold the global lock
+  # forever: SIGTERM at DISCOVER_BANK_TIMEOUT, SIGKILL 60s later if still alive.
+  if timeout -k 60 "${DISCOVER_BANK_TIMEOUT:-10800}" "$@" > "$DISCOVER_LOG_DIR/$bank.log" 2>&1; then
     echo "$bank" >> "$DISCOVER_LOG_DIR/.ok"
   else
     echo "$bank" >> "$DISCOVER_LOG_DIR/.failed"
@@ -71,6 +76,7 @@ run_discover() {
   fi
   export DISCOVER_TYPES="${DISCOVER_TYPES:-full}"
   export DISCOVER_ROUNDS="${DISCOVER_ROUNDS:-1}"
+  export DISCOVER_BANK_TIMEOUT="${DISCOVER_BANK_TIMEOUT:-10800}"
   export DISCOVER_LOG_DIR="$DATA_DIR/reports/discover/$(date -u +%Y-%m-%d)"
   mkdir -p "$DISCOVER_LOG_DIR"
   rm -f "$DISCOVER_LOG_DIR/.ok" "$DISCOVER_LOG_DIR/.failed"

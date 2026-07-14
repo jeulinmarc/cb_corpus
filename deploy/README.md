@@ -65,7 +65,9 @@ without it), `DISCOVER_TYPES` (`full` = whole A–F scope, or comma list),
 `DISCOVER_ROUNDS` (1 = incremental), `DISCOVER_WORKERS` (parallel banks,
 default 6 — the single knob bounding CPU/RAM/bandwidth),
 `DISCOVER_LOCK_TIMEOUT` (seconds discover waits for a running refresh,
-default 7200). Schedule: refresh at 00:00/12:00, discover nightly at 04:00
+default 7200), `DISCOVER_BANK_TIMEOUT` (seconds per bank before the crawl is
+killed and the bank is counted as failed, default 10800). Schedule: refresh
+at 00:00/12:00, discover nightly at 04:00
 (Paris). **Migration from DISCOVER_ARGS:** stacks created before 2026-07-14
 used `DISCOVER_ARGS`, which no longer exists — replace it with the variables
 above and recreate the stack.

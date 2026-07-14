@@ -11,6 +11,8 @@ if [ "$*" = "-m cb_corpus list-banks" ]; then
   printf 'aa   Bank Aa                              aa.example\n'
   printf 'bb   Bank Bb                              bb.example  (verify domain)\n'
   printf 'cc   Bank Cc                              cc.example\n'
+  printf '\n'
+  printf '3 banks\n'
 fi
 case "$*" in
   *"${PY_FAIL_MATCH:-@@none@@}"*) exit 1 ;;
@@ -163,6 +165,17 @@ if [ -f "$PY_LOG" ] && grep -q "PYARGS:-m cb_corpus discover" "$PY_LOG"; then
 fi
 wait "$HOLDER"
 unset DISCOVER_BANKS DISCOVER_LOCK_TIMEOUT
+
+# T5i — a bank exceeding DISCOVER_BANK_TIMEOUT is killed and counted as failed.
+newdir; export DISCOVER_BANKS="aa,bb" DISCOVER_BANK_TIMEOUT=1
+export PY_CONC_DIR="$D/conc" PY_SLEEP=5
+mkdir -p "$PY_CONC_DIR"
+START=$(date +%s)
+if /app/deploy/run-job.sh discover; then fail "all-banks-timed-out discover must exit non-zero"; fi
+END=$(date +%s)
+[ $((END - START)) -lt 10 ] || fail "banks were not killed by DISCOVER_BANK_TIMEOUT"
+grep -q "\[discover\] FAILED 0/2 banks: aa,bb" "$D/reports/nas_runs.log" || fail "timed-out banks not counted as failed"
+unset DISCOVER_BANKS DISCOVER_BANK_TIMEOUT PY_CONC_DIR PY_SLEEP
 
 # T6 — autocommit called after success (AUTOCOMMIT=1), not after failure.
 newdir; export AUTOCOMMIT=1 AC_LOG="$D/ac.log"

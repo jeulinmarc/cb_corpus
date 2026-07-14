@@ -149,3 +149,10 @@ Write-safety analysis (why per-bank processes don't conflict):
   recreate the stack.
 - First nightly run should be watched via `reports/nas_runs.log` and
   `reports/discover/<date>/`.
+
+## Amendment (2026-07-14, final branch review)
+
+- `resolve_banks` filters the `list-banks` footer (`awk 'NF && $1 ~ /^[a-z]{2,4}$/'`).
+- Per-bank runtime bound: `DISCOVER_BANK_TIMEOUT` (default 10800 s, SIGKILL +60 s via
+  coreutils `timeout`) so a wedged bank cannot hold the global lock indefinitely;
+  timed-out banks are counted in `.failed` and surface in the summary.
