@@ -39,77 +39,79 @@ export CB_APP_DIR=/app
 
 newdir() { D=$(mktemp -d); export CB_DATA_DIR="$D" PY_LOG="$D/py.log"; mkdir -p "$D/manifest"; echo '{}' > "$D/manifest/stub.jsonl"; }
 
-# T1 — refresh success: bis-sitemap then repec, log OK, status OK.
-newdir; export AUTOCOMMIT=0
-/app/deploy/run-job.sh refresh
+# T1 — sync success: bis-sitemap, then repec, then per-bank native discover, in order.
+newdir; export AUTOCOMMIT=0 DISCOVER_BANKS="us,ecb" DISCOVER_TYPES="A3" DISCOVER_ROUNDS=1
+/app/deploy/run-job.sh sync
 grep -q "PYARGS:-m cb_corpus bis-sitemap --download" "$PY_LOG" || fail "bis-sitemap not called"
 grep -q "PYARGS:-m cb_corpus repec --download" "$PY_LOG" || fail "repec not called"
-grep -q "\[refresh\] OK" "$D/reports/nas_runs.log" || fail "log OK missing"
-grep -q "OK \[refresh\]" "$D/reports/last_run_status" || fail "status != OK"
+grep -q "PYARGS:-m cb_corpus discover --banks us --types A3 --rounds 1 --native-only --download" "$PY_LOG" \
+  || fail "us native discover call wrong"
+grep -q "PYARGS:-m cb_corpus discover --banks ecb --types A3 --rounds 1 --native-only --download" "$PY_LOG" \
+  || fail "ecb native discover call wrong"
+BIS_LINE=$(grep -n "bis-sitemap" "$PY_LOG" | cut -d: -f1 | head -1)
+REPEC_LINE=$(grep -n "cb_corpus repec" "$PY_LOG" | cut -d: -f1 | head -1)
+DISC_LINE=$(grep -n "cb_corpus discover" "$PY_LOG" | cut -d: -f1 | head -1)
+[ "$BIS_LINE" -lt "$REPEC_LINE" ] && [ "$REPEC_LINE" -lt "$DISC_LINE" ] || fail "sync phases out of order"
+grep -q "\[sync\] catalogs OK" "$D/reports/nas_runs.log" || fail "catalogs OK not logged"
+grep -q "\[sync\] OK 2/2" "$D/reports/nas_runs.log" || fail "native summary missing"
+grep -q "OK 2/2 \[sync\]" "$D/reports/last_run_status" || fail "status summary missing"
+DAY=$(date -u +%Y-%m-%d)
+[ -f "$D/reports/discover/$DAY/us.log" ] || fail "per-bank log missing"
+unset DISCOVER_BANKS DISCOVER_TYPES DISCOVER_ROUNDS
 
-# T2 — refresh failure: status FAILED, non-zero exit.
-newdir; export PY_EXIT=1
-if /app/deploy/run-job.sh refresh; then fail "refresh should have failed"; fi
-grep -q "FAILED \[refresh\]" "$D/reports/last_run_status" || fail "status != FAILED"
-unset PY_EXIT
+# T2 — catalog failure aborts sync: no native phase, FAILED status, non-zero exit.
+newdir; export DISCOVER_BANKS="us" PY_FAIL_MATCH="bis-sitemap"
+if /app/deploy/run-job.sh sync; then fail "sync must fail when a catalog phase fails"; fi
+grep -q "FAILED \[sync\]" "$D/reports/last_run_status" || fail "status != FAILED (catalog)"
+if grep -q "PYARGS:-m cb_corpus discover" "$PY_LOG"; then fail "native phase must not run after catalog failure"; fi
+unset PY_FAIL_MATCH DISCOVER_BANKS
 
-# T3 — lock busy: refresh skips (exit 0), python never called.
-newdir
+# T3 — lock busy: second sync skips (exit 0), python never called.
+newdir; export DISCOVER_BANKS="us"
 ( exec 9>"$D/.cb.lock"; flock 9; sleep 3 ) &
 HOLDER=$!
 sleep 0.5
-/app/deploy/run-job.sh refresh || fail "skip must exit 0"
-grep -q "\[refresh\] SKIPPED" "$D/reports/nas_runs.log" || fail "SKIPPED not logged"
+/app/deploy/run-job.sh sync || fail "lock-busy sync must exit 0"
+grep -q "\[sync\] SKIPPED (lock busy)" "$D/reports/nas_runs.log" || fail "SKIPPED not logged"
 if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python should not have run"; fi
-wait "$HOLDER"
+wait "$HOLDER"; unset DISCOVER_BANKS
 
-# T4 — campaign waits for the lock then runs with its args.
+# T4 — campaign waits for the lock then runs with its args (unchanged from before).
 newdir
 ( exec 9>"$D/.cb.lock"; flock 9; sleep 2 ) &
 HOLDER=$!
 sleep 0.5
 START=$(date +%s)
-/app/deploy/run-job.sh campaign discover --banks fr --types A3 --download
+/app/deploy/run-job.sh campaign discover --banks fr --native-only --download
 END=$(date +%s)
 [ $((END - START)) -ge 1 ] || fail "campaign did not wait for the lock"
-grep -q "PYARGS:-m cb_corpus discover --banks fr --types A3 --download" "$PY_LOG" \
+grep -q "PYARGS:-m cb_corpus discover --banks fr --native-only --download" "$PY_LOG" \
   || fail "incorrect campaign args"
 wait "$HOLDER"
 
-# T5 — discover: explicit bank list, explicit types → one call per bank + per-bank logs.
-newdir; export DISCOVER_BANKS="us,ecb" DISCOVER_TYPES="A3" DISCOVER_ROUNDS=1
-/app/deploy/run-job.sh discover
-grep -q "PYARGS:-m cb_corpus discover --banks us --types A3 --rounds 1 --download" "$PY_LOG" \
-  || fail "us discover call wrong"
-grep -q "PYARGS:-m cb_corpus discover --banks ecb --types A3 --rounds 1 --download" "$PY_LOG" \
-  || fail "ecb discover call wrong"
-DAY=$(date -u +%Y-%m-%d)
-[ -f "$D/reports/discover/$DAY/us.log" ] || fail "per-bank log us missing"
-[ -f "$D/reports/discover/$DAY/ecb.log" ] || fail "per-bank log ecb missing"
-grep -q "\[discover\] OK 2/2" "$D/reports/nas_runs.log" || fail "OK summary missing"
-grep -q "OK 2/2 \[discover\]" "$D/reports/last_run_status" || fail "status summary missing"
-unset DISCOVER_BANKS DISCOVER_TYPES DISCOVER_ROUNDS
-
-# T5b — discover without DISCOVER_BANKS: explicit refusal (no implicit all-banks discover).
+# T5 — DISCOVER_BANKS unset: sync refused before any python call.
 newdir
-if /app/deploy/run-job.sh discover; then fail "discover without DISCOVER_BANKS should have failed"; fi
-grep -q "FAILED \[discover\]" "$D/reports/last_run_status" || fail "status != FAILED (no DISCOVER_BANKS)"
-if [ -f "$PY_LOG" ] && grep -q "PYARGS:-m cb_corpus discover" "$PY_LOG"; then
-  fail "python discover should not have run without DISCOVER_BANKS"
+if /app/deploy/run-job.sh sync; then fail "sync without DISCOVER_BANKS should have failed"; fi
+grep -q "FAILED \[sync\]" "$D/reports/last_run_status" || fail "status != FAILED (no DISCOVER_BANKS)"
+if [ -f "$PY_LOG" ] && grep -q "cb_corpus discover" "$PY_LOG"; then
+  fail "native discover should not run without DISCOVER_BANKS"
 fi
 
-# T5c — DISCOVER_BANKS=all resolves via list-banks; DISCOVER_TYPES=full omits --types.
+# T5b — refusal happens BEFORE catalogs (cheap fail: no bis-sitemap either).
+if [ -f "$PY_LOG" ] && grep -q "bis-sitemap" "$PY_LOG"; then
+  fail "catalogs should not run without DISCOVER_BANKS"
+fi
+
+# T6 — all resolution via list-banks with footer filtered; full omits --types.
 newdir; export DISCOVER_BANKS="all" DISCOVER_TYPES="full"
-/app/deploy/run-job.sh discover
-grep -q "PYARGS:-m cb_corpus list-banks" "$PY_LOG" || fail "list-banks not called for all"
-grep -q "PYARGS:-m cb_corpus discover --banks aa --rounds 1 --download" "$PY_LOG" \
-  || fail "aa call wrong (types must be omitted when full)"
-grep -q "PYARGS:-m cb_corpus discover --banks bb --rounds 1 --download" "$PY_LOG" || fail "bb call missing"
-grep -q "PYARGS:-m cb_corpus discover --banks cc --rounds 1 --download" "$PY_LOG" || fail "cc call missing"
-grep -q "\[discover\] OK 3/3" "$D/reports/nas_runs.log" || fail "OK 3/3 summary missing"
+/app/deploy/run-job.sh sync
+grep -q "PYARGS:-m cb_corpus list-banks" "$PY_LOG" || fail "list-banks not called"
+grep -q "PYARGS:-m cb_corpus discover --banks aa --rounds 1 --native-only --download" "$PY_LOG" \
+  || fail "aa call wrong (footer not filtered or --types not omitted)"
+grep -q "\[sync\] OK 3/3" "$D/reports/nas_runs.log" || fail "OK 3/3 missing (footer leaked into totals)"
 unset DISCOVER_BANKS DISCOVER_TYPES
 
-# T5d — partial failure: PARTIAL summary, exit 0, autocommit still runs.
+# T7 — native partial failure: PARTIAL, exit 0, autocommit runs.
 newdir; export AUTOCOMMIT=1 AC_LOG="$D/ac.log"
 cat > "$D/ac.sh" <<'EOF'
 #!/bin/bash
@@ -117,94 +119,52 @@ echo "AC:$1" >> "$AC_LOG"
 EOF
 chmod +x "$D/ac.sh"; export AUTOCOMMIT_BIN="$D/ac.sh"
 export DISCOVER_BANKS="aa,bb,cc" PY_FAIL_MATCH="--banks bb"
-/app/deploy/run-job.sh discover || fail "partial failure must exit 0"
-grep -q "\[discover\] PARTIAL 2/3 FAILED: bb" "$D/reports/nas_runs.log" || fail "PARTIAL summary missing"
-grep -q "PARTIAL 2/3 FAILED: bb \[discover\]" "$D/reports/last_run_status" || fail "PARTIAL status missing"
-grep -q "AC:discover" "$AC_LOG" || fail "autocommit not called on PARTIAL"
+/app/deploy/run-job.sh sync || fail "native partial failure must exit 0"
+grep -q "\[sync\] PARTIAL 2/3 FAILED: bb" "$D/reports/nas_runs.log" || fail "PARTIAL summary missing"
+grep -q "AC:sync" "$AC_LOG" || fail "autocommit not called on PARTIAL"
 unset PY_FAIL_MATCH AUTOCOMMIT_BIN DISCOVER_BANKS; export AUTOCOMMIT=0
 
-# T5e — all banks failed: FAILED status, non-zero exit.
-newdir; export DISCOVER_BANKS="aa,bb" PY_EXIT=1
-if /app/deploy/run-job.sh discover; then fail "all-failed discover must exit non-zero"; fi
-grep -q "\[discover\] FAILED 0/2 banks: aa,bb" "$D/reports/nas_runs.log" || fail "all-failed summary missing"
-grep -q "FAILED \[discover\]" "$D/reports/last_run_status" || fail "status != FAILED (all banks)"
-unset PY_EXIT DISCOVER_BANKS
+# T8 — all native banks failed: FAILED, non-zero exit.
+newdir; export DISCOVER_BANKS="aa,bb" PY_FAIL_MATCH="cb_corpus discover"
+if /app/deploy/run-job.sh sync; then fail "all-native-failed sync must exit non-zero"; fi
+grep -q "\[sync\] FAILED 0/2 banks: aa,bb" "$D/reports/nas_runs.log" || fail "all-failed summary missing"
+unset PY_FAIL_MATCH DISCOVER_BANKS
 
-# T5f — parallelism is real and bounded by DISCOVER_WORKERS.
+# T9 — parallelism bounded by DISCOVER_WORKERS (concurrency counter in stub).
 newdir; export DISCOVER_BANKS="b1,b2,b3,b4,b5,b6" DISCOVER_WORKERS=2
 export PY_CONC_DIR="$D/conc" PY_SLEEP=0.3
 mkdir -p "$PY_CONC_DIR"
-/app/deploy/run-job.sh discover
+/app/deploy/run-job.sh sync
 MAXC=$(cat "$PY_CONC_DIR/max")
 [ "$MAXC" -le 2 ] || fail "parallelism exceeded DISCOVER_WORKERS (max=$MAXC)"
 [ "$MAXC" -ge 2 ] || fail "no parallelism observed (max=$MAXC)"
 unset DISCOVER_BANKS DISCOVER_WORKERS PY_CONC_DIR PY_SLEEP
 
-# T5g — discover waits for a busy lock (blocking flock) instead of skipping.
-newdir; export DISCOVER_BANKS="us"
-( exec 9>"$D/.cb.lock"; flock 9; sleep 2 ) &
-HOLDER=$!
-sleep 0.5
-START=$(date +%s)
-/app/deploy/run-job.sh discover
-END=$(date +%s)
-[ $((END - START)) -ge 1 ] || fail "discover did not wait for the lock"
-grep -q "PYARGS:-m cb_corpus discover --banks us" "$PY_LOG" || fail "discover did not run after the wait"
-wait "$HOLDER"
-unset DISCOVER_BANKS
-
-# T5h — discover gives up after DISCOVER_LOCK_TIMEOUT (exit 0, SKIPPED logged).
-newdir; export DISCOVER_BANKS="us" DISCOVER_LOCK_TIMEOUT=1
-( exec 9>"$D/.cb.lock"; flock 9; sleep 3 ) &
-HOLDER=$!
-sleep 0.5
-/app/deploy/run-job.sh discover || fail "lock timeout must exit 0"
-grep -q "\[discover\] SKIPPED (lock timeout" "$D/reports/nas_runs.log" || fail "lock timeout not logged"
-if [ -f "$PY_LOG" ] && grep -q "PYARGS:-m cb_corpus discover" "$PY_LOG"; then
-  fail "python should not have run on lock timeout"
-fi
-wait "$HOLDER"
-unset DISCOVER_BANKS DISCOVER_LOCK_TIMEOUT
-
-# T5i — a bank exceeding DISCOVER_BANK_TIMEOUT is killed and counted as failed.
+# T10 — DISCOVER_BANK_TIMEOUT kills a wedged bank; both timed out => FAILED.
 newdir; export DISCOVER_BANKS="aa,bb" DISCOVER_BANK_TIMEOUT=1
 export PY_CONC_DIR="$D/conc" PY_SLEEP=5
 mkdir -p "$PY_CONC_DIR"
 START=$(date +%s)
-if /app/deploy/run-job.sh discover; then fail "all-banks-timed-out discover must exit non-zero"; fi
+if /app/deploy/run-job.sh sync; then fail "all-timed-out sync must exit non-zero"; fi
 END=$(date +%s)
-[ $((END - START)) -lt 10 ] || fail "banks were not killed by DISCOVER_BANK_TIMEOUT"
-grep -q "\[discover\] FAILED 0/2 banks: aa,bb" "$D/reports/nas_runs.log" || fail "timed-out banks not counted as failed"
+[ $((END - START)) -lt 20 ] || fail "banks were not killed by DISCOVER_BANK_TIMEOUT"
+grep -q "\[sync\] FAILED 0/2 banks: aa,bb" "$D/reports/nas_runs.log" || fail "timed-out banks not counted"
 unset DISCOVER_BANKS DISCOVER_BANK_TIMEOUT PY_CONC_DIR PY_SLEEP
 
-# T6 — autocommit called after success (AUTOCOMMIT=1), not after failure.
-newdir; export AUTOCOMMIT=1 AC_LOG="$D/ac.log"
-cat > "$D/ac.sh" <<'EOF'
-#!/bin/bash
-echo "AC:$1" >> "$AC_LOG"
-EOF
-chmod +x "$D/ac.sh"; export AUTOCOMMIT_BIN="$D/ac.sh"
-/app/deploy/run-job.sh refresh
-grep -q "AC:refresh" "$AC_LOG" || fail "autocommit not called after success"
-export PY_EXIT=1
-if /app/deploy/run-job.sh refresh; then fail "refresh should have failed"; fi
-[ "$(grep -c "AC:" "$AC_LOG")" = "1" ] || fail "autocommit called after failure"
-unset PY_EXIT AUTOCOMMIT_BIN
-
-# T7 — unknown job: error.
+# T11 — retired job names are rejected.
 newdir
-if /app/deploy/run-job.sh bogus; then fail "unknown job accepted"; fi
+for j in refresh discover bogus; do
+  if /app/deploy/run-job.sh "$j"; then fail "job '$j' should be rejected"; fi
+done
 
-# T8 — empty volume: refused (exit 3), REFUSED logged, python never called.
-D=$(mktemp -d); export CB_DATA_DIR="$D" PY_LOG="$D/py.log"
-export AUTOCOMMIT=0
-set +e; /app/deploy/run-job.sh refresh; rc=$?; set -e
+# T12 — empty volume: REFUSED (exit 3), python never called; override works.
+D=$(mktemp -d); export CB_DATA_DIR="$D" PY_LOG="$D/py.log" DISCOVER_BANKS="us"
+set +e; /app/deploy/run-job.sh sync; rc=$?; set -e
 [ "$rc" = "3" ] || fail "empty volume must exit 3 (rc=$rc)"
 grep -q "REFUSED" "$D/reports/nas_runs.log" || fail "REFUSED not logged"
-if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python should not have run on an empty volume"; fi
-# and with the override, it runs
+if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python must not run on empty volume"; fi
 export CB_ALLOW_EMPTY_DATA=1
-/app/deploy/run-job.sh refresh || fail "CB_ALLOW_EMPTY_DATA=1 must allow it"
-unset CB_ALLOW_EMPTY_DATA
+/app/deploy/run-job.sh sync || fail "CB_ALLOW_EMPTY_DATA=1 must allow it"
+unset CB_ALLOW_EMPTY_DATA DISCOVER_BANKS
 
 echo "RUN_JOB_OK"

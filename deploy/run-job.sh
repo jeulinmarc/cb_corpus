@@ -1,6 +1,6 @@
 #!/bin/bash
 # Job wrapper: global lock + execution + log + state auto-commit.
-# Usage: run-job.sh refresh | discover | campaign <cb_corpus sub-command...>
+# Usage: run-job.sh sync | campaign <cb_corpus sub-command...>
 set -uo pipefail
 
 JOB="${1:-}"; shift || true
@@ -28,7 +28,7 @@ if [ "${CB_ALLOW_EMPTY_DATA:-0}" != "1" ]; then
 fi
 
 case "$JOB" in
-  refresh|discover|campaign) ;;
+  sync|campaign) ;;
   *) echo "run-job: unknown job '$JOB'" >&2; exit 2 ;;
 esac
 
@@ -55,7 +55,7 @@ discover_one() {
   if [ "$DISCOVER_TYPES" != "full" ]; then
     set -- "$@" --types "$DISCOVER_TYPES"
   fi
-  set -- "$@" --rounds "$DISCOVER_ROUNDS" --download
+  set -- "$@" --rounds "$DISCOVER_ROUNDS" --native-only --download
   # Per-bank wall-clock bound so one wedged bank cannot hold the global lock
   # forever: SIGTERM at DISCOVER_BANK_TIMEOUT, SIGKILL 60s later if still alive.
   if timeout -k 60 "${DISCOVER_BANK_TIMEOUT:-10800}" "$@" > "$DISCOVER_LOG_DIR/$bank.log" 2>&1; then
@@ -70,10 +70,6 @@ export -f discover_one
 JOB_SUMMARY=""
 
 run_discover() {
-  if [ -z "${DISCOVER_BANKS:-}" ]; then
-    echo "run-job: DISCOVER_BANKS not set — refusing an implicit all-banks discover" >&2
-    return 2
-  fi
   export DISCOVER_TYPES="${DISCOVER_TYPES:-full}"
   export DISCOVER_ROUNDS="${DISCOVER_ROUNDS:-1}"
   export DISCOVER_BANK_TIMEOUT="${DISCOVER_BANK_TIMEOUT:-10800}"
@@ -105,15 +101,24 @@ run_discover() {
   fi
 }
 
+run_sync() {
+  if [ -z "${DISCOVER_BANKS:-}" ]; then
+    echo "run-job: DISCOVER_BANKS not set — refusing an implicit all-banks sync" >&2
+    return 2
+  fi
+  # Phase 1+2: shared catalogs, read once for all banks (the whole point:
+  # per-bank discover no longer re-walks them — see the 2026-07-15 spec).
+  python -m cb_corpus bis-sitemap --download || return $?
+  python -m cb_corpus repec --download || return $?
+  log "catalogs OK"
+  # Phase 3: native bank-site fan-out (unchanged mechanics from PR #3).
+  run_discover
+}
+
 run_job() {
   case "$JOB" in
-    refresh)
-      python -m cb_corpus bis-sitemap --download \
-        && python -m cb_corpus repec --download ;;
-    discover)
-      run_discover ;;
-    campaign)
-      python -m cb_corpus "$@" ;;
+    sync)     run_sync ;;
+    campaign) python -m cb_corpus "$@" ;;
   esac
 }
 
@@ -121,12 +126,6 @@ exec 9>"$LOCK"
 case "$JOB" in
   campaign)
     flock 9 ;;   # a campaign waits its turn (refresh in progress, etc.)
-  discover)
-    # Wait for an overrunning refresh instead of silently losing the night.
-    if ! flock -w "${DISCOVER_LOCK_TIMEOUT:-7200}" 9; then
-      log "SKIPPED (lock timeout after ${DISCOVER_LOCK_TIMEOUT:-7200}s)"
-      exit 0
-    fi ;;
   *)
     if ! flock -n 9; then
       log "SKIPPED (lock busy)"
