@@ -56,6 +56,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="re-crawl up to N times until no new docs and no errors "
                         "(idempotent; fills transient-failure gaps). Use a higher "
                         "value for a full rebuild. Ignored for dry-run.")
+    d.add_argument("--native-only", action="store_true",
+                   help="skip shared catalogs (BIS index, RePEc) — bank-site "
+                        "sources only; the sync job's catalog phase owns those")
 
     b = sub.add_parser("bis-sitemap",
                        help="Single-pass discovery of all C1 speeches via BIS sitemaps.")
@@ -147,7 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "discover":
         scope = _types(args.types)
         results = run(bank_codes=banks, scope=scope, since=args.since,
-                      dry_run=not args.download, max_rounds=args.rounds)
+                      dry_run=not args.download, max_rounds=args.rounds,
+                      native_only=args.native_only)
         for code, counts in results.items():
             print(f"{code}: {counts}")
         return 0

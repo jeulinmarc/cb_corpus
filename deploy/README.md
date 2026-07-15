@@ -59,39 +59,38 @@ The `deploy_key` file must be **readable** by the PUID user:
 autocommit copies the key as 0600 into a private temp directory (0700, removed at the end of the run), so a 0644 key works;
 a root:0600 key will fail with a clear message in `nas_runs.log`.
 
-Discover scope is controlled by env vars (Dockge, no rebuild needed):
-`DISCOVER_BANKS` (`all` or comma list — required, the job refuses to run
-without it), `DISCOVER_TYPES` (`full` = whole A–F scope, or comma list),
-`DISCOVER_ROUNDS` (1 = incremental), `DISCOVER_WORKERS` (parallel banks,
-default 6 — the single knob bounding CPU/RAM/bandwidth),
-`DISCOVER_LOCK_TIMEOUT` (seconds discover waits for a running refresh,
-default 7200), `DISCOVER_BANK_TIMEOUT` (seconds per bank before the crawl is
-killed and the bank is counted as failed, default 10800). Schedule: refresh
-at 00:00/12:00, discover nightly at 04:00
-(Paris). **Migration from DISCOVER_ARGS:** stacks created before 2026-07-14
-used `DISCOVER_ARGS`, which no longer exists — replace it with the variables
-above and recreate the stack.
+Schedule: one sync nightly at 01:00 (Paris). Each sync catalogs once for all
+banks (bis-sitemap, repec), then proceeds to parallel native bank-site
+discovery. Scope for the native phase is controlled by env vars (Dockge, no
+rebuild needed): `DISCOVER_BANKS` (`all` or comma list — required, the job
+refuses to run without it), `DISCOVER_TYPES` (`full` = whole A–F scope, or
+comma list), `DISCOVER_ROUNDS` (1 = incremental), `DISCOVER_WORKERS` (parallel
+banks, default 6 — the single knob bounding CPU/RAM/bandwidth),
+`DISCOVER_BANK_TIMEOUT` (seconds per bank before the crawl is killed and the
+bank is counted as failed, default 10800). **Migration:** stacks created before
+2026-07-15 used the refresh/discover job pair — the crontab and job names
+changed; recreate the stack after re-pulling the image.
 
 ## 4. `cb-campaign` stack (on demand)
 
 Dockge → stack `cb-campaign` → paste `compose.campaign.example.yml` →
 replace the placeholders and the `command:` line → drop the private key `nas_deploy_key`
 into the stack's folder under the name `deploy_key` → Deploy. The container
-waits for any running refresh to finish (lock), runs, pushes the state, stops.
+waits for any running sync or campaign to finish (lock), runs, pushes the state, stops.
 To launch another campaign: re-edit `command:` + Deploy.
 
 ## 5. Sanity checks
 
 - `data/reports/nas_runs.log` and `last_run_status` visible in Finder (SMB).
 - A recent PDF appears under `raw/<bank>/...` in Finder.
-- A `data: NAS refresh <date>` commit appears on GitHub after a useful run.
+- A `data: NAS sync <date>` commit appears on GitHub after a useful run, with `[sync] catalogs OK` in the log output.
 - Files created by the container belong to you via SMB (otherwise revisit PUID/PGID).
 - A Dockge stop/redeploy mid-run kills the current job (status `FAILED` or
   absent) — the lock is released automatically and the next cron tick
   picks up again; this is expected.
-- After a nightly discover: per-bank logs under `data/reports/discover/<date>/`,
+- After the nightly sync: per-bank discovery logs under `data/reports/discover/<date>/`,
   one summary line `OK n/n` or `PARTIAL k/n FAILED: <codes>` in `nas_runs.log`,
-  and a `data: NAS discover <date>` commit on GitHub when something changed.
+  and a `data: NAS sync <date>` commit on GitHub when discovery changed.
 - A `PARTIAL` status is not an emergency: failed banks are retried the next
   night. Investigate a bank only when it fails several nights in a row
   (its log under `reports/discover/<date>/<code>.log` has the traceback).

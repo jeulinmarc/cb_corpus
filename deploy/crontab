@@ -1,7 +1,5 @@
-# refresh (bis-sitemap + repec) every 12 h; nightly all-banks discover at 04:00
-# (right after the 00:00 refresh, ~4 h observed; discover also waits on the
-# lock up to DISCOVER_LOCK_TIMEOUT). Schedule = parameter: edit here (the
-# image must be rebuilt) or override the service command in Dockge to point
+# One nightly sync: shared catalogs (bis-sitemap + repec) once for all banks,
+# then the parallel native bank-site fan-out. ~4-4.5 h total. Schedule = parameter:
+# edit here (image rebuild) or override the service command in Dockge to point
 # to a crontab mounted as a volume.
-0 */12 * * * /app/deploy/run-job.sh refresh
-0 4 * * * /app/deploy/run-job.sh discover
+0 1 * * * /app/deploy/run-job.sh sync
