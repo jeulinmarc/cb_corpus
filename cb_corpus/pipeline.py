@@ -58,7 +58,8 @@ def run(bank_codes: Optional[Iterable[str]] = None,
         since: Optional[date] = None,
         dry_run: bool = True,
         config: Optional[Config] = None,
-        max_rounds: int = 1) -> dict[str, dict[str, int]]:
+        max_rounds: int = 1,
+        native_only: bool = False) -> dict[str, dict[str, int]]:
     """Crawl + (optionally) download. dry_run=True only indexes URLs.
 
     With ``max_rounds > 1`` the crawl repeats until a round downloads nothing
@@ -87,7 +88,8 @@ def run(bank_codes: Optional[Iterable[str]] = None,
             # bank doesn't re-download its back-catalogue. Only the native D1/D2
             # branch reads this hook; other types/banks are unaffected.
             adapter._skip_known_url = storage.is_known_url
-            recs = adapter.discover_all(scope=scope, since=since)
+            recs = adapter.discover_all(scope=scope, since=since,
+                                        native_only=native_only)
             counts = storage.save_many(recs, dry_run=dry_run, label=code)
             results[code] = counts
             round_saved += counts.get("saved", 0)

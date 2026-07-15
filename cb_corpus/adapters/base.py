@@ -85,8 +85,14 @@ class BankAdapter(ABC):
         return tuple(dict.fromkeys(self.native_types + extra))
 
     def discover(self, doc_type: DocType,
-                 since: Optional[date] = None) -> Iterator[DocRecord]:
+                 since: Optional[date] = None,
+                 native_only: bool = False) -> Iterator[DocRecord]:
         if doc_type == DocType.C1:
+            # C1 comes from the shared BIS index (no adapter has a native C1
+            # route today) — skipped entirely under native_only: the sync
+            # job's catalog phase owns that source.
+            if native_only:
+                return
             yield from self._bis.discover(since=since, only_banks={self.bank.code})
         elif doc_type in (DocType.D1, DocType.D2):
             # WP v3: a bank that declares D1/D2 in `native_types` discovers them
@@ -108,16 +114,19 @@ class BankAdapter(ABC):
                     recs = (r for r in recs if not skip(r.pdf_url))
                 yield from recs
             else:
+                if native_only:
+                    return
                 yield from (r for r in self._repec.discover_bank(self.bank.code)
                             if r.doc_type == doc_type)
         else:
             yield from self._discover_native(doc_type, since)
 
     def discover_all(self, scope: tuple[DocType, ...] = FULL_SCOPE,
-                     since: Optional[date] = None) -> Iterator[DocRecord]:
+                     since: Optional[date] = None,
+                     native_only: bool = False) -> Iterator[DocRecord]:
         for dt in scope:
             if dt in self.supported_types():
-                yield from self.discover(dt, since=since)
+                yield from self.discover(dt, since=since, native_only=native_only)
 
     def _discover_native(self, doc_type: DocType,
                          since: Optional[date]) -> Iterator[DocRecord]:
