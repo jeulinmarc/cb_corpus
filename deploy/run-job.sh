@@ -125,7 +125,7 @@ run_job() {
 exec 9>"$LOCK"
 case "$JOB" in
   campaign)
-    flock 9 ;;   # a campaign waits its turn (refresh in progress, etc.)
+    flock 9 ;;   # a campaign waits its turn (sync or another campaign in progress)
   *)
     if ! flock -n 9; then
       log "SKIPPED (lock busy)"

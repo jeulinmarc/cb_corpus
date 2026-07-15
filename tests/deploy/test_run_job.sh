@@ -59,11 +59,26 @@ DAY=$(date -u +%Y-%m-%d)
 [ -f "$D/reports/discover/$DAY/us.log" ] || fail "per-bank log missing"
 unset DISCOVER_BANKS DISCOVER_TYPES DISCOVER_ROUNDS
 
-# T2 — catalog failure aborts sync: no native phase, FAILED status, non-zero exit.
+# T2 — catalog failure aborts sync: no native phase, FAILED status, non-zero exit,
+# and autocommit must NOT run after a FAILED sync.
 newdir; export DISCOVER_BANKS="us" PY_FAIL_MATCH="bis-sitemap"
+export AUTOCOMMIT=1 AC_LOG="$D/ac.log"
+cat > "$D/ac.sh" <<'EOF'
+#!/bin/bash
+echo "AC:$1" >> "$AC_LOG"
+EOF
+chmod +x "$D/ac.sh"; export AUTOCOMMIT_BIN="$D/ac.sh"
 if /app/deploy/run-job.sh sync; then fail "sync must fail when a catalog phase fails"; fi
 grep -q "FAILED \[sync\]" "$D/reports/last_run_status" || fail "status != FAILED (catalog)"
 if grep -q "PYARGS:-m cb_corpus discover" "$PY_LOG"; then fail "native phase must not run after catalog failure"; fi
+if [ -f "$AC_LOG" ]; then fail "autocommit must not run after FAILED sync"; fi
+unset PY_FAIL_MATCH DISCOVER_BANKS AUTOCOMMIT_BIN AC_LOG; export AUTOCOMMIT=0
+
+# T2b — repec failure (second catalog phase) also aborts: FAILED, no native phase.
+newdir; export DISCOVER_BANKS="us" PY_FAIL_MATCH="cb_corpus repec"
+if /app/deploy/run-job.sh sync; then fail "sync must fail when repec fails"; fi
+grep -q "FAILED \[sync\]" "$D/reports/last_run_status" || fail "status != FAILED (repec)"
+if grep -q "PYARGS:-m cb_corpus discover" "$PY_LOG"; then fail "native phase must not run after repec failure"; fi
 unset PY_FAIL_MATCH DISCOVER_BANKS
 
 # T3 — lock busy: second sync skips (exit 0), python never called.
@@ -121,6 +136,7 @@ chmod +x "$D/ac.sh"; export AUTOCOMMIT_BIN="$D/ac.sh"
 export DISCOVER_BANKS="aa,bb,cc" PY_FAIL_MATCH="--banks bb"
 /app/deploy/run-job.sh sync || fail "native partial failure must exit 0"
 grep -q "\[sync\] PARTIAL 2/3 FAILED: bb" "$D/reports/nas_runs.log" || fail "PARTIAL summary missing"
+grep -q "PARTIAL 2/3 FAILED: bb \[sync\]" "$D/reports/last_run_status" || fail "PARTIAL status missing"
 grep -q "AC:sync" "$AC_LOG" || fail "autocommit not called on PARTIAL"
 unset PY_FAIL_MATCH AUTOCOMMIT_BIN DISCOVER_BANKS; export AUTOCOMMIT=0
 
@@ -128,6 +144,7 @@ unset PY_FAIL_MATCH AUTOCOMMIT_BIN DISCOVER_BANKS; export AUTOCOMMIT=0
 newdir; export DISCOVER_BANKS="aa,bb" PY_FAIL_MATCH="cb_corpus discover"
 if /app/deploy/run-job.sh sync; then fail "all-native-failed sync must exit non-zero"; fi
 grep -q "\[sync\] FAILED 0/2 banks: aa,bb" "$D/reports/nas_runs.log" || fail "all-failed summary missing"
+grep -q "FAILED \[sync\]" "$D/reports/last_run_status" || fail "status != FAILED (all banks)"
 unset PY_FAIL_MATCH DISCOVER_BANKS
 
 # T9 — parallelism bounded by DISCOVER_WORKERS (concurrency counter in stub).

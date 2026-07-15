@@ -1,5 +1,5 @@
 # One nightly sync: shared catalogs (bis-sitemap + repec) once for all banks,
-# then the parallel native bank-site fan-out. ~4 h total. Schedule = parameter:
+# then the parallel native bank-site fan-out. ~4-4.5 h total. Schedule = parameter:
 # edit here (image rebuild) or override the service command in Dockge to point
 # to a crontab mounted as a volume.
 0 1 * * * /app/deploy/run-job.sh sync

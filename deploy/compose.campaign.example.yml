@@ -1,6 +1,6 @@
 # Dockge stack "cb-campaign" — long on-demand campaign.
 # Edit `command:` (full cb_corpus sub-command) then Deploy.
-# The container waits for the lock if a refresh is running, then stops at the end.
+# The container waits for the lock if a sync is running, then stops at the end.
 services:
   cb-campaign:
     image: ghcr.io/jeulinmarc/cb_corpus:latest

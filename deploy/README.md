@@ -76,7 +76,7 @@ changed; recreate the stack after re-pulling the image.
 Dockge → stack `cb-campaign` → paste `compose.campaign.example.yml` →
 replace the placeholders and the `command:` line → drop the private key `nas_deploy_key`
 into the stack's folder under the name `deploy_key` → Deploy. The container
-waits for any running refresh to finish (lock), runs, pushes the state, stops.
+waits for any running sync or campaign to finish (lock), runs, pushes the state, stops.
 To launch another campaign: re-edit `command:` + Deploy.
 
 ## 5. Sanity checks
