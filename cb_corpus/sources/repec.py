@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -133,17 +133,16 @@ class RePEcDiscovery:
         self.max_items = max_items_per_series
         self.max_pages = max_pages
 
-    def _series_paper_urls(self, handle: str) -> list[str]:
-        """All paper-page URLs for a series, FOLLOWING IDEAS pagination.
+    def _series_paper_pages(self, handle: str) -> Iterator[list[str]]:
+        """Per-page paper-page URLs for a series, following IDEAS pagination.
 
-        IDEAS caps a series listing at ~200 items per page; older papers live on
-        numbered pages (`<handle>2.html`, `<handle>3.html`, ...). We walk pages
-        until one yields no new URLs (last page repeats / 404s) or a cap is hit,
-        so the full back-catalogue is discovered instead of only the ~200 newest.
+        IDEAS caps a series listing at ~200 items per page; older papers live
+        on numbered pages (`<handle>2.html`, ...). Pages are yielded newest
+        first; the walk ends when a page yields nothing new (last page repeats
+        / 404s) or the cap is hit.
         """
         base = f"{IDEAS}/s/{handle.replace(':', '/')}"
         seen: set[str] = set()
-        ordered: list[str] = []
         for page in range(1, self.max_pages + 1):
             url = f"{base}.html" if page == 1 else f"{base}{page}.html"
             try:
@@ -151,43 +150,81 @@ class RePEcDiscovery:
             except Exception:
                 break
             new = [u for u in parse_series_page(html) if u not in seen]
-            if not new:                       # last page repeats or empties out
+            if not new:
                 break
-            for u in new:
-                seen.add(u)
-                ordered.append(u)
+            seen.update(new)
+            yield new
+
+    def _series_paper_urls(self, handle: str) -> list[str]:
+        """All paper-page URLs for a series, FOLLOWING IDEAS pagination.
+
+        Back-compat flat-list wrapper over `_series_paper_pages` (kept for
+        existing direct callers/tests); capped at `max_items`.
+        """
+        ordered: list[str] = []
+        for page_urls in self._series_paper_pages(handle):
+            ordered.extend(page_urls)
             if len(ordered) >= self.max_items:
                 break
         return ordered[: self.max_items]
 
-    def discover_bank(self, bank_code: str) -> Iterator[DocRecord]:
+    def discover_bank(self, bank_code: str,
+                      skip_url: Optional[Callable[[str], bool]] = None,
+                      stop_on_known: bool = False) -> Iterator[DocRecord]:
+        """Yield D1/D2 records for a bank's wired series.
+
+        `skip_url(paper_page_url)` short-circuits BEFORE the per-paper fetch
+        (mirror of the BIS hook). With `stop_on_known`, a listing page whose
+        papers are ALL skipped ends that series' pagination — IDEAS lists
+        newest first, so an all-known page means the older tail is known too;
+        a page with any unknown paper keeps the walk going (mid-list backfills
+        still pull it deeper). Dates play no role here: identity stays on
+        stable keys.
+        """
         bank = get_bank(bank_code)
         for handle, doc_type in SERIES.get(bank_code, []):
-            for paper_url in self._series_paper_urls(handle):
-                try:
-                    paper_html = self.fetcher.get_text(paper_url)
-                except Exception:
-                    continue
-                cands = extract_pdf_candidates(paper_html, bank.homepage)
-                if not cands:
-                    continue
-                title, pub_date = _paper_meta(paper_html)
-                yield DocRecord(
-                    bank_code=bank_code,
-                    doc_type=doc_type,
-                    title=title,
-                    pdf_url=cands[0],
-                    alt_urls=cands[1:],          # tried by Storage if cands[0] fails
-                    source_url=paper_url,
-                    date=pub_date,
-                    provenance="repec_discovery",
-                    mime_type="application/pdf",
-                    # RePEc's Creation-Date is month-only (YYYY-MM, padded to day 1
-                    # by _iso_date) — record that honestly so the date-recovery
-                    # waterfall and repec-check can target these rows.
-                    date_precision="month",
-                    date_source="repec",
-                )
+            considered = 0
+            for page_urls in self._series_paper_pages(handle):
+                remaining = self.max_items - considered
+                if remaining <= 0:
+                    break
+                page_urls = page_urls[:remaining]
+                considered += len(page_urls)
+                unknown_on_page = 0
+                for paper_url in page_urls:
+                    if skip_url is not None and skip_url(paper_url):
+                        continue
+                    unknown_on_page += 1
+                    try:
+                        paper_html = self.fetcher.get_text(paper_url)
+                    except Exception:
+                        continue
+                    cands = extract_pdf_candidates(paper_html, bank.homepage)
+                    if not cands:
+                        continue
+                    title, pub_date = _paper_meta(paper_html)
+                    yield DocRecord(
+                        bank_code=bank_code,
+                        doc_type=doc_type,
+                        title=title,
+                        pdf_url=cands[0],
+                        alt_urls=cands[1:],          # tried by Storage if cands[0] fails
+                        source_url=paper_url,
+                        date=pub_date,
+                        provenance="repec_discovery",
+                        mime_type="application/pdf",
+                        # RePEc's Creation-Date is month-only (YYYY-MM, padded to day 1
+                        # by _iso_date) — record that honestly so the date-recovery
+                        # waterfall and repec-check can target these rows.
+                        date_precision="month",
+                        date_source="repec",
+                    )
+                if stop_on_known and unknown_on_page == 0:
+                    break
+                if considered >= self.max_items:
+                    # Cap is now fully bound -- don't re-enter the page
+                    # generator for another (wasted) listing-page fetch.
+                    break
 
 
 def _title_of(paper_html: str) -> str:

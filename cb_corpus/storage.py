@@ -154,6 +154,7 @@ class Storage:
         self._hashes: set[str] = set()
         self._ids: set[str] = set()
         self._urls: set[str] = set()
+        self._source_urls: set[str] = set()
         # Chrome profile reused across every render in THIS process (a fresh
         # per-call temp profile is ~10x slower). Keyed by PID so multiple
         # concurrent download processes don't fight over one profile lock —
@@ -183,10 +184,22 @@ class Storage:
             for alt in rec.get("alt_urls") or []:
                 if alt:
                     self._urls.add(alt)
+            src = rec.get("source_url")
+            if src:
+                self._source_urls.add(src)
 
     def is_known_url(self, url: str) -> bool:
         """True if a record with this pdf_url is already in the manifest."""
         return url in self._urls
+
+    def is_known_source_url(self, url: str) -> bool:
+        """True if a record with this source_url is already in the manifest.
+
+        Own index, deliberately separate from is_known_url(): source pages
+        (e.g. IDEAS paper pages) identify a listing entry BEFORE its PDF is
+        known — used by incremental catalog walks to skip the per-item fetch.
+        """
+        return url in self._source_urls
 
     def iter_manifest(self, bank_code: Optional[str] = None) -> Iterator[dict]:
         """All manifest rows across per-bank files, or just one bank's."""
@@ -213,6 +226,7 @@ class Storage:
         """
         n = write_per_bank(self.cfg, rows)
         self._ids.clear(); self._hashes.clear(); self._urls.clear()
+        self._source_urls.clear()
         self._load_existing()
         return n
 
@@ -238,6 +252,8 @@ class Storage:
             # placeholder pollution happened once.)
             self._ids.add(rec.doc_id)
             self._urls.add(rec.pdf_url)
+            if rec.source_url:
+                self._source_urls.add(rec.source_url)
             return "dry-run:indexed"
 
         # Try the preferred URL, then any fallback copies (EconStor/SSRN/cached)
@@ -303,6 +319,8 @@ class Storage:
         self._ids.add(rec.doc_id)
         self._hashes.add(digest)
         self._urls.add(rec.pdf_url)
+        if rec.source_url:
+            self._source_urls.add(rec.source_url)
         self._append(rec)
         return "saved"
 
@@ -339,6 +357,8 @@ class Storage:
         self._ids.add(rec.doc_id)
         self._hashes.add(digest)
         self._urls.add(rec.pdf_url)
+        if rec.source_url:
+            self._source_urls.add(rec.source_url)
         self._append(rec)
         return "reindexed"
 

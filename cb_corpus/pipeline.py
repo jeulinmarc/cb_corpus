@@ -360,13 +360,18 @@ def reindex_bis_from_disk(only_banks: Optional[set[str]] = None,
 
 def run_repec(bank_codes: Optional[Iterable[str]] = None,
               dry_run: bool = True,
-              config: Optional[Config] = None) -> dict[str, dict[str, int]]:
+              config: Optional[Config] = None,
+              incremental: bool = False) -> dict[str, dict[str, int]]:
     """Discover + (optionally) download RePEc working papers (D1/D2) for every
     SERIES-wired bank, following IDEAS pagination so the full back-catalogue is
     captured (not just the ~200 newest per series).
 
     One pass per bank, idempotent (dedup on doc_id + sha256), so re-running only
-    fills gaps. Returns {bank_code: {status: count}}.
+    fills gaps. With ``incremental=True`` (nightly mode), papers already known
+    by their IDEAS source URL are skipped BEFORE the per-paper fetch, and a
+    series' pagination stops at the first listing page that is fully known
+    (the weekly full sweep omits this to still catch backfills). Returns
+    {bank_code: {status: count}}.
     """
     from .sources.repec import RePEcDiscovery, SERIES
     cfg, fetcher, storage = _make_storage(config)
@@ -377,7 +382,11 @@ def run_repec(bank_codes: Optional[Iterable[str]] = None,
         if code not in SERIES:
             continue
         results[code] = storage.save_many(
-            rep.discover_bank(code), dry_run=dry_run, label=f"repec:{code}")
+            rep.discover_bank(
+                code,
+                skip_url=storage.is_known_source_url if incremental else None,
+                stop_on_known=incremental),
+            dry_run=dry_run, label=f"repec:{code}")
     return results
 
 

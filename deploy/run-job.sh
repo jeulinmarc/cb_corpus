@@ -4,6 +4,16 @@
 set -uo pipefail
 
 JOB="${1:-}"; shift || true
+
+SYNC_MODE="full"
+if [ "$JOB" = "sync" ]; then
+  if [ "${1:-}" = "full" ]; then
+    shift
+  elif [ -n "${SYNC_WINDOW_DAYS:-}" ]; then
+    SYNC_MODE="window"
+  fi
+fi
+
 APP_DIR="${CB_APP_DIR:-/app}"
 DATA_DIR="${CB_DATA_DIR:-/app/data}"
 LOCK="$DATA_DIR/.cb.lock"
@@ -108,8 +118,17 @@ run_sync() {
   fi
   # Phase 1+2: shared catalogs, read once for all banks (the whole point:
   # per-bank discover no longer re-walks them — see the 2026-07-15 spec).
-  python -m cb_corpus bis-sitemap --download || return $?
-  python -m cb_corpus repec --download || return $?
+  if [ "$SYNC_MODE" = "window" ]; then
+    # Bound the WALK only — identity/dedup stays on stable keys.
+    local y0 y1
+    y0=$(date -u -d "-${SYNC_WINDOW_DAYS} days" +%Y)
+    y1=$(date -u +%Y)
+    python -m cb_corpus bis-sitemap --years "${y0}-${y1}" --download || return $?
+    python -m cb_corpus repec --incremental --download || return $?
+  else
+    python -m cb_corpus bis-sitemap --download || return $?
+    python -m cb_corpus repec --download || return $?
+  fi
   log "catalogs OK"
   # Phase 3: native bank-site fan-out (unchanged mechanics from PR #3).
   run_discover
@@ -133,7 +152,15 @@ case "$JOB" in
     fi ;;
 esac
 
-log "START"
+if [ "$JOB" = "sync" ]; then
+  if [ "$SYNC_MODE" = "window" ]; then
+    log "START (window ${SYNC_WINDOW_DAYS}d)"
+  else
+    log "START (full)"
+  fi
+else
+  log "START"
+fi
 if run_job "$@"; then
   log "${JOB_SUMMARY:-OK}"
   echo "$(ts) ${JOB_SUMMARY:-OK} [$JOB]" > "$STATUS"

@@ -74,6 +74,10 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--banks", default="", help="restrict to bank codes")
     rp.add_argument("--download", action="store_true",
                     help="actually fetch PDFs (default is dry-run: index only)")
+    rp.add_argument("--incremental", action="store_true",
+                    help="skip papers already known by their IDEAS page and stop "
+                         "each series at the first fully-known listing page "
+                         "(nightly mode; the weekly full sweep omits this)")
 
     rx = sub.add_parser("reindex-from-disk",
                         help="Rebuild manifest rows for on-disk docs missing from "
@@ -169,7 +173,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "repec":
-        results = run_repec(bank_codes=banks, dry_run=not args.download)
+        results = run_repec(bank_codes=banks, dry_run=not args.download,
+                            incremental=args.incremental)
         for code, counts in results.items():
             print(f"{code}: {counts}")
         return 0

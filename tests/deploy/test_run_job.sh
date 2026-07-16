@@ -59,6 +59,34 @@ DAY=$(date -u +%Y-%m-%d)
 [ -f "$D/reports/discover/$DAY/us.log" ] || fail "per-bank log missing"
 unset DISCOVER_BANKS DISCOVER_TYPES DISCOVER_ROUNDS
 
+# T1b — bounded sync (SYNC_WINDOW_DAYS set): windowed years + incremental repec.
+newdir; export DISCOVER_BANKS="us" SYNC_WINDOW_DAYS=90
+/app/deploy/run-job.sh sync
+Y1=$(date -u +%Y)
+Y0=$(date -u -d "-90 days" +%Y)
+grep -q "PYARGS:-m cb_corpus bis-sitemap --years ${Y0}-${Y1} --download" "$PY_LOG" \
+  || fail "bounded sync must pass --years ${Y0}-${Y1}"
+grep -q "PYARGS:-m cb_corpus repec --incremental --download" "$PY_LOG" \
+  || fail "bounded sync must pass --incremental"
+grep -q "\[sync\] START (window 90d)" "$D/reports/nas_runs.log" || fail "window START marker missing"
+unset DISCOVER_BANKS SYNC_WINDOW_DAYS
+
+# T1c — 'sync full' ignores the window: unbounded catalogs.
+newdir; export DISCOVER_BANKS="us" SYNC_WINDOW_DAYS=90
+/app/deploy/run-job.sh sync full
+grep -q "PYARGS:-m cb_corpus bis-sitemap --download" "$PY_LOG" || fail "full sync must omit --years"
+if grep -q "\-\-incremental" "$PY_LOG"; then fail "full sync must omit --incremental"; fi
+grep -q "\[sync\] START (full)" "$D/reports/nas_runs.log" || fail "full START marker missing"
+unset DISCOVER_BANKS SYNC_WINDOW_DAYS
+
+# T1d — window unset: sync behaves as full.
+newdir; export DISCOVER_BANKS="us"
+/app/deploy/run-job.sh sync
+grep -q "PYARGS:-m cb_corpus bis-sitemap --download" "$PY_LOG" || fail "unset window must run full"
+if grep -q "\-\-incremental" "$PY_LOG"; then fail "unset window must omit --incremental"; fi
+grep -q "\[sync\] START (full)" "$D/reports/nas_runs.log" || fail "full START marker missing (unset window)"
+unset DISCOVER_BANKS
+
 # T2 — catalog failure aborts sync: no native phase, FAILED status, non-zero exit,
 # and autocommit must NOT run after a FAILED sync.
 newdir; export DISCOVER_BANKS="us" PY_FAIL_MATCH="bis-sitemap"
