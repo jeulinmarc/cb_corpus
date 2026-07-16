@@ -357,6 +357,8 @@ class Storage:
         self._ids.add(rec.doc_id)
         self._hashes.add(digest)
         self._urls.add(rec.pdf_url)
+        if rec.source_url:
+            self._source_urls.add(rec.source_url)
         self._append(rec)
         return "reindexed"
 

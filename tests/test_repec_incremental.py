@@ -1,8 +1,4 @@
 """RePEc incremental mode: pre-fetch skip + stop-on-known pagination."""
-from typing import Iterator
-
-import pytest
-
 from cb_corpus.sources.repec import RePEcDiscovery, IDEAS
 
 

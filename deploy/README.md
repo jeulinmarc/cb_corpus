@@ -74,7 +74,7 @@ bank is counted as failed, default 10800).
 freshness window: it caps the BIS sitemap walk to `--years <y0>-<y1>`
 (computed from `now - SYNC_WINDOW_DAYS`) and switches RePEc to
 `--incremental` (skip papers already known by their IDEAS page, stop each
-series at the first fully-known listing page — see Task 1). Unset or empty
+series at the first fully-known listing page). Unset or empty
 means every night runs the full, unbounded catalog walk (the pre-2026-07-16
 behavior). The `sync full` job argument (used by the Sunday cron line) always
 runs the unbounded walk regardless of `SYNC_WINDOW_DAYS`, so late backfills
@@ -84,9 +84,12 @@ records which mode ran.
 
 **Count-semantics change:** on a windowed (incremental) night, the RePEc
 phase logs only *new* work discovered per series, not full per-series counts
-— a low number on a bounded night is expected, not a regression. The Sunday
-full sweep is the one that re-walks everything and produces full audit counts;
-use it (not the nightly numbers) to judge whether a series is actually stalled.
+— a low number on a bounded night is expected, not a regression. Those
+per-series counts appear in the container/Dockge logs, not in
+`nas_runs.log`, which records only the run's START mode marker, `[sync]
+catalogs OK`, and the native discovery summary line. The Sunday full sweep
+is the one that re-walks everything and produces full audit counts; use it
+(not the nightly numbers) to judge whether a series is actually stalled.
 
 **Migration:** stacks created before 2026-07-15 used the refresh/discover job
 pair — the crontab and job names changed; recreate the stack after re-pulling
@@ -116,8 +119,9 @@ To launch another campaign: re-edit `command:` + Deploy.
   one summary line `OK n/n` or `PARTIAL k/n FAILED: <codes>` in `nas_runs.log`,
   and a `data: NAS sync <date>` commit on GitHub when discovery changed.
   Monday–Saturday this is a bounded sync (`[sync] START (window <n>d)`,
-  lower RePEc counts — incremental, new work only); Sunday it is the full
-  sweep (`[sync] START (full)`) with the full audit counts.
+  lower RePEc counts — incremental, new work only; counts in the container
+  logs, `nas_runs.log` keeps only the mode marker and `catalogs OK`); Sunday
+  it is the full sweep (`[sync] START (full)`) with the full audit counts.
 - A `PARTIAL` status is not an emergency: failed banks are retried the next
   night. Investigate a bank only when it fails several nights in a row
   (its log under `reports/discover/<date>/<code>.log` has the traceback).
