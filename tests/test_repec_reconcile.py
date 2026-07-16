@@ -857,3 +857,35 @@ def test_cli_csv_same_as_apply_csv_is_an_argparse_error(tmp_path, capsys):
         cli.main(["repec-reconcile", "--apply-csv", str(same_path), "--csv", str(same_path)])
     assert exc.value.code == 2
     assert "--csv" in capsys.readouterr().err
+
+
+def test_cli_csv_symlink_alias_of_apply_csv_is_an_argparse_error(tmp_path, capsys):
+    """A --csv path that is a SYMLINK pointing at the --apply-csv file must be
+    caught too (realpath resolves the symlink to the same target) -- not just
+    a byte-identical path string. Guards against clobbering the decision
+    record via an alias rather than the literal same path."""
+    import os
+
+    from cb_corpus import cli
+    import pytest
+
+    real_path = tmp_path / "real.csv"
+    real_path.write_text("bank,ideas_url,candidate_doc_id,candidate_title,score,approve\n")
+
+    link_path = tmp_path / "link.csv"
+    try:
+        link_path.symlink_to(real_path)
+    except (OSError, NotImplementedError):
+        import pytest as _pytest
+        _pytest.skip("symlinks not supported on this platform")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["repec-reconcile", "--apply-csv", str(real_path), "--csv", str(link_path)])
+    assert exc.value.code == 2
+    assert "--csv" in capsys.readouterr().err
+
+    # samefile sub-assert: the realpath check alone already catches the
+    # symlink case above, but confirm the samefile fallback used for
+    # case-insensitive-filesystem aliases agrees on the same two paths too.
+    if hasattr(os.path, "samefile"):
+        assert os.path.samefile(str(link_path), str(real_path))

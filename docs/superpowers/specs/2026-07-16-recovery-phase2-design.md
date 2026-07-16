@@ -5,13 +5,22 @@ Status: for Marc's review (phase 2 of the 2026-07-16 download-failures spec)
 
 ## Inputs (real data, verified today)
 
-- **fr 13 (and future audit entries): genuinely missing, Wayback-recoverable.**
-  Probed empirically: the IDEAS page for fr WP981 lists ONLY the 403-blocked
-  banque-france.fr URL (no EconStor/SSRN mirror → the mirror route is dead for
-  fr), but the Wayback Machine holds the PDF (200 snapshot, 2025-02-07). The
-  corpus already has the right convention (`sources/wayback.py`): download the
-  `<ts>id_/` raw snapshot (original bytes), keep `pdf_url` = the official bank
-  URL (citation + stable doc_id), `provenance="wayback"` for auditability.
+- **fr audit entries: dry-run outcome on the 15 reconstructed entries — 6
+  recoverable / 7 unrecoverable / 2 converged.** Probed empirically: the
+  IDEAS page for fr WP981 lists ONLY the 403-blocked banque-france.fr URL (no
+  EconStor/SSRN mirror → the mirror route is dead for fr), but the Wayback
+  Machine holds the PDF (200 snapshot, 2025-02-07) — one of the 6 recoverable.
+  The 7 unrecoverable ones have no snapshot under any known URL and are left
+  honestly listed rather than guessed at; the 2 converged ones were already
+  picked up by the nightly retry since the failure was logged. Note: this is
+  the dry-run classification of the 15 RECONSTRUCTED entries used to probe
+  the tooling, not the full live inventory — the NAS's live
+  `download_errors.jsonl` may recover more once `--download` is run against
+  it, since some of those entries carry `alt_urls` (original mirrors) this
+  reconstructed sample didn't exercise. The corpus already has the right
+  convention (`sources/wayback.py`): download the `<ts>id_/` raw snapshot
+  (original bytes), keep `pdf_url` = the official bank URL (citation + stable
+  doc_id), `provenance="wayback"` for auditability.
 - **gb 32: NOT missing — RePEc↔published title drift** (verified row by row in
   the PR #7 review: retitles, RePEc typos, data-entry artifacts). No stable key
   can match them; the exact-match rule correctly refuses. The corpus HAS these
@@ -48,8 +57,18 @@ New CLI command `recover-downloads [--banks a,b] [--download] [--csv path]`:
      fallback chain downloads the snapshot bytes (official URL is tried
      first and may even succeed if the bank unblocked it — fine either way);
      sha256/doc_id dedup as everywhere.
+   - `recovered` → `storage.save()` returned `saved`: the document is now on
+     disk and in the manifest.
+   - `duplicate` → `storage.save()` returned a `skip:*` status (the
+     snapshot's bytes hash-match a document already in the corpus, or the
+     doc_id was already indexed): nothing was left to recover, so the CSV
+     honestly says `duplicate` rather than `recoverable` — the latter would
+     be a lie (nothing recoverable remains) and would re-download the same
+     PDF on every subsequent run for no gain.
    - `unrecoverable` (no snapshot anywhere) → report line; this is the
      honest residue, never guessed at.
+   - `converged` → the corpus already has the document (step 2); never
+     touches the network.
 6. Dry-run default (`--download` mirrors the discover convention): without
    it, only the CSV is written — nothing downloaded, nothing saved.
 7. Politeness: web.archive.org goes through the standard per-host throttle;
@@ -75,7 +94,14 @@ never fuzzy-match automatically. The human becomes the key, explicitly:
   pairs, re-enforcing every phase-1 invariant at apply time (target row
   still exists, `source_url` still empty, one stamp per doc_id per run, one
   stamp per ideas_url; violations → reported, skipped). Idempotent; goes
-  through `rewrite_manifest`; CSV report of applied/skipped.
+  through `rewrite_manifest`; CSV report of applied/skipped. Skip reasons
+  (`skip_reason` column, first-match wins): `not-approved`, `bad-ideas-url`
+  (the CSV is untrusted human input — an `ideas_url` that doesn't look like
+  an IDEAS paper page, including an empty string, is rejected before any
+  manifest lookup so a re-apply can't stamp `source_url=""` forever),
+  `row-gone`, `bad-doc-type` (target row isn't D1/D2 — a hand-typed
+  `candidate_doc_id` could otherwise point outside scope), `source-not-empty`,
+  `duplicate-doc-id`, `duplicate-ideas-url`.
 - Auditability: applied stamps are indistinguishable in the manifest from
   phase-1 stamps (same field, same semantics); the approved CSV is the human
   decision record — Marc keeps it (e.g. under `data/reports/`, gitignored,
@@ -108,9 +134,11 @@ already-converged, per bank, in one CSV. No separate tooling.
 
 1. Merge; image rebuild; Update (pull) cb-refresh.
 2. `recover-downloads --banks fr` dry-run (campaign) → CSV → Marc reads →
-   `--download` run → expect the 13 fr papers saved with
-   `provenance="wayback"` (probe already confirmed ≥1 snapshot exists;
-   unrecoverable ones stay honestly listed).
+   `--download` run → expect ~6 papers saved with `provenance="wayback"`
+   (probe already confirmed ≥1 snapshot exists) + an honest unrecoverable
+   list (7, in the reconstructed sample) for what Wayback genuinely doesn't
+   hold — the live inventory may do better, since it carries `alt_urls` the
+   reconstructed probe sample didn't.
 3. `repec-reconcile --propose --banks gb` → Marc approves pairs in the CSV →
    `--apply-csv ... --write` → Sunday gb errors → ~0.
 4. After next Sunday: full-inventory dry-run = class-C classification of

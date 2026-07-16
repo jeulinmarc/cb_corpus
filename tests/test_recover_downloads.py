@@ -282,14 +282,15 @@ def test_csv_columns_shape(tmp_path):
     assert header == ["bank", "pdf_url", "action", "snapshot_ts", "title"]
 
 
-def test_counts_dict_has_all_four_action_keys(tmp_path):
+def test_counts_dict_has_all_five_action_keys(tmp_path):
     from cb_corpus.recover import run_recover_downloads
 
     cfg = Config(data_dir=tmp_path)
     _write_inventory(cfg, [_entry()])
     results = run_recover_downloads(config=cfg, fetcher=_StubFetcher(),
                                     csv_path=str(tmp_path / "r.csv"))
-    assert set(results["fr"]) == {"recoverable", "recovered", "unrecoverable", "converged"}
+    assert set(results["fr"]) == {"recoverable", "recovered", "duplicate",
+                                  "unrecoverable", "converged"}
 
 
 # --- metadata refresh from the IDEAS source page --------------------------
@@ -435,3 +436,46 @@ def test_download_missing_doc_type_code_is_skipped_gracefully(tmp_path):
                                     fetcher=fetcher, csv_path=str(tmp_path / "r.csv"))
     assert results["fr"]["recoverable"] == 1
     assert results["fr"]["recovered"] == 0
+
+
+def test_download_skip_status_is_reported_as_duplicate_not_recoverable(tmp_path):
+    """`storage.save()` can come back `skip:duplicate-content` when the
+    snapshot's bytes hash-match a document already in the corpus (a real,
+    pre-seeded manifest row here) -- nothing is left to recover. Leaving the
+    CSV action as 'recoverable' would be a lie (there is nothing recoverable
+    left) and would make the entry re-download the full PDF every run just
+    to rediscover the same duplicate. The honest action is 'duplicate',
+    counted separately from 'recovered'."""
+    from cb_corpus.recover import run_recover_downloads
+    from cb_corpus.models import DocRecord
+    from cb_corpus.taxonomy import DocType
+
+    cfg = Config(data_dir=tmp_path)
+    dup_bytes = b"%PDF-1.4 duplicate-body"
+
+    # Pre-seed the corpus with the document under its OWN (still-live) URL.
+    seed_storage = Storage(cfg, _StubFetcher(
+        bytes_ok={"existing.pdf": (dup_bytes, "application/pdf")}))
+    seed_rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Existing copy",
+                        pdf_url="https://www.banque-france.fr/existing.pdf",
+                        date=date(2020, 1, 1), mime_type="application/pdf")
+    assert seed_storage.save(seed_rec) == "saved"
+
+    # A DIFFERENT (dead) URL for the exact same content -- not converged by
+    # URL or source_url, but its Wayback snapshot's bytes hash-match the doc
+    # already saved above (official host still 403s; snapshot succeeds).
+    pdf_url = "https://www.banque-france.fr/dt-alias.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=pdf_url, title="Alias copy")])
+    fetcher = _StubFetcher(
+        cdx_hits={"dt-alias.pdf": "20240101000000"},
+        bytes_fail={"www.banque-france.fr"},
+        bytes_ok={"web.archive.org/web/20240101000000id_": (dup_bytes, "application/pdf")},
+    )
+    results = run_recover_downloads(bank_codes=["fr"], download=True, config=cfg,
+                                    fetcher=fetcher, csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["duplicate"] == 1
+    assert results["fr"]["recovered"] == 0
+    rows = list(iter_manifest_rows(cfg, "fr"))
+    assert len(rows) == 1   # only the seeded row -- nothing new appended
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "duplicate"

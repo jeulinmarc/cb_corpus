@@ -20,7 +20,12 @@ alternate URL); dry-run reports it, ``--download`` saves it with
 fallback ``Storage.save`` tries.
 
 No fuzzy matching anywhere: an entry with no snapshot under any known URL is
-reported ``unrecoverable`` and left alone, honestly.
+reported ``unrecoverable`` and left alone, honestly. When ``--download``
+finds a snapshot but ``Storage.save`` reports ``skip:*`` (the bytes
+hash-match a doc already in the corpus, or the doc_id was already indexed),
+the entry is reported ``duplicate`` -- there is nothing left to recover,
+so it is never relabelled ``recoverable`` (which would just re-download the
+same duplicate PDF every run).
 """
 from __future__ import annotations
 
@@ -39,7 +44,7 @@ from .sources.wayback import latest_capture, raw_url
 from .storage import Storage
 from .taxonomy import by_code
 
-_ACTIONS = ("recoverable", "recovered", "unrecoverable", "converged")
+_ACTIONS = ("recoverable", "recovered", "duplicate", "unrecoverable", "converged")
 _CSV_FIELDS = ("bank", "pdf_url", "action", "snapshot_ts", "title")
 
 
@@ -140,13 +145,19 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     """Drive the full recover-downloads pass. Dry-run by default: only the CSV
     is written, nothing is downloaded or saved (``--download`` opt-in mirrors
     the rest of the corpus's discovery commands). Returns
-    ``{bank_code: {"recoverable": n, "recovered": n, "unrecoverable": n,
-    "converged": n}}`` -- ``recovered`` only counts entries actually saved in
-    ``--download`` mode. A CSV report (``{bank, pdf_url, action, snapshot_ts,
-    title}``) is written in both modes so a dry-run's classification is never
-    lost, and a CSV line never claims an action that didn't happen (a failed
-    ``--download`` save stays ``recoverable``, not ``recovered``; its failure
-    lands in ``download_errors.jsonl`` like any other, via the audit path).
+    ``{bank_code: {"recoverable": n, "recovered": n, "duplicate": n,
+    "unrecoverable": n, "converged": n}}`` -- ``recovered`` only counts
+    entries actually saved in ``--download`` mode; ``duplicate`` counts
+    entries whose ``storage.save()`` came back ``skip:*`` (the snapshot's
+    bytes hash-match a doc already in the corpus, or the doc_id was already
+    indexed) -- nothing left to recover, so the CSV action is honestly
+    ``duplicate``, not ``recoverable`` (which would keep re-downloading the
+    full PDF every run for no gain). A CSV report (``{bank, pdf_url, action,
+    snapshot_ts, title}``) is written in both modes so a dry-run's
+    classification is never lost, and a CSV line never claims an action that
+    didn't happen (a failed ``--download`` save stays ``recoverable``, not
+    ``recovered``; its failure lands in ``download_errors.jsonl`` like any
+    other, via the audit path).
     """
     cfg = config or Config()
     fetcher = fetcher or Fetcher(cfg)
@@ -212,6 +223,15 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                 if status == "saved":
                     summary["recovered"] += 1
                     action = "recovered"
+                elif status.startswith("skip:"):
+                    # Bytes hash-matched an existing doc (skip:duplicate-content)
+                    # or the doc_id was already indexed (skip:already-indexed):
+                    # either way there is nothing left to recover here. Reporting
+                    # this as "recoverable" would be a lie (nothing recoverable
+                    # remains) and would keep re-downloading the full PDF every
+                    # run just to discover the same duplicate again.
+                    summary["duplicate"] += 1
+                    action = "duplicate"
 
         csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": action,
                          "snapshot_ts": ts, "title": title})

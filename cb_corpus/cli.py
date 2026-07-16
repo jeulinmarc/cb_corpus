@@ -281,10 +281,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.apply_csv and banks:
             rr.error("--banks has no effect with --apply-csv (the bank comes "
                      "from each CSV row) -- drop --banks")
-        if args.apply_csv and args.csv and \
-           os.path.abspath(args.csv) == os.path.abspath(args.apply_csv):
-            rr.error("--csv must not be the same path as --apply-csv (would "
-                     "overwrite the decision record you are reading)")
+        if args.apply_csv and args.csv:
+            same = os.path.realpath(args.csv) == os.path.realpath(args.apply_csv)
+            if not same and os.path.exists(args.csv):
+                # realpath resolves symlinks but not case-only aliases (e.g. a
+                # case-insensitive APFS volume) -- samefile is stat-based
+                # (dev/inode) and catches those too. Both targets must exist
+                # for samefile; --apply-csv is always an existing file here.
+                try:
+                    same = os.path.samefile(args.csv, args.apply_csv)
+                except OSError:
+                    pass
+            if same:
+                rr.error("--csv must not be the same path as --apply-csv (would "
+                         "overwrite the decision record you are reading)")
         if args.propose:
             from .repec_check import run_reconcile_propose
             run_reconcile_propose(bank_codes=banks, csv_path=args.csv or None)
