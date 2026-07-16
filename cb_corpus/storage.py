@@ -243,13 +243,6 @@ class Storage:
     def save(self, rec: DocRecord, *, dry_run: bool = False) -> str:
         if rec.doc_id in self._ids:
             return "skip:already-indexed"
-        if rec.source_url and rec.source_url in self._source_urls:
-            # The document behind this source page is already in the corpus
-            # (possibly under a different pdf_url => different doc_id). Source
-            # pages are stable identity keys, same family as pdf_url/sha256 —
-            # this is what stops re-listed variants (e.g. a dead RePEc URL for
-            # a natively-crawled paper) from triggering download attempts.
-            return "skip:known-source"
         if dry_run:
             # In-memory only: dedup within this pass for accurate counts, but
             # NEVER write to the manifest. A persisted dry-run row (local_path
