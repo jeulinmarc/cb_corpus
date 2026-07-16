@@ -44,9 +44,14 @@ esac
 
 # ---- discover: parallel per-bank fan-out ------------------------------------
 # One bank = one process = one host: the 0.5s per-host politeness throttle is
-# untouched, and manifest/raw writes are per-bank hence disjoint between
-# processes. data/discovery_errors.jsonl is shared across banks: O_APPEND
-# line-sized writes, accepted limitation.
+# untouched, and manifest/raw writes normally target one bank per process.
+# They are NOT fully disjoint though: any Storage init's torn-manifest loader
+# may repair another bank's torn tail (a leftover from a killed prior run), so
+# it can touch any bank file, not just the one this process is discovering.
+# Storage._append() and the repair path both take an exclusive fcntl flock on
+# the target manifest file, so a same-host append/repair race is safe.
+# data/discovery_errors.jsonl is shared across banks: O_APPEND line-sized
+# writes, accepted limitation.
 
 resolve_banks() {
   if [ "$DISCOVER_BANKS" = "all" ]; then

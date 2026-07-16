@@ -19,6 +19,7 @@ content sha256.
 from __future__ import annotations
 
 import atexit
+import fcntl
 import hashlib
 import json
 import os
@@ -56,32 +57,73 @@ def _manifest_files(cfg: Config, bank_code: Optional[str] = None) -> list[Path]:
     return [cfg.manifest_path] if cfg.manifest_path.exists() else []
 
 
-def _repair_torn_tail(f: Path, offset: int, torn_line: bytes) -> None:
-    """A malformed FINAL line = a torn append (SIGKILL/ENOSPC mid-write): save
-    the raw fragment to `<file>.torn` for forensics, then atomically truncate
-    the manifest back to the last complete line (`offset` = byte start of the
-    torn line — everything before it is intact). Truncating a *tail* needs no
-    temp-file rewrite; the intact prefix is untouched on disk.
+def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
+    """A malformed FINAL line, as seen by the caller's UNLOCKED first read, is
+    presumed to be a torn append (SIGKILL/ENOSPC mid-write). But `_append()`
+    (another process, same or different bank writer) or a concurrent repair
+    could have completed or extended that very tail since that unlocked read
+    — so before touching the file we take an exclusive flock and RE-READ the
+    tail (from `offset` to current EOF) under the lock:
 
-    Order matters: the fragment is written FIRST, so a crash between the two
-    steps never loses data — worst case the next run re-detects the same torn
-    tail (torn_path.write_bytes is idempotent/overwriting)."""
-    torn_path = f.with_name(f.name + ".torn")
-    torn_path.write_bytes(torn_line)
-    os.truncate(f, offset)
-    print(f"[storage] WARNING: torn manifest tail repaired: {f} "
-          f"truncated at byte offset {offset} (fragment saved to {torn_path})",
-          file=sys.stderr, flush=True)
+      - if every line in the freshly re-read tail now parses as valid JSON,
+        the earlier "torn" observation was just a race with an in-flight
+        writer, not real corruption -> no truncation, the now-complete row(s)
+        are returned so the caller doesn't lose them.
+      - if a line in the re-read tail is still malformed, THAT is the real
+        torn append: save the raw fragment to `<file>.torn` for forensics,
+        then atomically truncate the manifest back to the last complete line.
+        Truncating a *tail* needs no temp-file rewrite; the intact prefix is
+        untouched on disk. Any complete rows preceding the still-torn line
+        within the re-read tail are returned too.
+
+    Order matters for the repair itself: the fragment is written FIRST, so a
+    crash between the two steps never loses data — worst case the next run
+    re-detects the same torn tail (torn_path.write_bytes is idempotent/
+    overwriting). Holding the lock for the whole re-read+repair also blocks a
+    concurrent `_append()` (which takes the same flock) from writing into the
+    file while we decide/truncate.
+    """
+    rows: list[dict] = []
+    with f.open("r+b") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.seek(offset)
+        tail = fh.read()
+        local_offset = offset
+        for ln in tail.splitlines(keepends=True):
+            stripped = ln.strip()
+            if not stripped:
+                local_offset += len(ln)
+                continue
+            try:
+                rows.append(json.loads(stripped))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                torn_path = f.with_name(f.name + ".torn")
+                torn_path.write_bytes(ln)
+                fh.truncate(local_offset)
+                print(f"[storage] WARNING: torn manifest tail repaired: {f} "
+                      f"truncated at byte offset {local_offset} "
+                      f"(fragment saved to {torn_path})",
+                      file=sys.stderr, flush=True)
+                return rows
+            local_offset += len(ln)
+    return rows
 
 
 def _iter_manifest_file(f: Path) -> Iterator[dict]:
     """Yield rows from one manifest file.
 
     A malformed FINAL (non-blank) line is treated as a torn append and
-    repaired in place (see `_repair_torn_tail`) — the row is dropped, loading
-    continues. A malformed line that is NOT final is real corruption: raises
+    repaired in place (see `_repair_torn_tail`) — under a lock it is re-read
+    and either truly repaired (row dropped) or found to have been completed
+    by a concurrent writer in the meantime (row kept), loading continues
+    either way. A malformed line that is NOT final is real corruption: raises
     ValueError naming the file and 1-based line number (hard stop). Blank
     lines are skipped. An intact file is only ever read, never rewritten.
+
+    "Malformed" covers both a structurally broken JSON line
+    (`json.JSONDecodeError`) and a line torn mid multi-byte UTF-8 character
+    (`UnicodeDecodeError` — `json.loads` decodes `bytes` internally before
+    parsing); both are torn-append symptoms and are handled identically.
     """
     raw = f.read_bytes()
     if not raw:
@@ -103,9 +145,9 @@ def _iter_manifest_file(f: Path) -> Iterator[dict]:
             continue
         try:
             rows.append(json.loads(stripped))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             if i == last_content_idx:
-                _repair_torn_tail(f, offset, ln)
+                rows.extend(_repair_torn_tail(f, offset))
                 break
             raise ValueError(
                 f"corrupt manifest line (not the final line -> not a torn "
@@ -263,7 +305,13 @@ class Storage:
     def _append(self, rec: DocRecord) -> None:
         path = self.cfg.manifest_file(rec.bank_code)
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive same-host flock: mutual exclusion with (a) another
+        # process's _append() on this same bank file, and (b) the torn-tail
+        # repair path (_repair_torn_tail), which takes the same lock before
+        # deciding whether to truncate this file. Released implicitly when
+        # `fh` closes.
         with path.open("a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
             fh.write(json.dumps(rec.to_row(), ensure_ascii=False) + "\n")
 
     def rewrite_manifest(self, rows: Iterable[dict]) -> int:
