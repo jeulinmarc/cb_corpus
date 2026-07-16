@@ -169,3 +169,26 @@ def test_run_repec_incremental_wiring(monkeypatch, tmp_path):
                 config=Config(data_dir=tmp_path), incremental=True)
     assert captured["stop_on_known"] is True
     assert callable(captured["skip_url"])
+
+
+def test_run_repec_full_mode_also_passes_skip_url(monkeypatch, tmp_path):
+    """Full sweeps (incremental=False) still pass skip_url=storage.is_known_source_url
+    -- collision-free by construction since the RePEc source_url IS the per-record
+    identity page -- but stop_on_known stays False (full pagination preserved)."""
+    import cb_corpus.pipeline as P
+    captured = {}
+
+    class _FakeRep:
+        def __init__(self, fetcher): pass
+        def discover_bank(self, code, skip_url=None, stop_on_known=False):
+            captured["skip_url"] = skip_url
+            captured["stop_on_known"] = stop_on_known
+            return iter(())
+
+    monkeypatch.setattr("cb_corpus.sources.repec.RePEcDiscovery", _FakeRep)
+    from cb_corpus.config import Config
+    (tmp_path / "manifest").mkdir(parents=True)
+    P.run_repec(bank_codes=["se"], dry_run=True,
+                config=Config(data_dir=tmp_path), incremental=False)
+    assert captured["stop_on_known"] is False
+    assert callable(captured["skip_url"])

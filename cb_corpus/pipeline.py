@@ -367,10 +367,12 @@ def run_repec(bank_codes: Optional[Iterable[str]] = None,
     captured (not just the ~200 newest per series).
 
     One pass per bank, idempotent (dedup on doc_id + sha256), so re-running only
-    fills gaps. With ``incremental=True`` (nightly mode), papers already known
-    by their IDEAS source URL are skipped BEFORE the per-paper fetch, and a
-    series' pagination stops at the first listing page that is fully known
-    (the weekly full sweep omits this to still catch backfills). Returns
+    fills gaps. Papers already known by their IDEAS source URL are skipped
+    BEFORE the per-paper fetch in BOTH modes (collision-free by construction:
+    the tested URL IS the record's own source_url). With ``incremental=True``
+    (nightly mode), a series' pagination additionally stops at the first
+    listing page that is fully known (the weekly full sweep omits this to
+    still catch backfills, keeping full pagination for completeness). Returns
     {bank_code: {status: count}}.
     """
     from .sources.repec import RePEcDiscovery, SERIES
@@ -384,7 +386,13 @@ def run_repec(bank_codes: Optional[Iterable[str]] = None,
         results[code] = storage.save_many(
             rep.discover_bank(
                 code,
-                skip_url=storage.is_known_source_url if incremental else None,
+                # Always skip by source_url: in RePEc the tested URL IS the
+                # record's own source_url (one paper page, one record), so
+                # this pre-fetch skip is collision-free by construction, in
+                # both modes. stop_on_known stays incremental-only: full
+                # sweeps keep full pagination for completeness, they just
+                # stop re-fetching pages of papers already owned.
+                skip_url=storage.is_known_source_url,
                 stop_on_known=incremental),
             dry_run=dry_run, label=f"repec:{code}")
     return results
