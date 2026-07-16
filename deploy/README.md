@@ -59,17 +59,41 @@ The `deploy_key` file must be **readable** by the PUID user:
 autocommit copies the key as 0600 into a private temp directory (0700, removed at the end of the run), so a 0644 key works;
 a root:0600 key will fail with a clear message in `nas_runs.log`.
 
-Schedule: one sync nightly at 01:00 (Paris). Each sync catalogs once for all
-banks (bis-sitemap, repec), then proceeds to parallel native bank-site
-discovery. Scope for the native phase is controlled by env vars (Dockge, no
-rebuild needed): `DISCOVER_BANKS` (`all` or comma list — required, the job
-refuses to run without it), `DISCOVER_TYPES` (`full` = whole A–F scope, or
-comma list), `DISCOVER_ROUNDS` (1 = incremental), `DISCOVER_WORKERS` (parallel
-banks, default 6 — the single knob bounding CPU/RAM/bandwidth),
+Schedule: bounded sync nightly at 01:00 (Paris) Monday–Saturday, unbounded
+full sync at 01:00 Sunday. Each sync catalogs once for all banks (bis-sitemap,
+repec), then proceeds to parallel native bank-site discovery. Scope for the
+native phase is controlled by env vars (Dockge, no rebuild needed):
+`DISCOVER_BANKS` (`all` or comma list — required, the job refuses to run
+without it), `DISCOVER_TYPES` (`full` = whole A–F scope, or comma list),
+`DISCOVER_ROUNDS` (1 = incremental), `DISCOVER_WORKERS` (parallel banks,
+default 6 — the single knob bounding CPU/RAM/bandwidth),
 `DISCOVER_BANK_TIMEOUT` (seconds per bank before the crawl is killed and the
-bank is counted as failed, default 10800). **Migration:** stacks created before
-2026-07-15 used the refresh/discover job pair — the crontab and job names
-changed; recreate the stack after re-pulling the image.
+bank is counted as failed, default 10800).
+
+`SYNC_WINDOW_DAYS` (e.g. `"90"`) bounds the nightly catalog phase to a
+freshness window: it caps the BIS sitemap walk to `--years <y0>-<y1>`
+(computed from `now - SYNC_WINDOW_DAYS`) and switches RePEc to
+`--incremental` (skip papers already known by their IDEAS page, stop each
+series at the first fully-known listing page — see Task 1). Unset or empty
+means every night runs the full, unbounded catalog walk (the pre-2026-07-16
+behavior). The `sync full` job argument (used by the Sunday cron line) always
+runs the unbounded walk regardless of `SYNC_WINDOW_DAYS`, so late backfills
+and corrections on either catalog are never permanently missed. Log line
+`[sync] START (window <n>d)` vs `[sync] START (full)` in `nas_runs.log`
+records which mode ran.
+
+**Count-semantics change:** on a windowed (incremental) night, the RePEc
+phase logs only *new* work discovered per series, not full per-series counts
+— a low number on a bounded night is expected, not a regression. The Sunday
+full sweep is the one that re-walks everything and produces full audit counts;
+use it (not the nightly numbers) to judge whether a series is actually stalled.
+
+**Migration:** stacks created before 2026-07-15 used the refresh/discover job
+pair — the crontab and job names changed; recreate the stack after re-pulling
+the image. Stacks created before 2026-07-16 ran a single unbounded sync every
+night — after re-pulling the image, add `SYNC_WINDOW_DAYS` to the compose
+environment (or leave it unset to keep the old full-nightly behavior; the
+crontab image update still switches Sunday to `sync full`).
 
 ## 4. `cb-campaign` stack (on demand)
 
@@ -91,6 +115,9 @@ To launch another campaign: re-edit `command:` + Deploy.
 - After the nightly sync: per-bank discovery logs under `data/reports/discover/<date>/`,
   one summary line `OK n/n` or `PARTIAL k/n FAILED: <codes>` in `nas_runs.log`,
   and a `data: NAS sync <date>` commit on GitHub when discovery changed.
+  Monday–Saturday this is a bounded sync (`[sync] START (window <n>d)`,
+  lower RePEc counts — incremental, new work only); Sunday it is the full
+  sweep (`[sync] START (full)`) with the full audit counts.
 - A `PARTIAL` status is not an emergency: failed banks are retried the next
   night. Investigate a bank only when it fails several nights in a row
   (its log under `reports/discover/<date>/<code>.log` has the traceback).
