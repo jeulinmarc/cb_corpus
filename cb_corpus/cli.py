@@ -141,6 +141,13 @@ def main(argv: list[str] | None = None) -> int:
     rc.add_argument("--banks", default="", help="restrict to wired banks (default: all)")
     rc.add_argument("--csv", default="", help="CSV output path (default data/reports/repec_check.csv)")
 
+    rr = sub.add_parser("repec-reconcile",
+                        help="Stamp IDEAS source_urls onto uniquely-matched manifest "
+                             "rows (dry-run by default; --write applies).")
+    rr.add_argument("--banks", default="")
+    rr.add_argument("--write", action="store_true")
+    rr.add_argument("--csv", default="", help="CSV output path (default data/reports/repec_reconcile.csv)")
+
     args = p.parse_args(argv)
     banks = _banks(getattr(args, "banks", ""))
 
@@ -229,6 +236,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "repec-check":
         from .repec_check import run_repec_check
         run_repec_check(bank_codes=banks, csv_path=args.csv or None)
+        return 0
+
+    if args.cmd == "repec-reconcile":
+        from .repec_check import run_repec_reconcile
+        run_repec_reconcile(bank_codes=banks, write=args.write, csv_path=args.csv or None)
         return 0
     return 1
 
