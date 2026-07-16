@@ -201,8 +201,13 @@ def run_repec_reconcile(bank_codes: Optional[Iterable[str]] = None,
     one candidate row was found (across both passes) AND that row's
     source_url is empty. Zero candidates -> ``unmatched``. More than one ->
     ``ambiguous``. One candidate with a source_url already set -> ``already``.
-    Ambiguous/unmatched/already rows are reported (CSV + stdout), never
-    written. Default is dry-run (``write=False``); writes go through
+    A doc_id already claimed by an earlier listing entry IN THIS RUN (reverse
+    ambiguity: two distinct listing entries each uniquely resolve to the same
+    row) -> the first entry stamps, every later one is ``ambiguous`` too — a
+    doc_id can be stamped by at most one entry per run, so ``stamped`` counts,
+    the CSV, and rows actually rewritten always agree. Ambiguous/unmatched/
+    already rows are reported (CSV + stdout), never written. Default is
+    dry-run (``write=False``); writes go through
     ``storage.rewrite_manifest`` with the bank's FULL row set (never a
     filtered subset — see its docstring), touching ONLY ``source_url`` on the
     stamped doc_ids. Idempotent: once a row is stamped its IDEAS URL is a
@@ -313,6 +318,20 @@ def run_repec_reconcile(bank_codes: Optional[Iterable[str]] = None,
                         counts["already"] += 1
                         csv_rows.append({"bank": bank, "ideas_url": ideas_url,
                                          "action": "already", "doc_id": row["doc_id"],
+                                         "title": csv_title})
+                    elif row["doc_id"] in stamps:
+                        # Reverse ambiguity: a DIFFERENT listing entry already
+                        # claimed this doc_id earlier in this run (e.g. two
+                        # listing pids sharing one normalized title, each
+                        # otherwise uniquely resolving to the same row). A
+                        # doc_id can be stamped by at most one entry, or the
+                        # dict write below is last-wins and the CSV would
+                        # assert two writes for one actual write. The first
+                        # entry keeps its stamp; this later one is reported
+                        # (not written) so stamped == len(stamps) always.
+                        counts["ambiguous"] += 1
+                        csv_rows.append({"bank": bank, "ideas_url": ideas_url,
+                                         "action": "ambiguous", "doc_id": "",
                                          "title": csv_title})
                     else:
                         counts["stamped"] += 1

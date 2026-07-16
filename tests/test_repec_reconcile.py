@@ -257,3 +257,41 @@ def test_second_pass_pdf_candidate_url_match_stamps(tmp_path):
     assert results["gb"] == {"stamped": 1, "ambiguous": 0, "already": 0, "unmatched": 0}
     rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
     assert rows["i1"]["source_url"] == _paper_url("0007")
+
+
+# -- Case 8: reverse ambiguity — two listing entries, one manifest row ------
+
+def test_two_listing_entries_matching_one_row_only_first_stamps(tmp_path):
+    """Two DIFFERENT listing pids, sharing a normalized title, each uniquely
+    resolve (via title) to the SAME single manifest row. Without a claimed-
+    doc_id guard, both entries see an empty source_url (the write only
+    happens after the whole listing is walked) and both classify as
+    ``stamp``, so counts/CSV assert two writes for a doc_id that can only be
+    written once (dict last-wins). The reverse-ambiguity rule: the FIRST
+    entry stamps, the SECOND is reported ``ambiguous`` (not written)."""
+    cfg = _cfg(tmp_path)
+    row = _row("j1", "Reverse Ambiguity Paper",
+               "https://www.bankofengland.co.uk/-/media/boe/files/wp/2002/reverse.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    pages = {f"{BASE}.html": _series_html([
+        ("0008", "Reverse Ambiguity Paper"),
+        ("0009", "Reverse Ambiguity Paper"),
+    ])}
+    fetcher = FakeFetcher(pages)
+    csv_path = str(tmp_path / "out.csv")
+    results = run_repec_reconcile(bank_codes=["gb"], write=True,
+                                  csv_path=csv_path, config=cfg, fetcher=fetcher)
+
+    assert results["gb"] == {"stamped": 1, "ambiguous": 1, "already": 0, "unmatched": 0}
+
+    csv_rows = _read_csv(csv_path)
+    stamp_rows = [r for r in csv_rows if r["action"] == "stamp"]
+    ambiguous_rows = [r for r in csv_rows if r["action"] == "ambiguous"]
+    assert len(stamp_rows) == 1
+    assert len(ambiguous_rows) == 1
+    assert stamp_rows[0]["ideas_url"] == _paper_url("0008")
+    assert ambiguous_rows[0]["ideas_url"] == _paper_url("0009")
+
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["j1"]["source_url"] == _paper_url("0008")   # FIRST entry wins
