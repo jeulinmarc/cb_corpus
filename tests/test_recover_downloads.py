@@ -386,6 +386,42 @@ def test_download_saves_via_snapshot_fallback_when_official_url_blocked(tmp_path
     assert csv_rows[0]["action"] == "recovered"
 
 
+def test_download_all_candidates_fail_stays_recoverable_and_reaudits(tmp_path):
+    """A snapshot exists (CDX hit -> recoverable) but BOTH the official URL and
+    the archive.org snapshot bytes fail -- e.g. the snapshot itself is a dead
+    capture. `save()` raises; the failure must be re-audited into
+    download_errors.jsonl (label "recover-downloads") and the entry must
+    NEVER be counted/recorded as recovered -- the CSV row stays
+    'recoverable', not 'recovered'."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    pdf_url = "https://www.banque-france.fr/wp1003.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=pdf_url, title="WP 1003")])
+    fetcher = _StubFetcher(
+        cdx_hits={"wp1003.pdf": "20240601000000"},
+        bytes_fail={"www.banque-france.fr"},    # official host still 403s
+        # no bytes_ok entry at all (dropped from the fallback test's setup) --
+        # the archive.org snapshot has no configured success either, so it
+        # falls through to the stub's generic 404 -- no candidate URL can
+        # ever succeed.
+    )
+    results = run_recover_downloads(bank_codes=["fr"], download=True, config=cfg,
+                                    fetcher=fetcher, csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recoverable"] == 1
+    assert results["fr"]["recovered"] == 0
+    rows = list(iter_manifest_rows(cfg, "fr"))
+    assert rows == []   # nothing saved to the manifest
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "recoverable"   # never 'recovered'
+
+    errors_path = cfg.data_dir / "download_errors.jsonl"
+    error_lines = [json.loads(l) for l in errors_path.read_text().splitlines() if l.strip()]
+    reaudited = [e for e in error_lines if e.get("label") == "recover-downloads"]
+    assert len(reaudited) == 1
+    assert reaudited[0]["pdf_url"] == pdf_url
+
+
 def test_download_missing_doc_type_code_is_skipped_gracefully(tmp_path):
     """An audit entry with an unrecognised doc_type must not crash the run --
     it stays 'recoverable' (not 'recovered'), never breaking the whole pass."""
