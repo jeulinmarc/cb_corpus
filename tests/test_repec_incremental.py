@@ -169,3 +169,79 @@ def test_run_repec_incremental_wiring(monkeypatch, tmp_path):
                 config=Config(data_dir=tmp_path), incremental=True)
     assert captured["stop_on_known"] is True
     assert callable(captured["skip_url"])
+
+
+def test_discover_bank_prints_skipped_known_counter(monkeypatch, capsys):
+    """discover_bank must report, at bank end, how many listed paper pages
+    were skipped as already-known -- the only visibility channel for
+    revision-blindness (spec 2026-07-16 amendment). Spy on stderr via capsys
+    against a known/unknown mix."""
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    ids = ["0001", "0002", "0003"]
+    pages = {f"{BASE}.html": _series_html(ids)}
+    pages.update({_paper_url(p): _paper_html(p) for p in ids})
+    d = _mk(pages)
+    known = {_paper_url("0001"), _paper_url("0002")}   # 2 known, 1 unknown
+    list(d.discover_bank("se", skip_url=lambda u: u in known))
+    err = capsys.readouterr().err
+    assert "[repec:se] skipped-known: 2" in err
+
+
+def test_discover_bank_skipped_known_counter_zero_when_no_skip(monkeypatch, capsys):
+    """No skip_url -> no known papers -> counter must still print, at 0
+    (not omitted), so the absence of the line is never mistaken for the
+    counter not having run."""
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    pages = {f"{BASE}.html": _series_html(["0001"]),
+             _paper_url("0001"): _paper_html("0001")}
+    d = _mk(pages)
+    list(d.discover_bank("se"))
+    err = capsys.readouterr().err
+    assert "[repec:se] skipped-known: 0" in err
+
+
+def test_discover_bank_counter_prints_on_early_close(monkeypatch, capsys):
+    """The counter line must print via `finally`, so it still fires when the
+    consumer stops iterating early (generator `.close()`) instead of running
+    the walk to natural exhaustion -- e.g. a caller that only wants the first
+    record, or an early abort."""
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    ids = ["0001", "0002", "0003"]
+    pages = {f"{BASE}.html": _series_html(ids)}
+    pages.update({_paper_url(p): _paper_html(p) for p in ids})
+    d = _mk(pages)
+    known = {_paper_url("0002")}   # one known, rest unknown
+    gen = d.discover_bank("se", skip_url=lambda u: u in known)
+    next(gen)          # consume only the first yielded record
+    gen.close()         # early close -- generator never reaches exhaustion
+    err = capsys.readouterr().err
+    assert "[repec:se] skipped-known:" in err
+
+
+def test_run_repec_full_mode_also_passes_skip_url(monkeypatch, tmp_path):
+    """Full sweeps (incremental=False) still pass skip_url=storage.is_known_source_url
+    -- collision-free by construction since the RePEc source_url IS the per-record
+    identity page -- but stop_on_known stays False (full pagination preserved)."""
+    import cb_corpus.pipeline as P
+    captured = {}
+
+    class _FakeRep:
+        def __init__(self, fetcher): pass
+        def discover_bank(self, code, skip_url=None, stop_on_known=False):
+            captured["skip_url"] = skip_url
+            captured["stop_on_known"] = stop_on_known
+            return iter(())
+
+    monkeypatch.setattr("cb_corpus.sources.repec.RePEcDiscovery", _FakeRep)
+    from cb_corpus.config import Config
+    (tmp_path / "manifest").mkdir(parents=True)
+    P.run_repec(bank_codes=["se"], dry_run=True,
+                config=Config(data_dir=tmp_path), incremental=False)
+    assert captured["stop_on_known"] is False
+    assert callable(captured["skip_url"])

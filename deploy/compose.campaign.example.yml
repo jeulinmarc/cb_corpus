@@ -6,6 +6,8 @@ services:
     image: ghcr.io/jeulinmarc/cb_corpus:latest
     restart: "no"
     user: "PUID:PGID"
+    stop_grace_period: 60s     # SIGTERM grace before SIGKILL — a mid-write kill
+                                # can torn-tail a manifest line (see storage.py repair)
     environment:
       TZ: Europe/Paris
       AUTOCOMMIT: "1"

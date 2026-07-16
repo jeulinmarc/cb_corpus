@@ -68,4 +68,28 @@ git clone -q "$WORK/origin.git" "$CHECK4/c"
 N3=$(git -C "$CHECK4/c" rev-list --count HEAD)
 [ "$N_BASELINE" = "$N3" ] || fail "commit created on empty manifest"
 
+# Adversarial: torn manifest line in the COPY -> autocommit REFUSED, nothing
+# pushed (audit H1: a SIGKILL/ENOSPC-torn manifest must never reach the repo).
+D5=$(mktemp -d)
+mkdir -p "$D5/manifest"
+echo '{"doc_id":"d"}' > "$D5/manifest/us.jsonl"
+printf '{"doc_id": "torn' > "$D5/manifest/fr.jsonl"   # malformed, no trailing newline
+export CB_DATA_DIR="$D5"
+BASELINE5=$(mktemp -d)
+git clone -q "$WORK/origin.git" "$BASELINE5/c"
+N_BASELINE5=$(git -C "$BASELINE5/c" rev-list --count HEAD)
+
+set +e
+OUT=$(/app/deploy/autocommit.sh refresh 2>&1)
+RC=$?
+set -e
+[ "$RC" -ne 0 ] || fail "torn manifest must make autocommit exit non-zero"
+echo "$OUT" | grep -q "autocommit: REFUSED (malformed manifest" || fail "REFUSED message missing"
+echo "$OUT" | grep -q "fr.jsonl" || fail "REFUSED message must name the malformed file"
+
+CHECK5=$(mktemp -d)
+git clone -q "$WORK/origin.git" "$CHECK5/c"
+N5=$(git -C "$CHECK5/c" rev-list --count HEAD)
+[ "$N_BASELINE5" = "$N5" ] || fail "torn manifest must not be pushed"
+
 echo "AUTOCOMMIT_OK"

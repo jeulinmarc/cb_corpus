@@ -7,6 +7,7 @@ STUB=$(mktemp -d)
 cat > "$STUB/python" <<'EOF'
 #!/bin/bash
 echo "PYARGS:$*" >> "$PY_LOG"
+echo "PYSTUB:$*"
 if [ "$*" = "-m cb_corpus list-banks" ]; then
   printf 'aa   Bank Aa                              aa.example\n'
   printf 'bb   Bank Bb                              bb.example  (verify domain)\n'
@@ -52,11 +53,17 @@ BIS_LINE=$(grep -n "bis-sitemap" "$PY_LOG" | cut -d: -f1 | head -1)
 REPEC_LINE=$(grep -n "cb_corpus repec" "$PY_LOG" | cut -d: -f1 | head -1)
 DISC_LINE=$(grep -n "cb_corpus discover" "$PY_LOG" | cut -d: -f1 | head -1)
 [ "$BIS_LINE" -lt "$REPEC_LINE" ] && [ "$REPEC_LINE" -lt "$DISC_LINE" ] || fail "sync phases out of order"
+grep -q "\[sync\] bis-sitemap OK" "$D/reports/nas_runs.log" || fail "bis-sitemap OK heartbeat not logged"
 grep -q "\[sync\] catalogs OK" "$D/reports/nas_runs.log" || fail "catalogs OK not logged"
 grep -q "\[sync\] OK 2/2" "$D/reports/nas_runs.log" || fail "native summary missing"
 grep -q "OK 2/2 \[sync\]" "$D/reports/last_run_status" || fail "status summary missing"
-DAY=$(date -u +%Y-%m-%d)
+DAY=$(date +%Y-%m-%d)
 [ -f "$D/reports/discover/$DAY/us.log" ] || fail "per-bank log missing"
+[ -f "$D/reports/discover/$DAY/catalogs.log" ] || fail "catalogs.log missing"
+grep -q "PYSTUB:-m cb_corpus bis-sitemap --download" "$D/reports/discover/$DAY/catalogs.log" \
+  || fail "catalogs.log missing bis-sitemap stub output"
+grep -q "PYSTUB:-m cb_corpus repec --download" "$D/reports/discover/$DAY/catalogs.log" \
+  || fail "catalogs.log missing repec stub output"
 unset DISCOVER_BANKS DISCOVER_TYPES DISCOVER_ROUNDS
 
 # T1b — bounded sync (SYNC_WINDOW_DAYS set): windowed years + incremental repec.
@@ -116,6 +123,7 @@ HOLDER=$!
 sleep 0.5
 /app/deploy/run-job.sh sync || fail "lock-busy sync must exit 0"
 grep -q "\[sync\] SKIPPED (lock busy)" "$D/reports/nas_runs.log" || fail "SKIPPED not logged"
+grep -q "SKIPPED \[sync\]" "$D/reports/last_run_status" || fail "SKIPPED status missing"
 if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python should not have run"; fi
 wait "$HOLDER"; unset DISCOVER_BANKS
 
@@ -130,6 +138,7 @@ END=$(date +%s)
 [ $((END - START)) -ge 1 ] || fail "campaign did not wait for the lock"
 grep -q "PYARGS:-m cb_corpus discover --banks fr --native-only --download" "$PY_LOG" \
   || fail "incorrect campaign args"
+grep -q "\[campaign\] WAITING (lock busy)" "$D/reports/nas_runs.log" || fail "WAITING not logged"
 wait "$HOLDER"
 
 # T5 — DISCOVER_BANKS unset: sync refused before any python call.
@@ -211,5 +220,58 @@ if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python must not run 
 export CB_ALLOW_EMPTY_DATA=1
 /app/deploy/run-job.sh sync || fail "CB_ALLOW_EMPTY_DATA=1 must allow it"
 unset CB_ALLOW_EMPTY_DATA DISCOVER_BANKS
+
+# T13 — DISCOVER_BANKS is whitespace-trimmed before splitting on commas.
+# The trailing ",  " (comma + spaces, no bank code) is the discriminating
+# bit: xargs's own word-splitting already hides plain boundary spaces
+# around real codes, but a whitespace-only segment between/after commas
+# survives sed's "/^$/d" (it isn't zero-length) unless tr -d strips it
+# first — untrimmed, it inflates the bank total (2/3, not 2/2) even though
+# no third discover call is ever made.
+newdir; export DISCOVER_BANKS=" us , ecb ,  "
+/app/deploy/run-job.sh sync
+grep -q "PYARGS:-m cb_corpus discover --banks us --rounds 1 --native-only --download" "$PY_LOG" \
+  || fail "trimmed 'us' bank not resolved"
+grep -q "PYARGS:-m cb_corpus discover --banks ecb --rounds 1 --native-only --download" "$PY_LOG" \
+  || fail "trimmed 'ecb' bank not resolved"
+grep -q "\[sync\] OK 2/2" "$D/reports/nas_runs.log" \
+  || fail "trimmed DISCOVER_BANKS must yield exactly 2 banks (whitespace-only segment must not inflate the total)"
+unset DISCOVER_BANKS
+
+# T14 — malformed SYNC_WINDOW_DAYS fails fast: before the lock, no python calls.
+newdir; export DISCOVER_BANKS="us" SYNC_WINDOW_DAYS=90x
+if /app/deploy/run-job.sh sync; then fail "malformed SYNC_WINDOW_DAYS should have failed"; fi
+grep -q "FAILED (invalid SYNC_WINDOW_DAYS)" "$D/reports/nas_runs.log" || fail "invalid-window FAILED not logged"
+grep -q "FAILED \[sync\]" "$D/reports/last_run_status" || fail "invalid-window status != FAILED"
+if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python must not run with malformed SYNC_WINDOW_DAYS"; fi
+unset DISCOVER_BANKS SYNC_WINDOW_DAYS
+
+# T15 — autocommit failure: the AUTOCOMMIT_BIN stub exits 1, but that must
+# NOT downgrade the job — sync still exits 0, "AUTOCOMMIT FAILED (local state
+# intact" is logged, and last_run_status keeps the OK verdict (the audit-flagged
+# `|| log "AUTOCOMMIT FAILED..."` branch was never exercised).
+newdir; export AUTOCOMMIT=1 DISCOVER_BANKS="us"
+cat > "$D/ac_fail.sh" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+chmod +x "$D/ac_fail.sh"; export AUTOCOMMIT_BIN="$D/ac_fail.sh"
+/app/deploy/run-job.sh sync || fail "autocommit failure must not fail sync (exit 0 expected)"
+grep -q "AUTOCOMMIT FAILED (local state intact" "$D/reports/nas_runs.log" \
+  || fail "autocommit failure branch not logged"
+grep -q "OK 1/1 \[sync\]" "$D/reports/last_run_status" \
+  || fail "status must keep the OK verdict despite autocommit failure"
+unset AUTOCOMMIT_BIN DISCOVER_BANKS; export AUTOCOMMIT=0
+
+# T16 — campaign non-zero rc propagates: the wrapper's exit code must equal
+# python's rc, and last_run_status must log FAILED [campaign] rc=<n>.
+newdir; export PY_EXIT=1
+set +e
+/app/deploy/run-job.sh campaign discover --banks fr --native-only --download
+RC=$?
+set -e
+[ "$RC" -eq 1 ] || fail "campaign exit code must equal python's rc (got $RC)"
+grep -q "FAILED \[campaign\] rc=1" "$D/reports/last_run_status" || fail "FAILED [campaign] status missing"
+unset PY_EXIT
 
 echo "RUN_JOB_OK"

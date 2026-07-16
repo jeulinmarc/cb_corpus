@@ -6,6 +6,8 @@ services:
     image: ghcr.io/jeulinmarc/cb_corpus:latest
     restart: unless-stopped
     user: "PUID:PGID"          # UID:GID of the dataset owner (discover-ids stack)
+    stop_grace_period: 60s     # SIGTERM grace before SIGKILL — a mid-write kill
+                                # can torn-tail a manifest line (see storage.py repair)
     environment:
       TZ: Europe/Paris
       DISCOVER_BANKS: all      # "all" or a comma list of bank codes (us,ecb,fr)

@@ -14,6 +14,7 @@ IDEAS and extended toward all 63 banks; the crawler accepts any handle.
 from __future__ import annotations
 
 import re
+import sys
 from datetime import date
 from typing import Callable, Iterator, Optional
 from urllib.parse import urljoin
@@ -180,51 +181,71 @@ class RePEcDiscovery:
         a page with any unknown paper keeps the walk going (mid-list backfills
         still pull it deeper). Dates play no role here: identity stays on
         stable keys.
+
+        `skip_url` is blind to revisions: a paper page whose PDF changed since
+        it was first saved is skipped just like any other known URL (same-URL
+        revisions were already invisible before this method existed;
+        changed-URL revisions become invisible too now that pagination skips
+        known source pages). The only visibility this method offers is a
+        count: every skip is tallied and printed once, at the end of the
+        bank's walk, as `[repec:<bank_code>] skipped-known: N` on stderr —
+        the same channel periodic repec-check audits, so a bank whose skip
+        count balloons unexpectedly is discoverable, not silent.
+
+        The counter line prints via `finally`, so it fires even if the
+        consumer stops iterating early (e.g. closes the generator after the
+        first record) rather than only on a full, natural exhaustion.
         """
         bank = get_bank(bank_code)
-        for handle, doc_type in SERIES.get(bank_code, []):
-            considered = 0
-            for page_urls in self._series_paper_pages(handle):
-                remaining = self.max_items - considered
-                if remaining <= 0:
-                    break
-                page_urls = page_urls[:remaining]
-                considered += len(page_urls)
-                unknown_on_page = 0
-                for paper_url in page_urls:
-                    if skip_url is not None and skip_url(paper_url):
-                        continue
-                    unknown_on_page += 1
-                    try:
-                        paper_html = self.fetcher.get_text(paper_url)
-                    except Exception:
-                        continue
-                    cands = extract_pdf_candidates(paper_html, bank.homepage)
-                    if not cands:
-                        continue
-                    title, pub_date = _paper_meta(paper_html)
-                    yield DocRecord(
-                        bank_code=bank_code,
-                        doc_type=doc_type,
-                        title=title,
-                        pdf_url=cands[0],
-                        alt_urls=cands[1:],          # tried by Storage if cands[0] fails
-                        source_url=paper_url,
-                        date=pub_date,
-                        provenance="repec_discovery",
-                        mime_type="application/pdf",
-                        # RePEc's Creation-Date is month-only (YYYY-MM, padded to day 1
-                        # by _iso_date) — record that honestly so the date-recovery
-                        # waterfall and repec-check can target these rows.
-                        date_precision="month",
-                        date_source="repec",
-                    )
-                if stop_on_known and unknown_on_page == 0:
-                    break
-                if considered >= self.max_items:
-                    # Cap is now fully bound -- don't re-enter the page
-                    # generator for another (wasted) listing-page fetch.
-                    break
+        skipped = 0
+        try:
+            for handle, doc_type in SERIES.get(bank_code, []):
+                considered = 0
+                for page_urls in self._series_paper_pages(handle):
+                    remaining = self.max_items - considered
+                    if remaining <= 0:
+                        break
+                    page_urls = page_urls[:remaining]
+                    considered += len(page_urls)
+                    unknown_on_page = 0
+                    for paper_url in page_urls:
+                        if skip_url is not None and skip_url(paper_url):
+                            skipped += 1
+                            continue
+                        unknown_on_page += 1
+                        try:
+                            paper_html = self.fetcher.get_text(paper_url)
+                        except Exception:
+                            continue
+                        cands = extract_pdf_candidates(paper_html, bank.homepage)
+                        if not cands:
+                            continue
+                        title, pub_date = _paper_meta(paper_html)
+                        yield DocRecord(
+                            bank_code=bank_code,
+                            doc_type=doc_type,
+                            title=title,
+                            pdf_url=cands[0],
+                            alt_urls=cands[1:],          # tried by Storage if cands[0] fails
+                            source_url=paper_url,
+                            date=pub_date,
+                            provenance="repec_discovery",
+                            mime_type="application/pdf",
+                            # RePEc's Creation-Date is month-only (YYYY-MM, padded to day 1
+                            # by _iso_date) — record that honestly so the date-recovery
+                            # waterfall and repec-check can target these rows.
+                            date_precision="month",
+                            date_source="repec",
+                        )
+                    if stop_on_known and unknown_on_page == 0:
+                        break
+                    if considered >= self.max_items:
+                        # Cap is now fully bound -- don't re-enter the page
+                        # generator for another (wasted) listing-page fetch.
+                        break
+        finally:
+            print(f"[repec:{bank_code}] skipped-known: {skipped}",
+                  file=sys.stderr, flush=True)
 
 
 def _title_of(paper_html: str) -> str:
