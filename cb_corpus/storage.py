@@ -362,6 +362,26 @@ class Storage:
         self._append(rec)
         return "reindexed"
 
+    def _record_download_error(self, rec: DocRecord, exc: Exception, label: str) -> None:
+        """Append one line to data/download_errors.jsonl (durable audit of every
+        failed download — stdout scrolls away, this file doesn't). Append-only,
+        O_APPEND line writes; never read by the crawler itself."""
+        import datetime as _dt
+        entry = {
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+            "label": label,
+            "bank_code": rec.bank_code,
+            "doc_type": rec.doc_type.code,
+            "title": rec.title,
+            "pdf_url": rec.pdf_url,
+            "alt_urls": rec.alt_urls or [],
+            "source_url": rec.source_url,
+            "error": f"{type(exc).__name__}: {exc}".replace("\n", " ")[:500],
+        }
+        path = self.cfg.data_dir / "download_errors.jsonl"
+        with path.open("a") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     def save_many(self, recs: Iterable[DocRecord], *, dry_run: bool = False,
                   progress_every: int = 100, label: str = "") -> dict[str, int]:
         import sys
@@ -370,8 +390,13 @@ class Storage:
         for rec in recs:
             try:
                 status = self.save(rec, dry_run=dry_run).split(":")[0]
-            except Exception:
+            except Exception as exc:
                 status = "error"
+                if not dry_run:
+                    try:
+                        self._record_download_error(rec, exc, label)
+                    except Exception:
+                        pass  # auditing must never break the crawl
             counts[status] = counts.get(status, 0) + 1
             total += 1
             if progress_every and total % progress_every == 0:
