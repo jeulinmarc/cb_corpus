@@ -52,6 +52,28 @@ if [ -f "$DATA_DIR/wp_dates_index.jsonl" ]; then
   cp "$DATA_DIR/wp_dates_index.jsonl" "$TMP/repo/data/"
 fi
 
+# Refuse to push a torn/corrupt manifest (audit H1): validate every COPIED
+# manifest/*.jsonl with the container's python before staging anything. A
+# SIGKILL/ENOSPC mid-write can leave a malformed final line on the volume;
+# cb_corpus.storage repairs that in-place on the NEXT local run, but until it
+# does, this push must not ship the corrupt file to the public repo.
+shopt -s nullglob
+copied_manifests=("$TMP/repo/data/manifest"/*.jsonl)
+shopt -u nullglob
+for mf in "${copied_manifests[@]}"; do
+  if ! python -c '
+import json, sys
+with open(sys.argv[1], "rb") as fh:
+    for line in fh:
+        s = line.strip()
+        if s:
+            json.loads(s)
+' "$mf" >/dev/null 2>&1; then
+    echo "autocommit: REFUSED (malformed manifest: $mf)" >&2
+    exit 1
+  fi
+done
+
 cd "$TMP/repo"
 git add data/manifest
 [ -f data/wp_dates_index.jsonl ] && git add data/wp_dates_index.jsonl

@@ -56,16 +56,71 @@ def _manifest_files(cfg: Config, bank_code: Optional[str] = None) -> list[Path]:
     return [cfg.manifest_path] if cfg.manifest_path.exists() else []
 
 
+def _repair_torn_tail(f: Path, offset: int, torn_line: bytes) -> None:
+    """A malformed FINAL line = a torn append (SIGKILL/ENOSPC mid-write): save
+    the raw fragment to `<file>.torn` for forensics, then atomically truncate
+    the manifest back to the last complete line (`offset` = byte start of the
+    torn line — everything before it is intact). Truncating a *tail* needs no
+    temp-file rewrite; the intact prefix is untouched on disk.
+
+    Order matters: the fragment is written FIRST, so a crash between the two
+    steps never loses data — worst case the next run re-detects the same torn
+    tail (torn_path.write_bytes is idempotent/overwriting)."""
+    torn_path = f.with_name(f.name + ".torn")
+    torn_path.write_bytes(torn_line)
+    os.truncate(f, offset)
+    print(f"[storage] WARNING: torn manifest tail repaired: {f} "
+          f"truncated at byte offset {offset} (fragment saved to {torn_path})",
+          file=sys.stderr, flush=True)
+
+
+def _iter_manifest_file(f: Path) -> Iterator[dict]:
+    """Yield rows from one manifest file.
+
+    A malformed FINAL (non-blank) line is treated as a torn append and
+    repaired in place (see `_repair_torn_tail`) — the row is dropped, loading
+    continues. A malformed line that is NOT final is real corruption: raises
+    ValueError naming the file and 1-based line number (hard stop). Blank
+    lines are skipped. An intact file is only ever read, never rewritten.
+    """
+    raw = f.read_bytes()
+    if not raw:
+        return
+    lines = raw.splitlines(keepends=True)
+    last_content_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip():
+            last_content_idx = i
+    if last_content_idx is None:
+        return  # blank/whitespace-only file -> zero rows, nothing to repair
+
+    rows: list[dict] = []
+    offset = 0
+    for i, ln in enumerate(lines):
+        stripped = ln.strip()
+        if not stripped:
+            offset += len(ln)
+            continue
+        try:
+            rows.append(json.loads(stripped))
+        except json.JSONDecodeError as exc:
+            if i == last_content_idx:
+                _repair_torn_tail(f, offset, ln)
+                break
+            raise ValueError(
+                f"corrupt manifest line (not the final line -> not a torn "
+                f"append, hard stop): {f}:{i + 1}: {exc}"
+            ) from exc
+        offset += len(ln)
+    yield from rows
+
+
 def iter_manifest_rows(cfg: Config, bank_code: Optional[str] = None) -> Iterator[dict]:
     """Yield manifest rows across per-bank files (or one bank)."""
     for f in _manifest_files(cfg, bank_code):
         if not f.exists():
             continue
-        with f.open() as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    yield json.loads(line)
+        yield from _iter_manifest_file(f)
 
 
 def migrate_legacy_layout(cfg: Config) -> int:
