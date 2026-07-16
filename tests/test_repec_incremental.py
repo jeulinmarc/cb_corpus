@@ -171,6 +171,39 @@ def test_run_repec_incremental_wiring(monkeypatch, tmp_path):
     assert callable(captured["skip_url"])
 
 
+def test_discover_bank_prints_skipped_known_counter(monkeypatch, capsys):
+    """discover_bank must report, at bank end, how many listed paper pages
+    were skipped as already-known -- the only visibility channel for
+    revision-blindness (spec 2026-07-16 amendment). Spy on stderr via capsys
+    against a known/unknown mix."""
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    ids = ["0001", "0002", "0003"]
+    pages = {f"{BASE}.html": _series_html(ids)}
+    pages.update({_paper_url(p): _paper_html(p) for p in ids})
+    d = _mk(pages)
+    known = {_paper_url("0001"), _paper_url("0002")}   # 2 known, 1 unknown
+    list(d.discover_bank("se", skip_url=lambda u: u in known))
+    err = capsys.readouterr().err
+    assert "[repec:se] skipped-known: 2" in err
+
+
+def test_discover_bank_skipped_known_counter_zero_when_no_skip(monkeypatch, capsys):
+    """No skip_url -> no known papers -> counter must still print, at 0
+    (not omitted), so the absence of the line is never mistaken for the
+    counter not having run."""
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    pages = {f"{BASE}.html": _series_html(["0001"]),
+             _paper_url("0001"): _paper_html("0001")}
+    d = _mk(pages)
+    list(d.discover_bank("se"))
+    err = capsys.readouterr().err
+    assert "[repec:se] skipped-known: 0" in err
+
+
 def test_run_repec_full_mode_also_passes_skip_url(monkeypatch, tmp_path):
     """Full sweeps (incremental=False) still pass skip_url=storage.is_known_source_url
     -- collision-free by construction since the RePEc source_url IS the per-record

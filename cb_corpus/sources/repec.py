@@ -14,6 +14,7 @@ IDEAS and extended toward all 63 banks; the crawler accepts any handle.
 from __future__ import annotations
 
 import re
+import sys
 from datetime import date
 from typing import Callable, Iterator, Optional
 from urllib.parse import urljoin
@@ -180,8 +181,19 @@ class RePEcDiscovery:
         a page with any unknown paper keeps the walk going (mid-list backfills
         still pull it deeper). Dates play no role here: identity stays on
         stable keys.
+
+        `skip_url` is blind to revisions: a paper page whose PDF changed since
+        it was first saved is skipped just like any other known URL (same-URL
+        revisions were already invisible before this method existed;
+        changed-URL revisions become invisible too now that pagination skips
+        known source pages). The only visibility this method offers is a
+        count: every skip is tallied and printed once, at the end of the
+        bank's walk, as `[repec:<bank_code>] skipped-known: N` on stderr —
+        the same channel periodic repec-check audits, so a bank whose skip
+        count balloons unexpectedly is discoverable, not silent.
         """
         bank = get_bank(bank_code)
+        skipped = 0
         for handle, doc_type in SERIES.get(bank_code, []):
             considered = 0
             for page_urls in self._series_paper_pages(handle):
@@ -193,6 +205,7 @@ class RePEcDiscovery:
                 unknown_on_page = 0
                 for paper_url in page_urls:
                     if skip_url is not None and skip_url(paper_url):
+                        skipped += 1
                         continue
                     unknown_on_page += 1
                     try:
@@ -225,6 +238,8 @@ class RePEcDiscovery:
                     # Cap is now fully bound -- don't re-enter the page
                     # generator for another (wasted) listing-page fetch.
                     break
+        print(f"[repec:{bank_code}] skipped-known: {skipped}",
+              file=sys.stderr, flush=True)
 
 
 def _title_of(paper_html: str) -> str:

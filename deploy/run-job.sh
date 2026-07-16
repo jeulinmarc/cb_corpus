@@ -68,8 +68,12 @@ resolve_banks() {
   if [ "$DISCOVER_BANKS" = "all" ]; then
     # list-banks output ends with a blank line and an "N banks" footer
     # (cb_corpus/cli.py); real bank codes are 2-4 lowercase letters, so
-    # filter on that shape to keep the footer out of the bank list.
-    python -m cb_corpus list-banks | awk 'NF && $1 ~ /^[a-z]{2,4}$/ {print $1}'
+    # filter on that shape to keep the footer out of the bank list. The
+    # {2,4} POSIX interval is mawk-version-dependent (older mawk builds
+    # treat it literally instead of as a repeat count), so this is spelled
+    # out letter-by-letter instead -- identical accept/reject sets, no
+    # dependency on interval support.
+    python -m cb_corpus list-banks | awk 'NF && $1 ~ /^[a-z][a-z][a-z]?[a-z]?$/ {print $1}'
   else
     echo "$DISCOVER_BANKS" | tr -d '[:space:]' | tr ',' '\n' | sed '/^$/d'
   fi

@@ -184,3 +184,8 @@ manifest is refused, a *valid-but-stale* one is not detected as such.
 
 Push to master → CI rebuilds `ghcr.io/.../cb_corpus:latest` → in Dockge:
 re-pull the image and redeploy the stacks.
+
+After a long gap since the last rebuild, review `deploy/Dockerfile`'s base
+image tag before rebuilding — an unpinned/floating tag can jump several
+upstream versions between rebuilds, and that drift is easier to catch and
+pin deliberately than to debug after the fact.

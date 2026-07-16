@@ -14,17 +14,20 @@ python -m cb_corpus list-banks | grep -q "ecb" || { echo "FAIL: list-banks"; exi
 bash -n /app/deploy/entrypoint.sh || { echo "FAIL: entrypoint syntax"; exit 1; }
 
 # Registry-vs-filter: run-job.sh's resolve_banks() (DISCOVER_BANKS=all) filters
-# `list-banks` output with `awk 'NF && $1 ~ /^[a-z]{2,4}$/'` to drop the blank
-# line + "N banks" footer. Against the LIVE 63-bank registry (not a hand-rolled
-# mirror fixture) that filter must drop EXACTLY the footer, nothing else — i.e.
-# it must count the same banks as a simple "line starts with a lowercase
-# letter" grep. A regression here (e.g. a bank code that doesn't match
-# [a-z]{2,4}, or a footer that slips through) would silently shrink or inflate
-# the "all banks" sync fan-out.
-AWK_COUNT=$(python -m cb_corpus list-banks | awk 'NF && $1 ~ /^[a-z]{2,4}$/' | wc -l | tr -d ' ')
+# `list-banks` output with an awk program to drop the blank line + "N banks"
+# footer. Against the LIVE 63-bank registry (not a hand-rolled mirror
+# fixture) that filter must drop EXACTLY the footer, nothing else — i.e. it
+# must count the same banks as a simple "line starts with a lowercase
+# letter" grep. The awk program is EXTRACTED from the real run-job.sh (not
+# retyped here) so an edit to the production filter is what this assertion
+# actually exercises -- a hand-retyped copy would keep passing even if
+# resolve_banks() drifted, since it would just be comparing itself to itself.
+FILTER=$(grep -oE "awk '[^']+'" /app/deploy/run-job.sh | head -1)
+[ -n "$FILTER" ] || { echo "FAIL: could not extract awk filter from run-job.sh resolve_banks()"; exit 1; }
+AWK_COUNT=$(python -m cb_corpus list-banks | eval "$FILTER" | wc -l | tr -d ' ')
 GREP_COUNT=$(python -m cb_corpus list-banks | grep -c '^[a-z]' || true)
-[ -n "$AWK_COUNT" ] && [ "$AWK_COUNT" -gt 0 ] || { echo "FAIL: registry-vs-filter awk count empty/zero"; exit 1; }
+[ -n "$AWK_COUNT" ] && [ "$AWK_COUNT" -gt 0 ] || { echo "FAIL: registry-vs-filter awk count empty/zero (filter: $FILTER)"; exit 1; }
 [ "$AWK_COUNT" = "$GREP_COUNT" ] \
-  || { echo "FAIL: registry-vs-filter mismatch (awk=$AWK_COUNT grep=$GREP_COUNT)"; exit 1; }
+  || { echo "FAIL: registry-vs-filter mismatch (awk=$AWK_COUNT grep=$GREP_COUNT, filter: $FILTER)"; exit 1; }
 
 echo "IMAGE_OK"

@@ -86,9 +86,17 @@ Replacement, applied where the 1:1 identity holds BY CONSTRUCTION:
   with zero coverage change).
 - `Storage.save()` is NOT touched; `is_known_source_url` keeps its own index
   and its discovery-level role.
-- Known non-goal (pre-existing behavior, unchanged): a revised PDF behind an
-  already-known paper page is not re-fetched; corrections are a separate
-  concern.
+- Revision-blindness, corrected premise: same-URL revisions (the paper page's
+  URL is unchanged but its PDF was updated) were ALREADY invisible before this
+  change — `is_known_url`/save-level dedup never re-fetched those. What this
+  change ADDS is that CHANGED-URL revisions (a new paper-page URL for a
+  revised paper) also become invisible, because `skip_url` now short-circuits
+  BEFORE the per-paper fetch on the listing walk itself. Accepted by Marc
+  2026-07-16: the mitigation is visibility, not prevention — `discover_bank`
+  counts every skip and prints `[repec:<code>] skipped-known: N` per bank
+  (§Phase 1, RePEc walk), so an unexpected jump is discoverable from the job
+  logs; periodic `repec-check` remains the safety net for anything the
+  counter alone wouldn't catch.
 
 ### 3. One-shot reconciliation `repec-reconcile` (class A, the data half)
 
