@@ -1,0 +1,140 @@
+"""RePEc incremental mode: pre-fetch skip + stop-on-known pagination."""
+from typing import Iterator
+
+import pytest
+
+from cb_corpus.sources.repec import RePEcDiscovery, IDEAS
+
+
+SERIES_HANDLE = "hhs:rbnkwp"
+BASE = f"{IDEAS}/s/hhs/rbnkwp"
+
+
+def _series_html(paper_ids):
+    links = "".join(f'<li><a href="/p/hhs/rbnkwp/{p}.html">P{p}</a></li>'
+                    for p in paper_ids)
+    return f"<html><body><ul>{links}</ul></body></html>"
+
+
+def _paper_html(pid):
+    return (f'<html><head><title>Paper {pid}</title></head><body>'
+            f'<h1>Paper {pid}</h1>'
+            f'<a href="https://bank.test/wp/{pid}.pdf">Full text</a>'
+            f'</body></html>')
+
+
+class FakeFetcher:
+    """Serves canned series/paper pages and records every URL fetched."""
+    def __init__(self, pages):
+        # pages: {url: html}; anything else raises (like a 404)
+        self.pages = pages
+        self.fetched = []
+
+    def get_text(self, url):
+        self.fetched.append(url)
+        if url not in self.pages:
+            raise RuntimeError(f"404 {url}")
+        return self.pages[url]
+
+
+def _mk(pages):
+    d = RePEcDiscovery.__new__(RePEcDiscovery)
+    d.fetcher = FakeFetcher(pages)
+    d.max_pages = 80
+    return d
+
+
+def _paper_url(pid):
+    return f"{IDEAS}/p/hhs/rbnkwp/{pid}.html"
+
+
+def test_skip_url_prevents_paper_page_fetch(monkeypatch):
+    from cb_corpus.sources import repec as R
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, __import__("cb_corpus.taxonomy", fromlist=["DocType"]).DocType.D1)])
+    pages = {f"{BASE}.html": _series_html(["0001", "0002"]),
+             _paper_url("0002"): _paper_html("0002")}
+    d = _mk(pages)
+    known = {_paper_url("0001")}
+    recs = list(d.discover_bank("se", skip_url=lambda u: u in known))
+    assert [r.source_url for r in recs] == [_paper_url("0002")]
+    assert _paper_url("0001") not in d.fetcher.fetched   # never fetched
+
+
+def test_stop_on_known_stops_after_all_known_page(monkeypatch):
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    pages = {f"{BASE}.html": _series_html(["0010", "0011"]),
+             f"{BASE}2.html": _series_html(["0001", "0002"])}
+    d = _mk(pages)
+    known = {_paper_url(p) for p in ("0010", "0011", "0001", "0002")}
+    list(d.discover_bank("se", skip_url=lambda u: u in known, stop_on_known=True))
+    # page 1 is fully known -> pagination must stop; page 2 never requested
+    assert f"{BASE}2.html" not in d.fetcher.fetched
+
+
+def test_page_with_one_unknown_keeps_paginating(monkeypatch):
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    pages = {f"{BASE}.html": _series_html(["0010", "0011"]),
+             f"{BASE}2.html": _series_html(["0001"]),
+             _paper_url("0011"): _paper_html("0011"),
+             _paper_url("0001"): _paper_html("0001")}
+    d = _mk(pages)
+    known = {_paper_url("0010")}
+    recs = list(d.discover_bank("se", skip_url=lambda u: u in known, stop_on_known=True))
+    assert f"{BASE}2.html" in d.fetcher.fetched          # kept going
+    assert {r.source_url for r in recs} == {_paper_url("0011"), _paper_url("0001")}
+
+
+def test_default_behavior_unchanged(monkeypatch):
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    pages = {f"{BASE}.html": _series_html(["0001"]),
+             _paper_url("0001"): _paper_html("0001")}
+    d = _mk(pages)
+    recs = list(d.discover_bank("se"))                   # no new kwargs
+    assert len(recs) == 1 and recs[0].pdf_url == "https://bank.test/wp/0001.pdf"
+
+
+def test_storage_is_known_source_url(tmp_path):
+    import json
+    from cb_corpus.config import Config
+    from cb_corpus.storage import Storage
+    data = tmp_path / "data"
+    (data / "manifest").mkdir(parents=True)
+    row = {"bank_code": "se", "doc_type": "D1", "title": "t",
+           "pdf_url": "https://bank.test/wp/1.pdf",
+           "source_url": _paper_url("0001"),
+           "date": "2026-01-01", "language": "en", "provenance": "repec_discovery",
+           "mime_type": "application/pdf", "sha256": "x", "local_path": "y",
+           "doc_id": "abc123", "year": 2026}
+    (data / "manifest" / "se.jsonl").write_text(json.dumps(row) + "\n")
+    st = Storage(Config(data_dir=data))
+    assert st.is_known_source_url(_paper_url("0001"))
+    assert not st.is_known_source_url(_paper_url("9999"))
+    # deliberately separate semantics: source pages are NOT pdf-url-known
+    assert not st.is_known_url(_paper_url("0001"))
+
+
+def test_run_repec_incremental_wiring(monkeypatch, tmp_path):
+    """incremental=True wires storage.is_known_source_url + stop_on_known."""
+    import cb_corpus.pipeline as P
+    captured = {}
+
+    class _FakeRep:
+        def __init__(self, fetcher): pass
+        def discover_bank(self, code, skip_url=None, stop_on_known=False):
+            captured["skip_url"] = skip_url
+            captured["stop_on_known"] = stop_on_known
+            return iter(())
+
+    monkeypatch.setattr("cb_corpus.sources.repec.RePEcDiscovery", _FakeRep)
+    from cb_corpus.config import Config
+    (tmp_path / "manifest").mkdir(parents=True)
+    P.run_repec(bank_codes=["se"], dry_run=True,
+                config=Config(data_dir=tmp_path), incremental=True)
+    assert captured["stop_on_known"] is True
+    assert callable(captured["skip_url"])
