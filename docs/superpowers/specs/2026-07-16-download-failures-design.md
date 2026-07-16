@@ -61,24 +61,33 @@ it must be calibrated on the phase-1 audit output (real-data-first rule).
   `discovery_errors.jsonl`); never read by the crawler itself.
 - The exception is still counted as `error` — counts and log lines unchanged.
 
-### 2. Save-side dedup by source page (class A, the durable half)
+### 2. Source-page dedup in the RePEc walk, both modes (class A, the durable half)
 
-- In `Storage.save()`, immediately after the `doc_id in self._ids` check and
-  before the dry-run branch:
+**AMENDED 2026-07-16 (task review + Marc).** The original design (an
+unconditional `skip:known-source` guard inside `Storage.save()`) was WRONG and
+is explicitly rejected: `source_url` is only a per-document identity page in
+the RePEc path. Elsewhere it is a SHARED page — verified in the live manifest:
+90 ECB bulletins share one `source_url`, all ECB foedb rows share a constant,
+404 Buba legacy papers share their listing URL, 82 RBA statements share one
+index — so a save-level guard would have silently dropped every new document
+on those paths. Silent data loss is the worst failure mode; nothing of the
+kind may live in `Storage.save()`.
 
-  ```python
-  if rec.source_url and rec.source_url in self._source_urls:
-      return "skip:known-source"
-  ```
+Replacement, applied where the 1:1 identity holds BY CONSTRUCTION:
 
-- Rationale: `source_url` (e.g. the IDEAS paper page) is a stable identity key
-  for the document, exactly like pdf_url/sha256 — if a manifest row already
-  carries it, the document is in the corpus and a re-listed variant (different
-  or dead pdf_url ⇒ different doc_id) must not trigger a download attempt.
-  This closes the gap for FULL sweeps (the PR #5 incremental skip only covers
-  bounded nights, and only at listing level).
+- `pipeline.run_repec` passes `skip_url=storage.is_known_source_url` **always**
+  (full sweeps included, not just incremental). In `RePEcDiscovery`, the URL
+  tested is exactly the `source_url` of the record it would yield — one paper
+  page, one record — so no shared-URL collision is possible.
+- `stop_on_known` remains incremental-only: the Sunday sweep keeps full
+  pagination (that is where its completeness lives — discovering unknown
+  entries anywhere in the catalog), it just stops re-fetching the paper pages
+  of documents it already owns (~14k page fetches ≈ 2 h 30 saved every Sunday,
+  with zero coverage change).
+- `Storage.save()` is NOT touched; `is_known_source_url` keeps its own index
+  and its discovery-level role.
 - Known non-goal (pre-existing behavior, unchanged): a revised PDF behind an
-  already-known source page is not re-fetched; corrections are a separate
+  already-known paper page is not re-fetched; corrections are a separate
   concern.
 
 ### 3. One-shot reconciliation `repec-reconcile` (class A, the data half)
