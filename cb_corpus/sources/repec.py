@@ -183,7 +183,13 @@ class RePEcDiscovery:
         """
         bank = get_bank(bank_code)
         for handle, doc_type in SERIES.get(bank_code, []):
+            considered = 0
             for page_urls in self._series_paper_pages(handle):
+                remaining = self.max_items - considered
+                if remaining <= 0:
+                    break
+                page_urls = page_urls[:remaining]
+                considered += len(page_urls)
                 unknown_on_page = 0
                 for paper_url in page_urls:
                     if skip_url is not None and skip_url(paper_url):

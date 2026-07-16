@@ -37,10 +37,11 @@ class FakeFetcher:
         return self.pages[url]
 
 
-def _mk(pages):
+def _mk(pages, max_items=5000):
     d = RePEcDiscovery.__new__(RePEcDiscovery)
     d.fetcher = FakeFetcher(pages)
     d.max_pages = 80
+    d.max_items = max_items
     return d
 
 
@@ -97,6 +98,22 @@ def test_default_behavior_unchanged(monkeypatch):
     d = _mk(pages)
     recs = list(d.discover_bank("se"))                   # no new kwargs
     assert len(recs) == 1 and recs[0].pdf_url == "https://bank.test/wp/0001.pdf"
+
+
+def test_max_items_caps_papers_considered_per_series(monkeypatch):
+    """discover_bank must cap paper-page URLs considered per series at
+    max_items, counted at listing level -- mirroring the old
+    _series_paper_urls flattened-list truncation."""
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    ids = ["0001", "0002", "0003", "0004", "0005"]
+    pages = {f"{BASE}.html": _series_html(ids)}
+    pages.update({_paper_url(p): _paper_html(p) for p in ids})
+    d = _mk(pages, max_items=3)
+    list(d.discover_bank("se"))
+    paper_fetches = [u for u in d.fetcher.fetched if u.startswith(f"{IDEAS}/p/")]
+    assert len(paper_fetches) == 3
 
 
 def test_storage_is_known_source_url(tmp_path):
