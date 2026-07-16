@@ -22,7 +22,9 @@ bash -n /app/deploy/entrypoint.sh || { echo "FAIL: entrypoint syntax"; exit 1; }
 # retyped here) so an edit to the production filter is what this assertion
 # actually exercises -- a hand-retyped copy would keep passing even if
 # resolve_banks() drifted, since it would just be comparing itself to itself.
-FILTER=$(grep -oE "awk '[^']+'" /app/deploy/run-job.sh | head -1)
+FILTER_LINE=$(grep "list-banks | awk" /app/deploy/run-job.sh | head -1)
+[ -n "$FILTER_LINE" ] || { echo "FAIL: could not find the list-banks | awk line in run-job.sh resolve_banks()"; exit 1; }
+FILTER=$(printf '%s' "$FILTER_LINE" | grep -oE "awk '[^']+'")
 [ -n "$FILTER" ] || { echo "FAIL: could not extract awk filter from run-job.sh resolve_banks()"; exit 1; }
 AWK_COUNT=$(python -m cb_corpus list-banks | eval "$FILTER" | wc -l | tr -d ' ')
 GREP_COUNT=$(python -m cb_corpus list-banks | grep -c '^[a-z]' || true)

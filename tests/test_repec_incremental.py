@@ -204,6 +204,26 @@ def test_discover_bank_skipped_known_counter_zero_when_no_skip(monkeypatch, caps
     assert "[repec:se] skipped-known: 0" in err
 
 
+def test_discover_bank_counter_prints_on_early_close(monkeypatch, capsys):
+    """The counter line must print via `finally`, so it still fires when the
+    consumer stops iterating early (generator `.close()`) instead of running
+    the walk to natural exhaustion -- e.g. a caller that only wants the first
+    record, or an early abort."""
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    ids = ["0001", "0002", "0003"]
+    pages = {f"{BASE}.html": _series_html(ids)}
+    pages.update({_paper_url(p): _paper_html(p) for p in ids})
+    d = _mk(pages)
+    known = {_paper_url("0002")}   # one known, rest unknown
+    gen = d.discover_bank("se", skip_url=lambda u: u in known)
+    next(gen)          # consume only the first yielded record
+    gen.close()         # early close -- generator never reaches exhaustion
+    err = capsys.readouterr().err
+    assert "[repec:se] skipped-known:" in err
+
+
 def test_run_repec_full_mode_also_passes_skip_url(monkeypatch, tmp_path):
     """Full sweeps (incremental=False) still pass skip_url=storage.is_known_source_url
     -- collision-free by construction since the RePEc source_url IS the per-record

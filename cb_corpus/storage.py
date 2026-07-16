@@ -82,6 +82,13 @@ def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
     overwriting). Holding the lock for the whole re-read+repair also blocks a
     concurrent `_append()` (which takes the same flock) from writing into the
     file while we decide/truncate.
+
+    The lock only serializes the truncate DECISION, not the writes that can
+    land in the caller's earlier unlocked-read window: an `_append()` that
+    interleaves its bytes into the torn tail during that window can produce a
+    garbled merged tail that still fails to parse under the lock; that tail
+    is truncated like any other real tear, and the row(s) it carried
+    reconverge on the next run via stable-key dedup, not via this repair.
     """
     rows: list[dict] = []
     with f.open("r+b") as fh:

@@ -96,7 +96,10 @@ pair — the crontab and job names changed; recreate the stack after re-pulling
 the image. Stacks created before 2026-07-16 ran a single unbounded sync every
 night — after re-pulling the image, add `SYNC_WINDOW_DAYS` to the compose
 environment (or leave it unset to keep the old full-nightly behavior; the
-crontab image update still switches Sunday to `sync full`).
+crontab image update still switches Sunday to `sync full`). Stacks created
+before this image must also manually add `stop_grace_period: 60s` to BOTH
+stacks' compose in Dockge — re-pulling the image does not update the compose
+files.
 
 ## 4. `cb-campaign` stack (on demand)
 
@@ -176,7 +179,7 @@ it does not diff or merge against the previously committed state beyond
 git's own history (clone, add, commit, rebase, push). The volume is the
 single source of truth for every autocommit: if it ever regresses (a bad
 restore, a manual edit, a stale seed re-applied), the next successful run
-will commit that regression as-is. The only server-side guard is the
+will commit that regression as-is. The only push-side guard is the
 per-manifest JSON validation from the H1 hardening pass — a *malformed*
 manifest is refused, a *valid-but-stale* one is not detected as such.
 

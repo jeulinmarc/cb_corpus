@@ -41,9 +41,9 @@ Root-cause analysis (Mac, 2026-07-16):
 
 ## Delivery in two phases
 
-**Phase 1 (this spec's plan): D + A.** Ships the audit file, the save-side
-source dedup, and the one-shot reconciliation. After one real nightly/Sunday
-cycle, the audit file gives the exact class-B/C inventory.
+**Phase 1 (this spec's plan): D + A.** Ships the audit file, the always-on
+RePEc-walk source skip, and the one-shot reconciliation. After one real
+nightly/Sunday cycle, the audit file gives the exact class-B/C inventory.
 **Phase 2 (separate plan, after real audit data): B + C.** Mirror/Wayback
 recovery for the audited leftovers. Not planned in detail here on purpose —
 it must be calibrated on the phase-1 audit output (real-data-first rule).

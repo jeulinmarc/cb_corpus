@@ -61,8 +61,8 @@ fi
 # it can touch any bank file, not just the one this process is discovering.
 # Storage._append() and the repair path both take an exclusive fcntl flock on
 # the target manifest file, so a same-host append/repair race is safe.
-# data/discovery_errors.jsonl is shared across banks: O_APPEND line-sized
-# writes, accepted limitation.
+# data/discovery_errors.jsonl and data/download_errors.jsonl are each shared
+# across banks: O_APPEND line-sized writes, accepted limitation.
 
 resolve_banks() {
   if [ "$DISCOVER_BANKS" = "all" ]; then
