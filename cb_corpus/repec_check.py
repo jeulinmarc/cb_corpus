@@ -541,10 +541,31 @@ def run_reconcile_apply(apply_csv: str, write: bool = False,
     this function, so a stray high-similarity row that Marc did NOT mark can
     never be written.
 
-    Every phase-1 invariant is re-validated against the LIVE manifest at
-    apply time (never trusted from the propose pass, which may be stale),
-    per approved row, in CSV order (first line wins ties — same rule as
-    phase 1's reverse-ambiguity):
+    This CSV is human-edited by hand, so it is treated as UNTRUSTED input,
+    not a trusted machine artifact — every field is guarded before it can
+    influence a write:
+
+      - ``bank`` is stripped of surrounding whitespace before use (a stray
+        space must not turn a valid bank into an unknown one); if a bank
+        has NO manifest rows at all (typo, or genuinely empty), every row
+        for it still gets the accurate ``row-gone`` skip reason, but ONE
+        stderr warning (``unknown or empty bank '<x>' in apply CSV``) is
+        also printed per distinct bad bank, so a systematic mistake is
+        loud rather than silently absorbed into a pile of row-gone rows;
+      - ``ideas_url`` must start with ``f"{IDEAS}/p/"`` (the only shape a
+        real IDEAS paper page URL can take) else ``bad-ideas-url`` —
+        this also closes an idempotence hole: an EMPTY ideas_url used to
+        pass every other guard and get stamped as ``source_url=""``
+        (falsy), so a re-apply of the same CSV saw ``source_url`` still
+        "empty" and stamped again, forever — never converging;
+      - the target row's ``doc_type`` must be ``D1``/``D2`` else
+        ``bad-doc-type`` (a typo'd or hand-edited ``candidate_doc_id``
+        must never stamp a row the reconciliation scope excludes).
+
+    Every phase-1 invariant is ALSO re-validated against the LIVE manifest
+    at apply time (never trusted from the propose pass, which may be
+    stale), per approved row, in CSV order (first line wins ties — same
+    rule as phase 1's reverse-ambiguity):
 
       - the doc_id still exists in the bank's manifest, else ``row-gone``;
       - its ``source_url`` is still empty, else ``source-not-empty`` (also
@@ -557,6 +578,10 @@ def run_reconcile_apply(apply_csv: str, write: bool = False,
         ``duplicate-ideas-url``.
 
     An unapproved row is reported ``not-approved`` and never touched.
+
+    The CSV is opened with ``encoding="utf-8-sig"`` so a BOM (common when a
+    spreadsheet app re-saves the propose CSV) is stripped rather than
+    corrupting the first column's header/value.
 
     Default is dry-run (``write=False``): the report CSV still shows every
     row that WOULD be applied/skipped (so it doubles as a preview), but
@@ -572,15 +597,16 @@ def run_reconcile_apply(apply_csv: str, write: bool = False,
     fetcher = fetcher or Fetcher(cfg)
     storage = Storage(cfg, fetcher)
 
-    with open(apply_csv, newline="", encoding="utf-8") as fh:
+    with open(apply_csv, newline="", encoding="utf-8-sig") as fh:
         rows = list(csv.DictReader(fh))
 
     counts = {"applied": 0, "skipped": 0}
     out_rows: list[dict] = []
     bank_states: dict[str, dict] = {}
+    warned_banks: set[str] = set()
 
     for r in rows:
-        bank = r.get("bank") or ""
+        bank = (r.get("bank") or "").strip()
         ideas_url = r.get("ideas_url") or ""
         doc_id = r.get("candidate_doc_id") or ""
         title = r.get("candidate_title") or ""
@@ -592,11 +618,24 @@ def run_reconcile_apply(apply_csv: str, write: bool = False,
                              "title": title, "action": "skipped", "skip_reason": "not-approved"})
             continue
 
+        if not ideas_url.startswith(f"{IDEAS}/p/"):
+            counts["skipped"] += 1
+            out_rows.append({"bank": bank, "ideas_url": ideas_url, "doc_id": doc_id,
+                             "title": title, "action": "skipped", "skip_reason": "bad-ideas-url"})
+            continue
+
         state = bank_states.setdefault(bank, _load_bank_state(storage, bank))
+        if not state["all_rows"] and bank not in warned_banks:
+            warned_banks.add(bank)
+            print(f"[repec-reconcile apply] unknown or empty bank '{bank}' in apply CSV",
+                 file=sys.stderr)
+
         row = state["by_doc_id"].get(doc_id) if doc_id else None
 
         if row is None:
             reason = "row-gone"
+        elif row.get("doc_type") not in ("D1", "D2"):
+            reason = "bad-doc-type"
         elif row.get("source_url"):
             reason = "source-not-empty"
         elif doc_id in state["stamps"]:

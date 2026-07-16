@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import date, datetime
 
 from .banks import BIS_63
@@ -163,7 +164,14 @@ def main(argv: list[str] | None = None) -> int:
     rr.add_argument("--apply-csv", default="",
                     help="path to a --propose CSV a human has edited (approve in "
                          "x|yes|1|oui); stamps exactly the approved pairs, "
-                         "re-validated against the live manifest")
+                         "re-validated against the live manifest. Guards (the CSV "
+                         "is untrusted human input): rows are skipped with "
+                         "bad-ideas-url (ideas_url doesn't look like an IDEAS paper "
+                         "page) or bad-doc-type (target row isn't D1/D2); --banks "
+                         "is invalid together with --apply-csv (the bank comes from "
+                         "each CSV row); --csv must not be the same path as "
+                         "--apply-csv (would overwrite the decision record you are "
+                         "reading)")
 
     rdl = sub.add_parser("recover-downloads",
                         help="Inventory-driven Wayback recovery for documents that "
@@ -270,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
             rr.error("--propose and --apply-csv are mutually exclusive")
         if args.propose and args.write:
             rr.error("--propose never writes manifests (drop --write)")
+        if args.apply_csv and banks:
+            rr.error("--banks has no effect with --apply-csv (the bank comes "
+                     "from each CSV row) -- drop --banks")
+        if args.apply_csv and args.csv and \
+           os.path.abspath(args.csv) == os.path.abspath(args.apply_csv):
+            rr.error("--csv must not be the same path as --apply-csv (would "
+                     "overwrite the decision record you are reading)")
         if args.propose:
             from .repec_check import run_reconcile_propose
             run_reconcile_propose(bank_codes=banks, csv_path=args.csv or None)

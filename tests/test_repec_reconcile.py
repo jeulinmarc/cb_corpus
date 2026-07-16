@@ -52,9 +52,9 @@ class FakeFetcher:
         return self.pages[url]
 
 
-def _row(doc_id, title, pdf_url, source_url="", alt_urls=None):
+def _row(doc_id, title, pdf_url, source_url="", alt_urls=None, doc_type="D1"):
     return {
-        "bank_code": "gb", "doc_type": "D1", "title": title,
+        "bank_code": "gb", "doc_type": doc_type, "title": title,
         "pdf_url": pdf_url, "source_url": source_url,
         "alt_urls": alt_urls or [], "date": "2001-01-01", "year": 2001,
         "language": "en", "provenance": "bank_site",
@@ -639,3 +639,221 @@ def test_apply_idempotent_reapply_is_all_already_ish_skips(tmp_path):
     assert second == {"applied": 0, "skipped": 1}
     report2 = _read_csv(str(tmp_path / "report2.csv"))
     assert report2[0]["skip_reason"] == "source-not-empty"
+
+
+# =============================================================================
+# Fix wave (task review): the human-edited apply CSV is UNTRUSTED input.
+# =============================================================================
+
+# -- C1: ideas_url shape guard ------------------------------------------------
+
+def test_apply_skip_bad_ideas_url_arbitrary_string(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("u1", "Row U1", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2020/u1.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": "not-a-url-at-all", "repec_title": "t",
+         "candidate_doc_id": "u1", "candidate_title": "Row U1",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 0, "skipped": 1}
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["skip_reason"] == "bad-ideas-url"
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["u1"]["source_url"] == ""
+
+
+def test_apply_skip_bad_ideas_url_empty_string(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("v1", "Row V1", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2020/v1.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": "", "repec_title": "t",
+         "candidate_doc_id": "v1", "candidate_title": "Row V1",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 0, "skipped": 1}
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["skip_reason"] == "bad-ideas-url"
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["v1"]["source_url"] == ""
+
+
+def test_apply_valid_ideas_url_still_applies(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("v2", "Row V2", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2020/v2.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0115"), "repec_title": "t",
+         "candidate_doc_id": "v2", "candidate_title": "Row V2",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 1, "skipped": 0}
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["v2"]["source_url"] == _paper_url("0115")
+
+
+def test_apply_reapply_of_previously_empty_ideas_url_converges_to_skips(tmp_path):
+    """Before the C1 fix, an empty ideas_url passed every guard and got
+    stamped as source_url="" (falsy), so a re-apply saw source_url still
+    empty and stamped AGAIN -- never converging. The bad-ideas-url guard
+    fires identically on every run, so both runs skip the same way."""
+    cfg = _cfg(tmp_path)
+    row = _row("v3", "Row V3", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2020/v3.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": "", "repec_title": "t",
+         "candidate_doc_id": "v3", "candidate_title": "Row V3",
+         "score": "0.9", "approve": "x"},
+    ])
+    first = run_reconcile_apply(str(apply_csv), write=True,
+                                csv_path=str(tmp_path / "report1.csv"),
+                                config=cfg, fetcher=FakeFetcher({}))
+    second = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report2.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert first == {"applied": 0, "skipped": 1}
+    assert second == {"applied": 0, "skipped": 1}
+    r1 = _read_csv(str(tmp_path / "report1.csv"))[0]
+    r2 = _read_csv(str(tmp_path / "report2.csv"))[0]
+    assert r1["skip_reason"] == r2["skip_reason"] == "bad-ideas-url"
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["v3"]["source_url"] == ""
+
+
+# -- I1: doc_type guard -------------------------------------------------------
+
+def test_apply_skip_bad_doc_type(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("w1", "Row W1", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2020/w1.pdf",
+              doc_type="D3")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0140"), "repec_title": "t",
+         "candidate_doc_id": "w1", "candidate_title": "Row W1",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 0, "skipped": 1}
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["skip_reason"] == "bad-doc-type"
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["w1"]["source_url"] == ""
+
+
+# -- I2: BOM -------------------------------------------------------------------
+
+def test_apply_csv_with_bom_applies_normally(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("x1", "Row X1", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2020/x1.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    fields = ["bank", "ideas_url", "repec_title", "candidate_doc_id",
+             "candidate_title", "score", "approve"]
+    with open(apply_csv, "w", newline="", encoding="utf-8-sig") as fh:
+        import csv as _csv
+        w = _csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        w.writerow({"bank": "gb", "ideas_url": _paper_url("0150"),
+                   "repec_title": "t", "candidate_doc_id": "x1",
+                   "candidate_title": "Row X1", "score": "0.9", "approve": "x"})
+    assert apply_csv.read_bytes().startswith(b"\xef\xbb\xbf")   # sanity: BOM present
+
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 1, "skipped": 0}
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["x1"]["source_url"] == _paper_url("0150")
+
+
+# -- M1: bank hygiene ----------------------------------------------------------
+
+def test_apply_bank_field_whitespace_is_stripped(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("y1", "Row Y1", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2020/y1.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb ", "ideas_url": _paper_url("0160"), "repec_title": "t",
+         "candidate_doc_id": "y1", "candidate_title": "Row Y1",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 1, "skipped": 0}
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["y1"]["source_url"] == _paper_url("0160")
+
+
+def test_apply_unknown_bank_warns_once(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    _write_manifest(cfg, "gb", [])   # so cfg.manifest_dir exists
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "zz", "ideas_url": _paper_url("0170"), "repec_title": "t",
+         "candidate_doc_id": "ghost1", "candidate_title": "Ghost1",
+         "score": "0.9", "approve": "x"},
+        {"bank": "zz", "ideas_url": _paper_url("0171"), "repec_title": "t",
+         "candidate_doc_id": "ghost2", "candidate_title": "Ghost2",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 0, "skipped": 2}
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert all(r["skip_reason"] == "row-gone" for r in report)
+    err = capsys.readouterr().err
+    assert err.count("unknown or empty bank 'zz'") == 1
+
+
+# -- M2 / M3: CLI guards -------------------------------------------------------
+
+def test_cli_banks_with_apply_csv_is_an_argparse_error(tmp_path, capsys):
+    from cb_corpus import cli
+    import pytest
+
+    apply_csv = tmp_path / "apply.csv"
+    apply_csv.write_text("bank,ideas_url,candidate_doc_id,candidate_title,score,approve\n")
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["repec-reconcile", "--apply-csv", str(apply_csv), "--banks", "gb"])
+    assert exc.value.code == 2
+    assert "--banks" in capsys.readouterr().err
+
+
+def test_cli_csv_same_as_apply_csv_is_an_argparse_error(tmp_path, capsys):
+    from cb_corpus import cli
+    import pytest
+
+    same_path = tmp_path / "same.csv"
+    same_path.write_text("bank,ideas_url,candidate_doc_id,candidate_title,score,approve\n")
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["repec-reconcile", "--apply-csv", str(same_path), "--csv", str(same_path)])
+    assert exc.value.code == 2
+    assert "--csv" in capsys.readouterr().err
