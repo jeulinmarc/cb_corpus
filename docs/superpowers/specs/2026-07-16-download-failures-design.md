@@ -119,8 +119,8 @@ New CLI command `repec-reconcile --banks gb [--write] [--csv path]`:
   (temp file + rename, per-bank).
 - Idempotent: a second run finds nothing left to stamp.
 - Expected effect on gb: ~374 stamps → those papers become skippable at
-  listing level (incremental nights, `_source_urls`) AND at save level
-  (Sunday full sweeps, §2) → gb error count drops to ~0. fr's 13 remain
+  listing level in BOTH modes (incremental nights and Sunday full sweeps —
+  §2's always-on `skip_url`) → gb error count drops to ~0. fr's 13 remain
   (they are `unmatched` — genuinely missing → phase 2 inventory).
 
 ### 4. Testing (adversarial fixtures, per the house rule)
@@ -128,9 +128,10 @@ New CLI command `repec-reconcile --banks gb [--write] [--csv path]`:
 - Audit file: a failing record writes exactly one well-formed JSON line with
   all fields; counts/log lines unchanged; dry-run never writes audit lines
   (nothing can fail before download in dry-run).
-- save-side dedup: known source_url → `skip:known-source` before any fetch
-  (spy fetcher asserts zero calls), in both dry-run and real mode; empty
-  source_url never matches; `_source_urls` freshness after save/reindex.
+- RePEc walk dedup (amended §2): a known source_url is skipped BEFORE its
+  paper-page fetch in both modes (spy fetcher asserts zero calls); empty
+  source_url never matches; `_source_urls` freshness after save/reindex;
+  the per-bank `skipped-known: N` counter line is asserted.
 - Reconciliation: fixtures with (i) a clean unique match → stamped in --write,
   reported in dry-run, file untouched in dry-run; (ii) TWO rows with the same
   canonical title → `ambiguous`, no write; (iii) row with non-empty
