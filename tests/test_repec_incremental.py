@@ -116,6 +116,24 @@ def test_max_items_caps_papers_considered_per_series(monkeypatch):
     assert len(paper_fetches) == 3
 
 
+def test_max_items_binding_exactly_on_page_stops_pagination(monkeypatch):
+    """When max_items is fully satisfied by the current listing page, the
+    next listing page must never be fetched -- the cap must stop pagination
+    immediately, not one iteration late (which would waste a real HTTP
+    listing-page fetch per capped series)."""
+    from cb_corpus.sources import repec as R
+    from cb_corpus.taxonomy import DocType
+    monkeypatch.setitem(R.SERIES, "se", [(SERIES_HANDLE, DocType.D1)])
+    page1_ids = ["0001", "0002", "0003"]
+    page2_ids = ["0004", "0005"]
+    pages = {f"{BASE}.html": _series_html(page1_ids),
+             f"{BASE}2.html": _series_html(page2_ids)}
+    pages.update({_paper_url(p): _paper_html(p) for p in page1_ids + page2_ids})
+    d = _mk(pages, max_items=3)
+    list(d.discover_bank("se"))
+    assert f"{BASE}2.html" not in d.fetcher.fetched
+
+
 def test_storage_is_known_source_url(tmp_path):
     import json
     from cb_corpus.config import Config

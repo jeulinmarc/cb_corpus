@@ -221,6 +221,10 @@ class RePEcDiscovery:
                     )
                 if stop_on_known and unknown_on_page == 0:
                     break
+                if considered >= self.max_items:
+                    # Cap is now fully bound -- don't re-enter the page
+                    # generator for another (wasted) listing-page fetch.
+                    break
 
 
 def _title_of(paper_html: str) -> str:
