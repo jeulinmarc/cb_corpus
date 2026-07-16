@@ -115,18 +115,72 @@ To launch another campaign: re-edit `command:` + Deploy.
 - A Dockge stop/redeploy mid-run kills the current job (status `FAILED` or
   absent) — the lock is released automatically and the next cron tick
   picks up again; this is expected.
-- After the nightly sync: per-bank discovery logs under `data/reports/discover/<date>/`,
-  one summary line `OK n/n` or `PARTIAL k/n FAILED: <codes>` in `nas_runs.log`,
-  and a `data: NAS sync <date>` commit on GitHub when discovery changed.
-  Monday–Saturday this is a bounded sync (`[sync] START (window <n>d)`,
-  lower RePEc counts — incremental, new work only; counts in the container
-  logs, `nas_runs.log` keeps only the mode marker and `catalogs OK`); Sunday
-  it is the full sweep (`[sync] START (full)`) with the full audit counts.
+- After the nightly sync: per-bank discovery logs under `data/reports/discover/<date>/`
+  (`<date>` is the container-local calendar date — `TZ=Europe/Paris` in prod —
+  not UTC, so the 01:00-CEST Monday run lands in Monday's directory instead of
+  clobbering Sunday's full-sweep logs), one summary line `OK n/n` or
+  `PARTIAL k/n FAILED: <codes>` in `nas_runs.log`, and a `data: NAS sync
+  <date>` commit on GitHub when discovery changed. The same directory also
+  holds `catalogs.log` (tee'd stdout+stderr of the bis-sitemap/RePEc phases —
+  survives a Dockge Update mid-run, unlike a traceback that only ever hit the
+  terminal) and a `[sync] bis-sitemap OK` heartbeat line in `nas_runs.log`
+  between the two catalog phases. Monday–Saturday this is a bounded sync
+  (`[sync] START (window <n>d)`, lower RePEc counts — incremental, new work
+  only; counts in the container logs, `nas_runs.log` keeps only the mode
+  marker, `bis-sitemap OK`, and `catalogs OK`); Sunday it is the full sweep
+  (`[sync] START (full)`) with the full audit counts.
 - A `PARTIAL` status is not an emergency: failed banks are retried the next
   night. Investigate a bank only when it fails several nights in a row
   (its log under `reports/discover/<date>/<code>.log` has the traceback).
+- A `cb-campaign` run that had to queue behind an in-progress sync logs
+  `[campaign] WAITING (lock busy)` in `nas_runs.log` before it blocks — if a
+  campaign looks stuck, check for that line plus whichever job is currently
+  running (its own `START` line without a matching `OK`/`PARTIAL`/`FAILED`
+  yet).
 
-## 6. Code updates
+## 6. Status semantics
+
+`data/reports/last_run_status` holds exactly one line summarizing the most
+recent run — treat it as "freshness", not as history (`nas_runs.log` has the
+history):
+
+- `OK n/n [job]` — full success.
+- `PARTIAL k/n FAILED: <codes> [job]` — some banks failed; autocommit still
+  runs (partial progress is real progress). Not an emergency — see §5.
+- `FAILED [job] rc=<n>` — the job errored out (a catalog phase, all banks
+  failed, a malformed `SYNC_WINDOW_DAYS`, ...); no autocommit.
+- `REFUSED [job]` — the volume had no manifests (missing-seed protection,
+  §2); no phase ran.
+- `SKIPPED [job]` — the global lock was already held (a previous sync or
+  campaign still in progress); this run did nothing. A `SKIPPED` line
+  overwrites the previous status on disk, so an operator checking only the
+  file's last-write time can no longer mistake a skipped night for a fresh
+  `OK` — check `nas_runs.log` for who held the lock.
+
+### Sunday error barrage (transitional)
+
+Until `repec-reconcile` exists (tracked separately, not yet written), the
+Sunday full sweep is expected to log on the order of ~400 `gb`/`fr` lines to
+`data/download_errors.jsonl` per run — a known RePEc/native reconciliation
+gap for those two banks, not a new incident. Don't read a noisy Sunday as a
+regression; conversely, don't read a *quiet* Sunday (well under ~400) before
+`repec-reconcile` ships as a sign of health either — it more likely means the
+sweep aborted early. Re-measure and remove this note once `repec-reconcile`
+lands.
+
+### Autocommit: the volume always wins
+
+`autocommit.sh` copies `data/manifest/*.jsonl` and `data/wp_dates_index.jsonl`
+from the running container's volume as-is and pushes them as a new commit —
+it does not diff or merge against the previously committed state beyond
+git's own history (clone, add, commit, rebase, push). The volume is the
+single source of truth for every autocommit: if it ever regresses (a bad
+restore, a manual edit, a stale seed re-applied), the next successful run
+will commit that regression as-is. The only server-side guard is the
+per-manifest JSON validation from the H1 hardening pass — a *malformed*
+manifest is refused, a *valid-but-stale* one is not detected as such.
+
+## 7. Code updates
 
 Push to master → CI rebuilds `ghcr.io/.../cb_corpus:latest` → in Dockge:
 re-pull the image and redeploy the stacks.
