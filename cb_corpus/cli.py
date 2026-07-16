@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import date, datetime
 
 from .banks import BIS_63
@@ -143,10 +144,44 @@ def main(argv: list[str] | None = None) -> int:
 
     rr = sub.add_parser("repec-reconcile",
                         help="Stamp IDEAS source_urls onto uniquely-matched manifest "
-                             "rows (dry-run by default; --write applies).")
+                             "rows (dry-run by default; --write applies). "
+                             "--propose / --apply-csv: human-approved reconciliation "
+                             "for RePEc/published title drift (spec §B2).")
     rr.add_argument("--banks", default="")
-    rr.add_argument("--write", action="store_true")
-    rr.add_argument("--csv", default="", help="CSV output path (default data/reports/repec_reconcile.csv)")
+    rr.add_argument("--write", action="store_true",
+                    help="plain mode: apply the strict-cascade stamps; "
+                         "with --apply-csv: apply the human-approved stamps "
+                         "(without it, --apply-csv is a dry-run report); "
+                         "invalid together with --propose (propose never writes)")
+    rr.add_argument("--csv", default="",
+                    help="output report CSV path (default data/reports/repec_reconcile.csv, "
+                         "or repec_reconcile_propose.csv / repec_reconcile_apply.csv "
+                         "for --propose / --apply-csv respectively)")
+    rr.add_argument("--propose", action="store_true",
+                    help="write a ranked-candidate CSV for every unmatched listing "
+                         "entry (up to 3 candidates each, approve column left empty "
+                         "for a human to fill in) -- never writes manifests")
+    rr.add_argument("--apply-csv", default="",
+                    help="path to a --propose CSV a human has edited (approve in "
+                         "x|yes|1|oui); stamps exactly the approved pairs, "
+                         "re-validated against the live manifest. Guards (the CSV "
+                         "is untrusted human input): rows are skipped with "
+                         "bad-ideas-url (ideas_url doesn't look like an IDEAS paper "
+                         "page) or bad-doc-type (target row isn't D1/D2); --banks "
+                         "is invalid together with --apply-csv (the bank comes from "
+                         "each CSV row); --csv must not be the same path as "
+                         "--apply-csv (would overwrite the decision record you are "
+                         "reading)")
+
+    rdl = sub.add_parser("recover-downloads",
+                        help="Inventory-driven Wayback recovery for documents that "
+                             "failed every prior download attempt "
+                             "(data/download_errors.jsonl). Default dry-run (CSV "
+                             "classification only); --download saves recoverable ones.")
+    rdl.add_argument("--banks", default="")
+    rdl.add_argument("--download", action="store_true",
+                     help="actually save recoverable documents (default: dry-run report)")
+    rdl.add_argument("--csv", default="", help="CSV output path (default data/reports/recover_downloads.csv)")
 
     args = p.parse_args(argv)
     banks = _banks(getattr(args, "banks", ""))
@@ -239,8 +274,44 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "repec-reconcile":
-        from .repec_check import run_repec_reconcile
-        run_repec_reconcile(bank_codes=banks, write=args.write, csv_path=args.csv or None)
+        if args.propose and args.apply_csv:
+            rr.error("--propose and --apply-csv are mutually exclusive")
+        if args.propose and args.write:
+            rr.error("--propose never writes manifests (drop --write)")
+        if args.apply_csv and banks:
+            rr.error("--banks has no effect with --apply-csv (the bank comes "
+                     "from each CSV row) -- drop --banks")
+        if args.apply_csv and args.csv:
+            same = os.path.realpath(args.csv) == os.path.realpath(args.apply_csv)
+            if not same and os.path.exists(args.csv):
+                # realpath resolves symlinks but not case-only aliases (e.g. a
+                # case-insensitive APFS volume) -- samefile is stat-based
+                # (dev/inode) and catches those too. Both targets must exist
+                # for samefile; --apply-csv is always an existing file here.
+                try:
+                    same = os.path.samefile(args.csv, args.apply_csv)
+                except OSError:
+                    pass
+            if same:
+                rr.error("--csv must not be the same path as --apply-csv (would "
+                         "overwrite the decision record you are reading)")
+        if args.propose:
+            from .repec_check import run_reconcile_propose
+            run_reconcile_propose(bank_codes=banks, csv_path=args.csv or None)
+        elif args.apply_csv:
+            from .repec_check import run_reconcile_apply
+            run_reconcile_apply(args.apply_csv, write=args.write, csv_path=args.csv or None)
+        else:
+            from .repec_check import run_repec_reconcile
+            run_repec_reconcile(bank_codes=banks, write=args.write, csv_path=args.csv or None)
+        return 0
+
+    if args.cmd == "recover-downloads":
+        from .recover import run_recover_downloads
+        results = run_recover_downloads(bank_codes=banks, download=args.download,
+                                        csv_path=args.csv or None)
+        for code, counts in results.items():
+            print(f"{code}: {counts}")
         return 0
     return 1
 

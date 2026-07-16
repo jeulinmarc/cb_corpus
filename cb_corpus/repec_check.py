@@ -22,6 +22,7 @@ import csv
 import re
 import sys
 from datetime import date, timedelta
+from difflib import SequenceMatcher
 from typing import Iterable, Optional
 
 from bs4 import BeautifulSoup
@@ -35,6 +36,7 @@ from .wp_migrate import (_KEY_FROM_HANDLE, _KEY_FROM_PDF, normalize_title,
                          normalize_url, repec_handle_from_source_url)
 
 _GRACE_DAYS = 45
+_APPROVE_TOKENS = {"x", "yes", "1", "oui"}
 
 
 def parse_series_listing(html: str, arch: str, series: str) -> list[tuple[str, str]]:
@@ -174,6 +176,152 @@ def run_repec_check(bank_codes: Optional[Iterable[str]] = None,
     return results
 
 
+def _build_indexes(storage: Storage, bank: str) -> dict:
+    """Index a bank's manifest rows for the reconcile walk: full RePEc handle,
+    bank-specific number key, normalized title, and normalized pdf/alt URL
+    (each -> list of rows), plus the set of source_urls already claimed and
+    the bank's key_handle helper. Also returns the FULL row list verbatim
+    (required for a full-row-set ``rewrite_manifest`` write — see its
+    docstring: a bank's file is fully replaced by the rows passed to it, so
+    a write must never be given a filtered subset)."""
+    by_handle: dict[str, list[dict]] = {}
+    by_key: dict = {}
+    by_title: dict[str, list[dict]] = {}
+    by_url: dict[str, list[dict]] = {}
+    known_sources: set[str] = set()
+    all_rows: list[dict] = []
+    key_pdf, key_handle = _KEY_FROM_PDF.get(bank), _KEY_FROM_HANDLE.get(bank)
+
+    for row in storage.iter_manifest(bank):
+        all_rows.append(row)
+        if row.get("doc_type") not in ("D1", "D2"):
+            continue
+        h = (row.get("repec_handle")
+             or repec_handle_from_source_url(row.get("source_url") or ""))
+        if h:
+            by_handle.setdefault(h, []).append(row)
+        if key_pdf:
+            k = key_pdf(row.get("pdf_url") or "") or (
+                key_handle and key_handle(row.get("source_url") or ""))
+            if k:
+                by_key.setdefault(k, []).append(row)
+        t = normalize_title(row.get("title") or "")
+        if t:
+            by_title.setdefault(t, []).append(row)
+        for u in [row.get("pdf_url"), *(row.get("alt_urls") or [])]:
+            if u:
+                by_url.setdefault(normalize_url(u), []).append(row)
+        src = row.get("source_url")
+        if src:
+            known_sources.add(src)
+
+    return {"by_handle": by_handle, "by_key": by_key, "by_title": by_title,
+            "by_url": by_url, "known_sources": known_sources,
+            "all_rows": all_rows, "key_handle": key_handle}
+
+
+def _walk_entries(bank: str, fetcher: Fetcher, idx: dict, bank_home: str):
+    """Yield one classification dict per IDEAS listing entry for ``bank``,
+    via the SAME matching cascade documented on ``run_repec_reconcile``
+    (never fuzzy, never dates): already-known short-circuit, first pass
+    (handle / bank-specific key / exact normalized title, no fetch), second
+    pass (only if the first found nothing: fetch the IDEAS paper page,
+    re-try PDF-URL candidates + fetched canonical title).
+
+    Each yielded dict: ``{"ideas_url", "title" (fetched canonical title if
+    the second pass ran and found one, else the listing title), "action",
+    "doc_id", "row"}`` where ``action`` is one of:
+
+      - ``"already"``: the IDEAS URL (or a matched row) already carries a
+        source_url; no write is ever possible here.
+      - ``"unmatched"``: zero candidate rows found by the cascade.
+      - ``"ambiguous"``: more than one candidate row found.
+      - ``"candidate"``: EXACTLY one candidate row, with an EMPTY
+        source_url -- eligible to be written, but reverse-ambiguity (two
+        listing entries independently resolving to the same doc_id) is a
+        cross-entry concern the CALLER must still resolve (see
+        ``run_repec_reconcile``); this generator does not track run-wide
+        claimed doc_ids.
+    """
+    by_handle, by_key = idx["by_handle"], idx["by_key"]
+    by_title, by_url = idx["by_title"], idx["by_url"]
+    known_sources, key_handle = idx["known_sources"], idx["key_handle"]
+
+    for handle, doc_type in SERIES[bank]:
+        arch, series = handle.split(":")
+        for pid, title in enumerate_series(fetcher, handle):
+            ideas_url = f"{IDEAS}/p/{arch}/{series}/{pid}.html"
+            full_handle = f"RePEc:{arch}:{series}:{pid}"
+            handle_rows = by_handle.get(full_handle) or []
+
+            if ideas_url in known_sources or any(r.get("source_url") for r in handle_rows):
+                doc_id = handle_rows[0]["doc_id"] if handle_rows else ""
+                yield {"ideas_url": ideas_url, "title": title, "action": "already",
+                       "doc_id": doc_id, "row": handle_rows[0] if handle_rows else None}
+                continue
+
+            cand_by_id: dict[str, dict] = {r["doc_id"]: r for r in handle_rows}
+            key = key_handle(f"{series}:{pid}") if key_handle else None
+            if key is not None:
+                for r in by_key.get(key, []):
+                    cand_by_id[r["doc_id"]] = r
+            for r in by_title.get(normalize_title(title), []):
+                cand_by_id[r["doc_id"]] = r
+
+            fetched_title = ""
+            if not cand_by_id:
+                # Second pass (cheap -- only unmatched entries): fetch the
+                # IDEAS page and re-match by its bank PDF-URL candidates
+                # (matched against pdf_url/alt_urls) or its canonical title.
+                try:
+                    html = fetcher.get_text(ideas_url)
+                    fetched_title, _ = _paper_meta(html)
+                    cands = extract_pdf_candidates(html, bank_home)
+                except Exception:
+                    fetched_title, cands = "", []
+                for c in cands:
+                    for r in by_url.get(normalize_url(c), []):
+                        cand_by_id[r["doc_id"]] = r
+                if fetched_title:
+                    for r in by_title.get(normalize_title(fetched_title), []):
+                        cand_by_id[r["doc_id"]] = r
+
+            csv_title = fetched_title or title
+            candidates = list(cand_by_id.values())
+            if not candidates:
+                yield {"ideas_url": ideas_url, "title": csv_title, "action": "unmatched",
+                       "doc_id": "", "row": None}
+            elif len(candidates) > 1:
+                yield {"ideas_url": ideas_url, "title": csv_title, "action": "ambiguous",
+                       "doc_id": "", "row": None}
+            else:
+                row = candidates[0]
+                if row.get("source_url"):
+                    yield {"ideas_url": ideas_url, "title": csv_title, "action": "already",
+                           "doc_id": row["doc_id"], "row": row}
+                else:
+                    yield {"ideas_url": ideas_url, "title": csv_title, "action": "candidate",
+                           "doc_id": row["doc_id"], "row": row}
+
+
+def _apply_stamps(storage: Storage, all_rows: list[dict], stamps: dict[str, str]) -> None:
+    """Stamp ``source_url`` onto every row in ``all_rows`` whose doc_id is a
+    key of ``stamps``, then rewrite the bank's manifest with the FULL row
+    set. Shared by ``run_repec_reconcile`` (phase 1) and
+    ``run_reconcile_apply`` (phase 2, human-approved) so both write paths go
+    through the identical full-row-set ``storage.rewrite_manifest`` call --
+    see its docstring: a bank's file is fully replaced by the rows given
+    here, so ``all_rows`` must always be the bank's complete row set, never
+    a filtered subset. No-op (no rewrite at all) when ``stamps`` is empty."""
+    if not stamps:
+        return
+    for row in all_rows:
+        did = row.get("doc_id")
+        if did in stamps:
+            row["source_url"] = stamps[did]
+    storage.rewrite_manifest(all_rows)
+
+
 def run_repec_reconcile(bank_codes: Optional[Iterable[str]] = None,
                         write: bool = False,
                         csv_path: Optional[str] = None,
@@ -185,33 +333,25 @@ def run_repec_reconcile(bank_codes: Optional[Iterable[str]] = None,
     bank_site D1 rows under modern slug URLs, with no cross-reference to the
     RePEc entry that reproves them on every catalog pass).
 
-    Matching cascade per listing entry, in order (never fuzzy, never dates):
-
-      1. already-known: the IDEAS paper URL is already a manifest row's
-         source_url (``known_sources``), or the full RePEc handle already
-         maps to a row carrying a source_url -> ``already``, no page fetch.
-      2. first pass (no fetch): union of rows matching the full handle, the
-         bank-specific number key (`wp_migrate._KEY_FROM_HANDLE`), or the
-         EXACT normalized title.
-      3. second pass (only if #2 found nothing): fetch the IDEAS paper page,
-         re-try the bank PDF-URL candidates against the manifest's
-         (pdf_url + alt_urls) index, and the fetched canonical title.
+    Matching cascade per listing entry: see ``_walk_entries``'s docstring
+    (handle / bank-specific key / exact normalized title, then a second-pass
+    page fetch — never fuzzy, never dates).
 
     Write rule (strict): a listing entry stamps its match ONLY when exactly
     one candidate row was found (across both passes) AND that row's
-    source_url is empty. Zero candidates -> ``unmatched``. More than one ->
-    ``ambiguous``. One candidate with a source_url already set -> ``already``.
-    A doc_id already claimed by an earlier listing entry IN THIS RUN (reverse
-    ambiguity: two distinct listing entries each uniquely resolve to the same
-    row) -> the first entry stamps, every later one is ``ambiguous`` too — a
-    doc_id can be stamped by at most one entry per run, so ``stamped`` counts,
-    the CSV, and rows actually rewritten always agree. Ambiguous/unmatched/
-    already rows are reported (CSV + stdout), never written. Default is
-    dry-run (``write=False``); writes go through
-    ``storage.rewrite_manifest`` with the bank's FULL row set (never a
-    filtered subset — see its docstring), touching ONLY ``source_url`` on the
-    stamped doc_ids. Idempotent: once a row is stamped its IDEAS URL is a
-    known source_url, so a second run finds it ``already`` and stamps 0.
+    source_url is empty (``_walk_entries``' ``"candidate"`` action). Zero
+    candidates -> ``unmatched``. More than one -> ``ambiguous``. One
+    candidate with a source_url already set -> ``already``. A doc_id already
+    claimed by an earlier listing entry IN THIS RUN (reverse ambiguity: two
+    distinct listing entries each uniquely resolve to the same row) -> the
+    first entry stamps, every later one is ``ambiguous`` too — a doc_id can
+    be stamped by at most one entry per run, so ``stamped`` counts, the CSV,
+    and rows actually rewritten always agree. Ambiguous/unmatched/already
+    rows are reported (CSV + stdout), never written. Default is dry-run
+    (``write=False``); writes go through the shared ``_apply_stamps`` (full
+    row set, see its docstring), touching ONLY ``source_url`` on the stamped
+    doc_ids. Idempotent: once a row is stamped its IDEAS URL is a known
+    source_url, so a second run finds it ``already`` and stamps 0.
 
     Returns {bank: {"stamped": n, "ambiguous": n, "already": n, "unmatched": n}}.
     Always writes a CSV (dry-run included) of every action taken, with rows
@@ -227,128 +367,52 @@ def run_repec_reconcile(bank_codes: Optional[Iterable[str]] = None,
     csv_rows: list[dict] = []
 
     for bank in codes:
-        by_handle: dict[str, list[dict]] = {}
-        by_key: dict = {}
-        by_title: dict[str, list[dict]] = {}
-        by_url: dict[str, list[dict]] = {}
-        known_sources: set[str] = set()
-        all_rows: list[dict] = []
-        key_pdf, key_handle = _KEY_FROM_PDF.get(bank), _KEY_FROM_HANDLE.get(bank)
-
-        for row in storage.iter_manifest(bank):
-            all_rows.append(row)
-            if row.get("doc_type") not in ("D1", "D2"):
-                continue
-            h = (row.get("repec_handle")
-                 or repec_handle_from_source_url(row.get("source_url") or ""))
-            if h:
-                by_handle.setdefault(h, []).append(row)
-            if key_pdf:
-                k = key_pdf(row.get("pdf_url") or "") or (
-                    key_handle and key_handle(row.get("source_url") or ""))
-                if k:
-                    by_key.setdefault(k, []).append(row)
-            t = normalize_title(row.get("title") or "")
-            if t:
-                by_title.setdefault(t, []).append(row)
-            for u in [row.get("pdf_url"), *(row.get("alt_urls") or [])]:
-                if u:
-                    by_url.setdefault(normalize_url(u), []).append(row)
-            src = row.get("source_url")
-            if src:
-                known_sources.add(src)
-
+        idx = _build_indexes(storage, bank)
+        bank_home = get_bank(bank).homepage
         counts = {"stamped": 0, "ambiguous": 0, "already": 0, "unmatched": 0}
         stamps: dict[str, str] = {}   # doc_id -> ideas_url
-        bank_home = get_bank(bank).homepage
 
-        for handle, doc_type in SERIES[bank]:
-            arch, series = handle.split(":")
-            for pid, title in enumerate_series(fetcher, handle):
-                ideas_url = f"{IDEAS}/p/{arch}/{series}/{pid}.html"
-                full_handle = f"RePEc:{arch}:{series}:{pid}"
-                handle_rows = by_handle.get(full_handle) or []
+        for entry in _walk_entries(bank, fetcher, idx, bank_home):
+            action = entry["action"]
+            ideas_url, title, doc_id = entry["ideas_url"], entry["title"], entry["doc_id"]
 
-                if ideas_url in known_sources or any(r.get("source_url") for r in handle_rows):
-                    counts["already"] += 1
-                    doc_id = handle_rows[0]["doc_id"] if handle_rows else ""
-                    csv_rows.append({"bank": bank, "ideas_url": ideas_url,
-                                     "action": "already", "doc_id": doc_id, "title": title})
-                    continue
-
-                cand_by_id: dict[str, dict] = {r["doc_id"]: r for r in handle_rows}
-                key = key_handle(f"{series}:{pid}") if key_handle else None
-                if key is not None:
-                    for r in by_key.get(key, []):
-                        cand_by_id[r["doc_id"]] = r
-                for r in by_title.get(normalize_title(title), []):
-                    cand_by_id[r["doc_id"]] = r
-
-                fetched_title = ""
-                if not cand_by_id:
-                    # Second pass (cheap -- only unmatched entries): fetch the
-                    # IDEAS page and re-match by its bank PDF-URL candidates
-                    # (matched against pdf_url/alt_urls) or its canonical title.
-                    try:
-                        html = fetcher.get_text(ideas_url)
-                        fetched_title, _ = _paper_meta(html)
-                        cands = extract_pdf_candidates(html, bank_home)
-                    except Exception:
-                        fetched_title, cands = "", []
-                    for c in cands:
-                        for r in by_url.get(normalize_url(c), []):
-                            cand_by_id[r["doc_id"]] = r
-                    if fetched_title:
-                        for r in by_title.get(normalize_title(fetched_title), []):
-                            cand_by_id[r["doc_id"]] = r
-
-                csv_title = fetched_title or title
-                candidates = list(cand_by_id.values())
-                if not candidates:
-                    counts["unmatched"] += 1
-                    csv_rows.append({"bank": bank, "ideas_url": ideas_url,
-                                     "action": "unmatched", "doc_id": "", "title": csv_title})
-                elif len(candidates) > 1:
+            if action == "already":
+                counts["already"] += 1
+                csv_rows.append({"bank": bank, "ideas_url": ideas_url,
+                                 "action": "already", "doc_id": doc_id, "title": title})
+            elif action == "unmatched":
+                counts["unmatched"] += 1
+                csv_rows.append({"bank": bank, "ideas_url": ideas_url,
+                                 "action": "unmatched", "doc_id": "", "title": title})
+            elif action == "ambiguous":
+                counts["ambiguous"] += 1
+                csv_rows.append({"bank": bank, "ideas_url": ideas_url,
+                                 "action": "ambiguous", "doc_id": "", "title": title})
+            else:  # "candidate": exactly one row, empty source_url
+                if doc_id in stamps:
+                    # Reverse ambiguity: a DIFFERENT listing entry already
+                    # claimed this doc_id earlier in this run (e.g. two
+                    # listing pids sharing one normalized title, each
+                    # otherwise uniquely resolving to the same row). A
+                    # doc_id can be stamped by at most one entry, or the
+                    # dict write below is last-wins and the CSV would
+                    # assert two writes for one actual write. The first
+                    # entry keeps its stamp; this later one is reported
+                    # (not written) so stamped == len(stamps) always.
                     counts["ambiguous"] += 1
                     csv_rows.append({"bank": bank, "ideas_url": ideas_url,
-                                     "action": "ambiguous", "doc_id": "", "title": csv_title})
+                                     "action": "ambiguous", "doc_id": "", "title": title})
                 else:
-                    row = candidates[0]
-                    if row.get("source_url"):
-                        counts["already"] += 1
-                        csv_rows.append({"bank": bank, "ideas_url": ideas_url,
-                                         "action": "already", "doc_id": row["doc_id"],
-                                         "title": csv_title})
-                    elif row["doc_id"] in stamps:
-                        # Reverse ambiguity: a DIFFERENT listing entry already
-                        # claimed this doc_id earlier in this run (e.g. two
-                        # listing pids sharing one normalized title, each
-                        # otherwise uniquely resolving to the same row). A
-                        # doc_id can be stamped by at most one entry, or the
-                        # dict write below is last-wins and the CSV would
-                        # assert two writes for one actual write. The first
-                        # entry keeps its stamp; this later one is reported
-                        # (not written) so stamped == len(stamps) always.
-                        counts["ambiguous"] += 1
-                        csv_rows.append({"bank": bank, "ideas_url": ideas_url,
-                                         "action": "ambiguous", "doc_id": "",
-                                         "title": csv_title})
-                    else:
-                        counts["stamped"] += 1
-                        stamps[row["doc_id"]] = ideas_url
-                        csv_rows.append({"bank": bank, "ideas_url": ideas_url,
-                                         "action": "stamp", "doc_id": row["doc_id"],
-                                         "title": csv_title})
+                    counts["stamped"] += 1
+                    stamps[doc_id] = ideas_url
+                    csv_rows.append({"bank": bank, "ideas_url": ideas_url,
+                                     "action": "stamp", "doc_id": doc_id, "title": title})
 
         results[bank] = counts
         print(f"{bank}: {counts}")
 
-        if write and stamps:
-            for row in all_rows:
-                did = row.get("doc_id")
-                if did in stamps:
-                    row["source_url"] = stamps[did]
-            storage.rewrite_manifest(all_rows)
+        if write:
+            _apply_stamps(storage, idx["all_rows"], stamps)
 
     out = csv_path or str(cfg.reports_dir / "repec_reconcile.csv")
     cfg.reports_dir.mkdir(parents=True, exist_ok=True)
@@ -359,3 +423,251 @@ def run_repec_reconcile(bank_codes: Optional[Iterable[str]] = None,
             w.writerow(r)
     print(f"wrote {len(csv_rows)} row(s) -> {out}", file=sys.stderr)
     return results
+
+
+# ---------------------------------------------------------------------------
+# --propose / --apply-csv: human-approved reconciliation for title drift
+# (spec docs/superpowers/specs/2026-07-16-recovery-phase2-design.md §B2).
+# ---------------------------------------------------------------------------
+
+_PROPOSE_CSV_FIELDS = ("bank", "ideas_url", "repec_title", "candidate_doc_id",
+                      "candidate_title", "score", "approve")
+_APPLY_CSV_FIELDS = ("bank", "ideas_url", "doc_id", "title", "action", "skip_reason")
+
+
+def run_reconcile_propose(bank_codes: Optional[Iterable[str]] = None,
+                          csv_path: Optional[str] = None,
+                          config: Optional[Config] = None,
+                          fetcher: Optional[Fetcher] = None) -> dict[str, dict]:
+    """``--propose``: the gb-style RePEc/published title-drift cases (spec
+    §B2) cannot be matched by any stable key, and the strict cascade in
+    ``_walk_entries`` correctly refuses to guess — they surface as
+    ``unmatched``. This makes the human the key: for every ``unmatched``
+    listing entry, rank up to 3 CANDIDATE manifest rows for the same bank
+    (D1/D2, empty source_url) by ``difflib.SequenceMatcher.ratio()`` on
+    ``normalize_title`` outputs.
+
+    The similarity score is used ONLY to ORDER the proposal — this function
+    holds no ``write`` parameter, never calls ``storage.rewrite_manifest`` or
+    ``_apply_stamps``, and touches no manifest bytes: it is architecturally
+    incapable of writing. Entries whose candidate pool is empty (no eligible
+    row at all for that bank) emit ONE CSV row with empty candidate fields
+    rather than being silently dropped.
+
+    Always writes a CSV (columns: bank, ideas_url, repec_title,
+    candidate_doc_id, candidate_title, score, approve — ``approve`` left
+    EMPTY for Marc to fill in with one of ``x|yes|1|oui``). Returns
+    ``{bank: {"unmatched": n}}`` (count of unmatched listing entries seen,
+    NOT of CSV rows — an entry can contribute 0..3 rows).
+    """
+    cfg = config or Config()
+    fetcher = fetcher or Fetcher(cfg)
+    storage = Storage(cfg, fetcher)
+    codes = [c for c in (bank_codes or SERIES.keys()) if c in SERIES]
+
+    results: dict[str, dict] = {}
+    csv_rows: list[dict] = []
+
+    for bank in codes:
+        idx = _build_indexes(storage, bank)
+        bank_home = get_bank(bank).homepage
+        pool = [(row, normalize_title(row.get("title") or ""))
+                for row in idx["all_rows"]
+                if row.get("doc_type") in ("D1", "D2") and not row.get("source_url")]
+
+        n_unmatched = 0
+        for entry in _walk_entries(bank, fetcher, idx, bank_home):
+            if entry["action"] != "unmatched":
+                continue
+            n_unmatched += 1
+            repec_title = entry["title"]
+            norm_repec = normalize_title(repec_title)
+            scored = sorted(
+                ((SequenceMatcher(None, norm_repec, norm_cand).ratio(), row)
+                 for row, norm_cand in pool),
+                key=lambda pair: pair[0], reverse=True,
+            )
+            top = scored[:3]
+            if not top:
+                csv_rows.append({"bank": bank, "ideas_url": entry["ideas_url"],
+                                 "repec_title": repec_title, "candidate_doc_id": "",
+                                 "candidate_title": "", "score": "", "approve": ""})
+            else:
+                for score, row in top:
+                    csv_rows.append({"bank": bank, "ideas_url": entry["ideas_url"],
+                                     "repec_title": repec_title,
+                                     "candidate_doc_id": row["doc_id"],
+                                     "candidate_title": row.get("title") or "",
+                                     "score": round(score, 3), "approve": ""})
+        results[bank] = {"unmatched": n_unmatched}
+        print(f"{bank}: unmatched={n_unmatched}")
+
+    out = csv_path or str(cfg.reports_dir / "repec_reconcile_propose.csv")
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(_PROPOSE_CSV_FIELDS))
+        w.writeheader()
+        for r in csv_rows:
+            w.writerow(r)
+    print(f"wrote {len(csv_rows)} row(s) -> {out}", file=sys.stderr)
+    return results
+
+
+def _load_bank_state(storage: Storage, bank: str) -> dict:
+    """Live per-bank manifest snapshot for ``run_reconcile_apply``: the FULL
+    row list (needed verbatim for ``_apply_stamps``'s full-row-set rewrite),
+    a doc_id index, the set of source_urls already known BEFORE this apply
+    run, and this run's own claim sets (doc_ids stamped, ideas_urls
+    claimed) — re-enforced per approved row so every phase-1 invariant holds
+    at apply time, not just at propose time."""
+    all_rows = list(storage.iter_manifest(bank))
+    return {
+        "all_rows": all_rows,
+        "by_doc_id": {r.get("doc_id"): r for r in all_rows},
+        "known_sources": {r.get("source_url") for r in all_rows if r.get("source_url")},
+        "stamps": {},
+        "claimed_ideas_urls": set(),
+    }
+
+
+def run_reconcile_apply(apply_csv: str, write: bool = False,
+                        csv_path: Optional[str] = None,
+                        config: Optional[Config] = None,
+                        fetcher: Optional[Fetcher] = None) -> dict:
+    """``--apply-csv``: reads a ``--propose`` CSV Marc has edited and stamps
+    EXACTLY the pairs he approved. The similarity ``score`` column is never
+    read here — only ``bank``/``ideas_url``/``candidate_doc_id`` (the human's
+    decision) and ``approve`` (``x|yes|1|oui``, case/space-insensitive) drive
+    this function, so a stray high-similarity row that Marc did NOT mark can
+    never be written.
+
+    This CSV is human-edited by hand, so it is treated as UNTRUSTED input,
+    not a trusted machine artifact — every field is guarded before it can
+    influence a write:
+
+      - ``bank`` is stripped of surrounding whitespace before use (a stray
+        space must not turn a valid bank into an unknown one); if a bank
+        has NO manifest rows at all (typo, or genuinely empty), every row
+        for it still gets the accurate ``row-gone`` skip reason, but ONE
+        stderr warning (``unknown or empty bank '<x>' in apply CSV``) is
+        also printed per distinct bad bank, so a systematic mistake is
+        loud rather than silently absorbed into a pile of row-gone rows;
+      - ``ideas_url`` must start with ``f"{IDEAS}/p/"`` (the only shape a
+        real IDEAS paper page URL can take) else ``bad-ideas-url`` —
+        this also closes an idempotence hole: an EMPTY ideas_url used to
+        pass every other guard and get stamped as ``source_url=""``
+        (falsy), so a re-apply of the same CSV saw ``source_url`` still
+        "empty" and stamped again, forever — never converging;
+      - the target row's ``doc_type`` must be ``D1``/``D2`` else
+        ``bad-doc-type`` (a typo'd or hand-edited ``candidate_doc_id``
+        must never stamp a row the reconciliation scope excludes).
+
+    Every phase-1 invariant is ALSO re-validated against the LIVE manifest
+    at apply time (never trusted from the propose pass, which may be
+    stale), per approved row, in CSV order (first line wins ties — same
+    rule as phase 1's reverse-ambiguity):
+
+      - the doc_id still exists in the bank's manifest, else ``row-gone``;
+      - its ``source_url`` is still empty, else ``source-not-empty`` (also
+        what an idempotent re-apply of the same CSV hits: already stamped);
+      - the doc_id was not already stamped by an earlier approved row IN
+        THIS run, else ``duplicate-doc-id``;
+      - the ideas_url was not already claimed by an earlier approved row IN
+        THIS run, NOR already a known source_url elsewhere in the manifest
+        (a stamp from phase 1 or an earlier apply run counts too), else
+        ``duplicate-ideas-url``.
+
+    An unapproved row is reported ``not-approved`` and never touched.
+
+    The CSV is opened with ``encoding="utf-8-sig"`` so a BOM (common when a
+    spreadsheet app re-saves the propose CSV) is stripped rather than
+    corrupting the first column's header/value.
+
+    Default is dry-run (``write=False``): the report CSV still shows every
+    row that WOULD be applied/skipped (so it doubles as a preview), but
+    ``_apply_stamps``/``storage.rewrite_manifest`` is never called — the
+    manifest is byte-for-byte untouched. With ``write=True``, stamps go
+    through the shared ``_apply_stamps`` (full row set, same as phase 1)
+    once per bank touched. Returns ``{"applied": n, "skipped": n}``. Always
+    writes a report CSV (columns: bank, ideas_url, doc_id, title, action,
+    skip_reason) — ``applied`` lines in it equal actual manifest writes
+    whenever ``write=True``.
+    """
+    cfg = config or Config()
+    fetcher = fetcher or Fetcher(cfg)
+    storage = Storage(cfg, fetcher)
+
+    with open(apply_csv, newline="", encoding="utf-8-sig") as fh:
+        rows = list(csv.DictReader(fh))
+
+    counts = {"applied": 0, "skipped": 0}
+    out_rows: list[dict] = []
+    bank_states: dict[str, dict] = {}
+    warned_banks: set[str] = set()
+
+    for r in rows:
+        bank = (r.get("bank") or "").strip()
+        ideas_url = r.get("ideas_url") or ""
+        doc_id = r.get("candidate_doc_id") or ""
+        title = r.get("candidate_title") or ""
+        approve = (r.get("approve") or "").strip().lower()
+
+        if approve not in _APPROVE_TOKENS:
+            counts["skipped"] += 1
+            out_rows.append({"bank": bank, "ideas_url": ideas_url, "doc_id": doc_id,
+                             "title": title, "action": "skipped", "skip_reason": "not-approved"})
+            continue
+
+        if not ideas_url.startswith(f"{IDEAS}/p/"):
+            counts["skipped"] += 1
+            out_rows.append({"bank": bank, "ideas_url": ideas_url, "doc_id": doc_id,
+                             "title": title, "action": "skipped", "skip_reason": "bad-ideas-url"})
+            continue
+
+        state = bank_states.setdefault(bank, _load_bank_state(storage, bank))
+        if not state["all_rows"] and bank not in warned_banks:
+            warned_banks.add(bank)
+            print(f"[repec-reconcile apply] unknown or empty bank '{bank}' in apply CSV",
+                 file=sys.stderr)
+
+        row = state["by_doc_id"].get(doc_id) if doc_id else None
+
+        if row is None:
+            reason = "row-gone"
+        elif row.get("doc_type") not in ("D1", "D2"):
+            reason = "bad-doc-type"
+        elif row.get("source_url"):
+            reason = "source-not-empty"
+        elif doc_id in state["stamps"]:
+            reason = "duplicate-doc-id"
+        elif ideas_url in state["claimed_ideas_urls"] or ideas_url in state["known_sources"]:
+            reason = "duplicate-ideas-url"
+        else:
+            reason = ""
+
+        if reason:
+            counts["skipped"] += 1
+            out_rows.append({"bank": bank, "ideas_url": ideas_url, "doc_id": doc_id,
+                             "title": title, "action": "skipped", "skip_reason": reason})
+            continue
+
+        state["stamps"][doc_id] = ideas_url
+        state["claimed_ideas_urls"].add(ideas_url)
+        counts["applied"] += 1
+        out_rows.append({"bank": bank, "ideas_url": ideas_url, "doc_id": doc_id,
+                         "title": title, "action": "applied", "skip_reason": ""})
+
+    if write:
+        for bank, state in bank_states.items():
+            _apply_stamps(storage, state["all_rows"], state["stamps"])
+
+    out = csv_path or str(cfg.reports_dir / "repec_reconcile_apply.csv")
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(_APPLY_CSV_FIELDS))
+        w.writeheader()
+        for row in out_rows:
+            w.writerow(row)
+    print(f"[repec-reconcile apply] applied={counts['applied']} skipped={counts['skipped']} -> {out}",
+         file=sys.stderr)
+    return counts
