@@ -7,7 +7,8 @@ fixtures mask bugs)."""
 import json
 
 from cb_corpus.config import Config
-from cb_corpus.repec_check import run_repec_reconcile
+from cb_corpus.repec_check import (run_reconcile_apply, run_reconcile_propose,
+                                   run_repec_reconcile)
 from cb_corpus.sources.repec import IDEAS
 
 ARCH, SLUG = "boe", "boeewp"      # real gb series (SERIES["gb"] in sources/repec.py)
@@ -295,3 +296,346 @@ def test_two_listing_entries_matching_one_row_only_first_stamps(tmp_path):
 
     rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
     assert rows["j1"]["source_url"] == _paper_url("0008")   # FIRST entry wins
+
+
+# =============================================================================
+# --propose / --apply-csv: human-approved reconciliation for title drift
+# (spec docs/superpowers/specs/2026-07-16-recovery-phase2-design.md §B2).
+# =============================================================================
+
+def _write_propose_csv(path, rows):
+    import csv
+    fields = ["bank", "ideas_url", "repec_title", "candidate_doc_id",
+             "candidate_title", "score", "approve"]
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({f: r.get(f, "") for f in fields})
+
+
+# -- propose: ranking, cap at 3, UTF-8 -------------------------------------
+
+def test_propose_ranks_candidates_by_similarity_and_caps_at_three(tmp_path):
+    cfg = _cfg(tmp_path)
+    repec_title = "La Transmission De La Politique Monétaire"
+    rows = [
+        _row("c1", "La Transmission De La Politique Monétaire Française",
+            "https://www.bankofengland.co.uk/-/media/boe/files/wp/2010/c1.pdf"),
+        _row("c2", "La Transmission De La Politique Monétaire En Zone Euro",
+            "https://www.bankofengland.co.uk/-/media/boe/files/wp/2010/c2.pdf"),
+        _row("c3", "Something About Interest Rates And Growth",
+            "https://www.bankofengland.co.uk/-/media/boe/files/wp/2010/c3.pdf"),
+        _row("c4", "Completely Different Topic On Housing Markets",
+            "https://www.bankofengland.co.uk/-/media/boe/files/wp/2010/c4.pdf"),
+    ]
+    _write_manifest(cfg, "gb", rows)
+
+    # Listing title doesn't exactly match any manifest row (no cascade match,
+    # no key_handle for gb) -> unmatched; no page fetched (no `pages` entry
+    # for the paper url) so the second pass fails silently and csv_title
+    # falls back to the listing title.
+    fetcher = FakeFetcher({f"{BASE}.html": _series_html([("0010", repec_title)])})
+    csv_path = str(tmp_path / "propose.csv")
+    results = run_reconcile_propose(bank_codes=["gb"], csv_path=csv_path,
+                                    config=cfg, fetcher=fetcher)
+
+    assert results["gb"] == {"unmatched": 1}
+    proposed = _read_csv(csv_path)
+    assert len(proposed) == 3   # capped at 3, c3 (lowest score) excluded
+    assert [r["candidate_doc_id"] for r in proposed] == ["c1", "c2", "c4"]
+    assert all(r["approve"] == "" for r in proposed)
+    assert all(r["repec_title"] == repec_title for r in proposed)
+    assert all(r["ideas_url"] == _paper_url("0010") for r in proposed)
+    # scores strictly descending, rounded to 3 decimals
+    scores = [float(r["score"]) for r in proposed]
+    assert scores == sorted(scores, reverse=True)
+    assert proposed[0]["score"] == "0.891"
+    assert proposed[0]["candidate_title"] == \
+        "La Transmission De La Politique Monétaire Française"
+
+
+def test_propose_zero_candidate_entry_emits_one_row_with_empty_fields(tmp_path):
+    cfg = _cfg(tmp_path)
+    _write_manifest(cfg, "gb", [])   # empty manifest -> empty candidate pool
+
+    fetcher = FakeFetcher({f"{BASE}.html": _series_html([("0011", "Nobody Home Paper")])})
+    csv_path = str(tmp_path / "propose.csv")
+    results = run_reconcile_propose(bank_codes=["gb"], csv_path=csv_path,
+                                    config=cfg, fetcher=fetcher)
+
+    assert results["gb"] == {"unmatched": 1}
+    proposed = _read_csv(csv_path)
+    assert len(proposed) == 1
+    row = proposed[0]
+    assert row["ideas_url"] == _paper_url("0011")
+    assert row["repec_title"] == "Nobody Home Paper"
+    assert row["candidate_doc_id"] == "" and row["candidate_title"] == "" and row["score"] == ""
+    assert row["approve"] == ""
+
+
+def test_propose_writes_no_manifest_bytes(tmp_path):
+    cfg = _cfg(tmp_path)
+    rows = [_row("k1", "Some Paper Title",
+                "https://www.bankofengland.co.uk/-/media/boe/files/wp/2011/k1.pdf")]
+    manifest_path = _write_manifest(cfg, "gb", rows)
+    before = manifest_path.read_bytes()
+
+    fetcher = FakeFetcher({f"{BASE}.html": _series_html([("0012", "Totally Unrelated Title")])})
+    run_reconcile_propose(bank_codes=["gb"], csv_path=str(tmp_path / "propose.csv"),
+                          config=cfg, fetcher=fetcher)
+
+    assert manifest_path.read_bytes() == before   # byte-for-byte: zero writes, ever
+
+
+# -- apply: stamps exactly the approved pairs ------------------------------
+
+def test_apply_stamps_exactly_the_approved_pairs(tmp_path):
+    cfg = _cfg(tmp_path)
+    rows = [
+        _row("m1", "Approve Me Paper",
+            "https://www.bankofengland.co.uk/-/media/boe/files/wp/2012/m1.pdf"),
+        _row("m2", "Leave Me Alone Paper",
+            "https://www.bankofengland.co.uk/-/media/boe/files/wp/2012/m2.pdf"),
+    ]
+    manifest_path = _write_manifest(cfg, "gb", rows)
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0020"), "repec_title": "Approve Me (RePEc)",
+         "candidate_doc_id": "m1", "candidate_title": "Approve Me Paper",
+         "score": "0.9", "approve": "x"},
+        {"bank": "gb", "ideas_url": _paper_url("0021"), "repec_title": "Leave Me (RePEc)",
+         "candidate_doc_id": "m2", "candidate_title": "Leave Me Alone Paper",
+         "score": "0.9", "approve": ""},
+    ])
+
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 1, "skipped": 1}
+
+    stamped = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert stamped["m1"]["source_url"] == _paper_url("0020")
+    assert stamped["m2"]["source_url"] == ""   # untouched: not approved
+
+    report = _read_csv(str(tmp_path / "report.csv"))
+    applied_rows = [r for r in report if r["action"] == "applied"]
+    skipped_rows = [r for r in report if r["action"] == "skipped"]
+    assert len(applied_rows) == 1 and applied_rows[0]["doc_id"] == "m1"
+    assert len(skipped_rows) == 1 and skipped_rows[0]["skip_reason"] == "not-approved"
+
+
+# -- apply: every skip reason ------------------------------------------------
+
+def test_apply_skip_row_gone(tmp_path):
+    cfg = _cfg(tmp_path)
+    _write_manifest(cfg, "gb", [])   # doc_id below simply doesn't exist
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0030"), "repec_title": "Ghost Paper",
+         "candidate_doc_id": "ghost1", "candidate_title": "Ghost Paper Copy",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 0, "skipped": 1}
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["skip_reason"] == "row-gone"
+
+
+def test_apply_skip_source_not_empty(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("n1", "Already Sourced Paper",
+              "https://www.bankofengland.co.uk/-/media/boe/files/wp/2013/n1.pdf",
+              source_url="https://www.bankofengland.co.uk/working-paper/2013/n1")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0031"), "repec_title": "Already Sourced (RePEc)",
+         "candidate_doc_id": "n1", "candidate_title": "Already Sourced Paper",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 0, "skipped": 1}
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["skip_reason"] == "source-not-empty"
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["n1"]["source_url"] == \
+        "https://www.bankofengland.co.uk/working-paper/2013/n1"   # untouched
+
+
+def test_apply_skip_duplicate_doc_id_first_wins(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("o1", "One Row Two Claims",
+              "https://www.bankofengland.co.uk/-/media/boe/files/wp/2014/o1.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0040"), "repec_title": "First Claim",
+         "candidate_doc_id": "o1", "candidate_title": "One Row Two Claims",
+         "score": "0.9", "approve": "x"},
+        {"bank": "gb", "ideas_url": _paper_url("0041"), "repec_title": "Second Claim",
+         "candidate_doc_id": "o1", "candidate_title": "One Row Two Claims",
+         "score": "0.8", "approve": "yes"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 1, "skipped": 1}
+
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["action"] == "applied" and report[0]["ideas_url"] == _paper_url("0040")
+    assert report[1]["action"] == "skipped" and report[1]["skip_reason"] == "duplicate-doc-id"
+
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["o1"]["source_url"] == _paper_url("0040")   # FIRST claim wins
+
+
+def test_apply_skip_duplicate_ideas_url_first_wins(tmp_path):
+    cfg = _cfg(tmp_path)
+    rows = [
+        _row("p1", "Row P1", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2015/p1.pdf"),
+        _row("p2", "Row P2", "https://www.bankofengland.co.uk/-/media/boe/files/wp/2015/p2.pdf"),
+    ]
+    _write_manifest(cfg, "gb", rows)
+
+    same_ideas_url = _paper_url("0050")
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": same_ideas_url, "repec_title": "Shared RePEc Entry",
+         "candidate_doc_id": "p1", "candidate_title": "Row P1",
+         "score": "0.9", "approve": "x"},
+        {"bank": "gb", "ideas_url": same_ideas_url, "repec_title": "Shared RePEc Entry",
+         "candidate_doc_id": "p2", "candidate_title": "Row P2",
+         "score": "0.8", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 1, "skipped": 1}
+
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["action"] == "applied" and report[0]["doc_id"] == "p1"
+    assert report[1]["action"] == "skipped" and report[1]["skip_reason"] == "duplicate-ideas-url"
+
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["p1"]["source_url"] == same_ideas_url
+    assert rows["p2"]["source_url"] == ""   # second claim never written
+
+
+def test_apply_skip_already_known_ideas_url_from_a_prior_stamp(tmp_path):
+    """An ideas_url already used as a DIFFERENT row's source_url from BEFORE
+    this apply run (e.g. an earlier phase-1 or apply-csv pass) must also be
+    refused -- same accurate reason (duplicate-ideas-url), even though the
+    duplication isn't within this CSV."""
+    cfg = _cfg(tmp_path)
+    already_claimed_url = _paper_url("0060")
+    rows = [
+        _row("q1", "Already Stamped Elsewhere",
+            "https://www.bankofengland.co.uk/-/media/boe/files/wp/2016/q1.pdf",
+            source_url=already_claimed_url),
+        _row("q2", "New Candidate Row",
+            "https://www.bankofengland.co.uk/-/media/boe/files/wp/2016/q2.pdf"),
+    ]
+    _write_manifest(cfg, "gb", rows)
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": already_claimed_url, "repec_title": "Reused RePEc Entry",
+         "candidate_doc_id": "q2", "candidate_title": "New Candidate Row",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 0, "skipped": 1}
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["skip_reason"] == "duplicate-ideas-url"
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    assert rows["q2"]["source_url"] == ""
+
+
+def test_apply_not_approved_tokens_case_and_space_insensitive(tmp_path):
+    cfg = _cfg(tmp_path)
+    rows = [_row(f"r{i}", f"Row {i}",
+                f"https://www.bankofengland.co.uk/-/media/boe/files/wp/2017/r{i}.pdf")
+           for i in range(1, 6)]
+    _write_manifest(cfg, "gb", rows)
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0070"), "repec_title": "t",
+         "candidate_doc_id": "r1", "candidate_title": "Row 1", "score": "0.9", "approve": " X "},
+        {"bank": "gb", "ideas_url": _paper_url("0071"), "repec_title": "t",
+         "candidate_doc_id": "r2", "candidate_title": "Row 2", "score": "0.9", "approve": "Yes"},
+        {"bank": "gb", "ideas_url": _paper_url("0072"), "repec_title": "t",
+         "candidate_doc_id": "r3", "candidate_title": "Row 3", "score": "0.9", "approve": "OUI"},
+        {"bank": "gb", "ideas_url": _paper_url("0073"), "repec_title": "t",
+         "candidate_doc_id": "r4", "candidate_title": "Row 4", "score": "0.9", "approve": "1"},
+        {"bank": "gb", "ideas_url": _paper_url("0074"), "repec_title": "t",
+         "candidate_doc_id": "r5", "candidate_title": "Row 5", "score": "0.9", "approve": "no"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 4, "skipped": 1}
+    rows = {r["doc_id"]: r for r in _read_rows(cfg, "gb")}
+    for i in range(1, 5):
+        assert rows[f"r{i}"]["source_url"] == _paper_url(f"007{i - 1}")
+    assert rows["r5"]["source_url"] == ""
+
+
+# -- apply: dry-run purity and idempotence -----------------------------------
+
+def test_apply_without_write_touches_nothing(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("s1", "Dry Run Candidate",
+              "https://www.bankofengland.co.uk/-/media/boe/files/wp/2018/s1.pdf")
+    manifest_path = _write_manifest(cfg, "gb", [row])
+    before = manifest_path.read_bytes()
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0080"), "repec_title": "Dry Run RePEc",
+         "candidate_doc_id": "s1", "candidate_title": "Dry Run Candidate",
+         "score": "0.9", "approve": "x"},
+    ])
+    counts = run_reconcile_apply(str(apply_csv), write=False,
+                                 csv_path=str(tmp_path / "report.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert counts == {"applied": 1, "skipped": 0}   # report says it WOULD apply...
+    assert manifest_path.read_bytes() == before      # ...but nothing is touched
+    report = _read_csv(str(tmp_path / "report.csv"))
+    assert report[0]["action"] == "applied"
+
+
+def test_apply_idempotent_reapply_is_all_already_ish_skips(tmp_path):
+    cfg = _cfg(tmp_path)
+    row = _row("t1", "Idempotent Apply Candidate",
+              "https://www.bankofengland.co.uk/-/media/boe/files/wp/2019/t1.pdf")
+    _write_manifest(cfg, "gb", [row])
+
+    apply_csv = tmp_path / "apply.csv"
+    _write_propose_csv(apply_csv, [
+        {"bank": "gb", "ideas_url": _paper_url("0090"), "repec_title": "Idempotent RePEc",
+         "candidate_doc_id": "t1", "candidate_title": "Idempotent Apply Candidate",
+         "score": "0.9", "approve": "x"},
+    ])
+    first = run_reconcile_apply(str(apply_csv), write=True,
+                                csv_path=str(tmp_path / "report1.csv"),
+                                config=cfg, fetcher=FakeFetcher({}))
+    assert first == {"applied": 1, "skipped": 0}
+
+    second = run_reconcile_apply(str(apply_csv), write=True,
+                                 csv_path=str(tmp_path / "report2.csv"),
+                                 config=cfg, fetcher=FakeFetcher({}))
+    assert second == {"applied": 0, "skipped": 1}
+    report2 = _read_csv(str(tmp_path / "report2.csv"))
+    assert report2[0]["skip_reason"] == "source-not-empty"
