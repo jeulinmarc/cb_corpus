@@ -148,6 +148,16 @@ def main(argv: list[str] | None = None) -> int:
     rr.add_argument("--write", action="store_true")
     rr.add_argument("--csv", default="", help="CSV output path (default data/reports/repec_reconcile.csv)")
 
+    rdl = sub.add_parser("recover-downloads",
+                        help="Inventory-driven Wayback recovery for documents that "
+                             "failed every prior download attempt "
+                             "(data/download_errors.jsonl). Default dry-run (CSV "
+                             "classification only); --download saves recoverable ones.")
+    rdl.add_argument("--banks", default="")
+    rdl.add_argument("--download", action="store_true",
+                     help="actually save recoverable documents (default: dry-run report)")
+    rdl.add_argument("--csv", default="", help="CSV output path (default data/reports/recover_downloads.csv)")
+
     args = p.parse_args(argv)
     banks = _banks(getattr(args, "banks", ""))
 
@@ -241,6 +251,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "repec-reconcile":
         from .repec_check import run_repec_reconcile
         run_repec_reconcile(bank_codes=banks, write=args.write, csv_path=args.csv or None)
+        return 0
+
+    if args.cmd == "recover-downloads":
+        from .recover import run_recover_downloads
+        results = run_recover_downloads(bank_codes=banks, download=args.download,
+                                        csv_path=args.csv or None)
+        for code, counts in results.items():
+            print(f"{code}: {counts}")
         return 0
     return 1
 
