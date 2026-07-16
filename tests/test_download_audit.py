@@ -55,3 +55,37 @@ def test_successful_saves_write_no_audit_line(tmp_path):
     counts = st.save_many([_rec()], dry_run=False, label="repec:gb")
     assert counts.get("error") is None
     assert not (tmp_path / "download_errors.jsonl").exists()
+
+
+def test_save_many_isolates_audit_write_failure_from_the_batch(tmp_path, monkeypatch):
+    """save_many wraps `_record_download_error` in a bare try/except so an
+    audit-write failure (e.g. a read-only data_dir, or the raise forced here)
+    can never break the crawl. That guard was untested — a mutation removing
+    the try/except (or swallowing the WRONG exception) would previously pass
+    every other test. Two-record batch: record 1 fails download AND fails to
+    audit that failure; record 2 must still be processed and saved."""
+    class _MixedFetcher:
+        def get_bytes(self, url):
+            if "dead" in url:
+                raise RuntimeError("HTTP 404: gone")
+            return b"%PDF-fake", "application/pdf"
+
+    (tmp_path / "manifest").mkdir(parents=True)
+    st = Storage(Config(data_dir=tmp_path), _MixedFetcher())
+
+    def _boom(self, rec, exc, label):
+        raise OSError("audit write failed (read-only data_dir)")
+    monkeypatch.setattr(Storage, "_record_download_error", _boom)
+
+    recs = [
+        _rec(pdf_url="https://x.test/dead.pdf",
+             source_url="https://ideas.test/p/1.html"),
+        _rec(pdf_url="https://x.test/alive.pdf",
+             source_url="https://ideas.test/p/2.html"),
+    ]
+    counts = st.save_many(recs, dry_run=False, label="repec:gb")
+    assert counts == {"error": 1, "saved": 1}
+    # The audit write itself failed, so (unlike test_failed_download_writes_
+    # one_audit_line) no line is persisted here — but the failure must not be
+    # mistaken for "nothing went wrong", and it must not abort the batch.
+    assert not (tmp_path / "download_errors.jsonl").exists()

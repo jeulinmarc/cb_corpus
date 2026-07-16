@@ -246,4 +246,32 @@ grep -q "FAILED \[sync\]" "$D/reports/last_run_status" || fail "invalid-window s
 if [ -f "$PY_LOG" ] && grep -q PYARGS "$PY_LOG"; then fail "python must not run with malformed SYNC_WINDOW_DAYS"; fi
 unset DISCOVER_BANKS SYNC_WINDOW_DAYS
 
+# T15 — autocommit failure: the AUTOCOMMIT_BIN stub exits 1, but that must
+# NOT downgrade the job — sync still exits 0, "AUTOCOMMIT FAILED (local state
+# intact" is logged, and last_run_status keeps the OK verdict (the audit-flagged
+# `|| log "AUTOCOMMIT FAILED..."` branch was never exercised).
+newdir; export AUTOCOMMIT=1 DISCOVER_BANKS="us"
+cat > "$D/ac_fail.sh" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+chmod +x "$D/ac_fail.sh"; export AUTOCOMMIT_BIN="$D/ac_fail.sh"
+/app/deploy/run-job.sh sync || fail "autocommit failure must not fail sync (exit 0 expected)"
+grep -q "AUTOCOMMIT FAILED (local state intact" "$D/reports/nas_runs.log" \
+  || fail "autocommit failure branch not logged"
+grep -q "OK 1/1 \[sync\]" "$D/reports/last_run_status" \
+  || fail "status must keep the OK verdict despite autocommit failure"
+unset AUTOCOMMIT_BIN DISCOVER_BANKS; export AUTOCOMMIT=0
+
+# T16 — campaign non-zero rc propagates: the wrapper's exit code must equal
+# python's rc, and last_run_status must log FAILED [campaign] rc=<n>.
+newdir; export PY_EXIT=1
+set +e
+/app/deploy/run-job.sh campaign discover --banks fr --native-only --download
+RC=$?
+set -e
+[ "$RC" -eq 1 ] || fail "campaign exit code must equal python's rc (got $RC)"
+grep -q "FAILED \[campaign\] rc=1" "$D/reports/last_run_status" || fail "FAILED [campaign] status missing"
+unset PY_EXIT
+
 echo "RUN_JOB_OK"
