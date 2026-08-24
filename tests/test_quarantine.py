@@ -255,6 +255,46 @@ def test_latest_line_per_url_wins_on_reload(tmp_path):
     assert q3.is_quarantined(url) is True
 
 
+# --- seed() (recover-quarantine design §4: seed final unrecoverables) --------
+
+def test_seed_immediately_quarantines_without_night_history(tmp_path):
+    q = _mk(tmp_path)
+    url = "https://x.test/confirmed-dead.pdf"
+    q.seed(url, "hunt exhausted: wayback + bank site + mirrors all checked")
+    assert q.is_quarantined(url) is True
+
+    path = tmp_path / "download_quarantine.jsonl"
+    row = json.loads(path.read_text().splitlines()[0])
+    assert row == {
+        "url": url,
+        "seeded": "hunt exhausted: wayback + bank site + mirrors all checked",
+        "quarantined": True,
+    }
+
+
+def test_seed_survives_reload_and_raising_threshold(tmp_path, monkeypatch):
+    """A seeded URL stays quarantined on a fresh instance, and raising
+    QUARANTINE_AFTER_NIGHTS afterwards must NOT un-quarantine it (it has no
+    night-count history to compare against a threshold)."""
+    q = _mk(tmp_path)
+    url = "https://x.test/confirmed-dead.pdf"
+    q.seed(url, "unrecoverable")
+
+    monkeypatch.setenv("QUARANTINE_AFTER_NIGHTS", "50")
+    q2 = _mk(tmp_path)
+    assert q2.is_quarantined(url) is True
+
+
+def test_seed_then_record_success_releases_it(tmp_path):
+    q = _mk(tmp_path)
+    url = "https://x.test/confirmed-dead.pdf"
+    q.seed(url, "unrecoverable")
+    assert q.is_quarantined(url) is True
+
+    q.record_success(url)
+    assert q.is_quarantined(url) is False
+
+
 # --- corrupt/torn line tolerance ----------------------------------------------
 
 def test_corrupt_line_is_skipped_with_a_single_warning(tmp_path, capsys):

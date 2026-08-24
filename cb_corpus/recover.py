@@ -26,11 +26,27 @@ hash-match a doc already in the corpus, or the doc_id was already indexed),
 the entry is reported ``duplicate`` -- there is nothing left to recover,
 so it is never relabelled ``recoverable`` (which would just re-download the
 same duplicate PDF every run).
+
+``--candidates <path>`` switches to a SEPARATE, candidates-only mode (no CDX
+walk at all): each JSONL line is an EXTERNALLY-recovered file (hunted by hand
+via Wayback / the bank's current site / a legitimate mirror --
+recover-quarantine design decision 1/2) --
+``{dead_pdf_url, file_path, recovered_from: wayback|bank_site|mirror,
+final_url, title?}``. The audit entry is matched by ``dead_pdf_url`` (an
+entry with no match is reported ``unknown-entry``, never guessed at); the
+already-downloaded local file is verified (``%PDF`` magic, >20KB) before
+anything is registered (``bad-file`` otherwise); the resulting ``DocRecord``
+follows the provenance rules per ``recovered_from`` (decision 2). Because the
+bytes already exist locally, this mode registers them via
+``Storage.reindex`` (copy to ``Storage.target_path`` + index, sha256 dedup)
+instead of ``Storage.save`` (no network fetch) -- same storage discipline,
+never bypassed.
 """
 from __future__ import annotations
 
 import csv
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Iterable, Optional
@@ -39,6 +55,7 @@ from .banks import get_bank
 from .config import Config
 from .http import Fetcher
 from .models import DocRecord
+from .quarantine import Quarantine
 from .sources.repec import IDEAS, _paper_meta, extract_pdf_candidates
 from .sources.wayback import latest_capture, raw_url
 from .storage import Storage
@@ -46,6 +63,12 @@ from .taxonomy import by_code
 
 _ACTIONS = ("recoverable", "recovered", "duplicate", "unrecoverable", "converged")
 _CSV_FIELDS = ("bank", "pdf_url", "action", "snapshot_ts", "title")
+
+# --candidates local-file verification: reject anything too small to
+# plausibly be a real working paper (a truncated download, an HTML error
+# page saved with a .pdf extension, etc).
+_MIN_CANDIDATE_PDF_BYTES = 20 * 1024
+_PDF_MAGIC = b"%PDF"
 
 
 def _read_inventory(cfg: Config,
@@ -137,11 +160,206 @@ def _find_snapshot(fetcher: Fetcher, pdf_url: str,
     return None, None
 
 
+def _read_candidates(path: str) -> list[dict]:
+    """Read a ``--candidates`` JSONL file: one externally-recovered doc per
+    line. No dedup here (unlike ``_read_inventory``) -- each line is its own
+    recovery decision, matched independently below."""
+    out: list[dict] = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            out.append(json.loads(line))
+    return out
+
+
+def _verify_local_pdf(path: Path) -> bool:
+    """True iff ``path`` exists, starts with the ``%PDF`` magic, and is
+    bigger than ``_MIN_CANDIDATE_PDF_BYTES`` -- the honesty check before an
+    externally-hunted file is ever registered into the corpus (recover-
+    quarantine design: verified local PDF)."""
+    try:
+        if not path.is_file():
+            return False
+        if path.stat().st_size <= _MIN_CANDIDATE_PDF_BYTES:
+            return False
+        with path.open("rb") as fh:
+            head = fh.read(len(_PDF_MAGIC))
+    except OSError:
+        return False
+    return head == _PDF_MAGIC
+
+
+def _apply_seed_quarantine(quarantine: Quarantine, path: str) -> int:
+    """Apply a ``--seed-quarantine`` JSONL file (``{url, reason?}`` per
+    line) -- for the docs that remain unrecoverable after the manual hunt,
+    so the nightly sync stops re-hammering them immediately (recover-
+    quarantine design §3/§4). Returns the number of lines applied; a
+    missing/blank ``url`` is skipped, never crashes the pass."""
+    n = 0
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            url = row.get("url")
+            if not url:
+                continue
+            quarantine.seed(url, row.get("reason") or "")
+            n += 1
+    return n
+
+
+def _candidate_provenance(dead_url: str, final_url: str,
+                          recovered_from: str) -> Optional[tuple[str, str, list[str]]]:
+    """(pdf_url, provenance, alt_urls) per the recover-quarantine design's
+    provenance rules (decision 2), or ``None`` for an unrecognised
+    ``recovered_from`` value (never guessed at)."""
+    if recovered_from == "wayback":
+        # Snapshot recovery: pdf_url stays the original official URL
+        # (citation + stable doc_id), the Wayback copy is the alt fallback.
+        return dead_url, "wayback", ([final_url] if final_url else [])
+    if recovered_from == "bank_site":
+        # The paper moved to a new live URL -- pdf_url points at reality,
+        # the old dead URL is kept as an alt for provenance/citation history.
+        return final_url, "bank_site", ([dead_url] if dead_url else [])
+    if recovered_from == "mirror":
+        # Legitimate mirror/co-publication: pdf_url is still the WP's own
+        # identity (the official URL), the mirror is only an alt copy.
+        return dead_url, "mirror", ([final_url] if final_url else [])
+    return None
+
+
+def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
+                         candidates_path: str, bank_codes: Optional[Iterable[str]],
+                         download: bool) -> tuple[dict[str, dict], list[dict]]:
+    """The ``--candidates`` mode of ``run_recover_downloads`` -- see the
+    module docstring. No CDX walk: every candidate's fate is decided from
+    the audit entry it matches (by ``dead_pdf_url``) plus the already-
+    downloaded local file."""
+    entries = _read_inventory(cfg, bank_codes)
+    by_url = {e["pdf_url"]: e for e in entries if e.get("pdf_url")}
+
+    results: dict[str, dict] = {}
+    csv_rows: list[dict] = []
+
+    def _bump(bank: str, action: str) -> dict:
+        summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
+        summary[action] = summary.get(action, 0) + 1
+        return summary
+
+    for cand in _read_candidates(candidates_path):
+        dead_url = cand.get("dead_pdf_url") or ""
+        entry = by_url.get(dead_url)
+
+        if entry is None:
+            _bump("_unknown", "unknown-entry")
+            csv_rows.append({"bank": "_unknown", "pdf_url": dead_url,
+                             "action": "unknown-entry", "snapshot_ts": "",
+                             "title": cand.get("title") or ""})
+            continue
+
+        bank = entry.get("bank_code") or "_unknown"
+        fallback_title = entry.get("title") or cand.get("title") or ""
+
+        file_path = Path(cand.get("file_path") or "")
+        if not _verify_local_pdf(file_path):
+            _bump(bank, "bad-file")
+            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-file",
+                             "snapshot_ts": "", "title": fallback_title})
+            continue
+
+        doc_type = None
+        try:
+            doc_type = by_code(entry.get("doc_type") or "")
+        except KeyError:
+            pass
+        if doc_type is None:
+            _bump(bank, "bad-doc-type")
+            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-doc-type",
+                             "snapshot_ts": "", "title": fallback_title})
+            continue
+
+        final_url = cand.get("final_url") or ""
+        provenance_result = _candidate_provenance(dead_url, final_url,
+                                                   cand.get("recovered_from") or "")
+        if provenance_result is None:
+            _bump(bank, "bad-provenance")
+            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-provenance",
+                             "snapshot_ts": "", "title": fallback_title})
+            continue
+        pdf_url, provenance, alt_urls = provenance_result
+
+        # Refresh title/date from the IDEAS source page exactly as the
+        # inventory-driven path does; a candidate-supplied title (if any) is
+        # a better fallback than the (possibly stale) audit-entry title when
+        # the IDEAS refresh itself fails.
+        entry_for_refresh = dict(entry)
+        if cand.get("title"):
+            entry_for_refresh["title"] = cand["title"]
+        title, rec_date, date_precision, date_source, _cands = _refresh_metadata(
+            fetcher, entry_for_refresh)
+
+        if provenance == "wayback" and not date_source:
+            # No repec date recovered -- honestly attribute whatever date
+            # metadata we do have (possibly none) to the wayback hunt itself,
+            # never leaving the DocRecord default ("bank_site") standing in
+            # for a document that was NOT found on the bank's own site.
+            date_source = "wayback"
+
+        rec = DocRecord(
+            bank_code=bank, doc_type=doc_type, title=title,
+            pdf_url=pdf_url, alt_urls=alt_urls,
+            source_url=entry.get("source_url") or "",
+            date=rec_date, provenance=provenance,
+            mime_type="application/pdf",
+        )
+        if date_precision:
+            rec.date_precision = date_precision
+        if date_source:
+            rec.date_source = date_source
+
+        _bump(bank, "recoverable")
+        action = "recoverable"
+
+        if download:
+            dest = storage.target_path(rec)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file_path, dest)
+            status = storage.reindex(rec, dest)
+            if status == "reindexed":
+                _bump(bank, "recovered")
+                action = "recovered"
+            elif status.startswith("skip:"):
+                # No orphan bytes: the file was copied into the corpus layout
+                # in anticipation of being indexed, but wasn't -- remove it.
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                if status in ("skip:already-indexed", "skip:duplicate-content"):
+                    _bump(bank, "duplicate")
+                    action = "duplicate"
+                else:
+                    summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
+                    summary[status] = summary.get(status, 0) + 1
+                    action = status
+
+        csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": action,
+                         "snapshot_ts": "", "title": title})
+
+    return results, csv_rows
+
+
 def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                           download: bool = False,
                           csv_path: Optional[str] = None,
                           config: Optional[Config] = None,
-                          fetcher: Optional[Fetcher] = None) -> dict[str, dict]:
+                          fetcher: Optional[Fetcher] = None,
+                          candidates: Optional[str] = None,
+                          seed_quarantine: Optional[str] = None) -> dict[str, dict]:
     """Drive the full recover-downloads pass. Dry-run by default: only the CSV
     is written, nothing is downloaded or saved (``--download`` opt-in mirrors
     the rest of the corpus's discovery commands). Returns
@@ -161,10 +379,35 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     didn't happen (a failed ``--download`` save stays ``recoverable``, not
     ``recovered``; its failure lands in ``download_errors.jsonl`` like any
     other, via the audit path).
+
+    ``candidates`` switches to the ``--candidates`` mode (see the module
+    docstring): the CDX walk below is skipped ENTIRELY, replaced by
+    :func:`_run_candidates_pass`. ``seed_quarantine``, independent of that
+    switch, applies a ``--seed-quarantine`` file (:func:`_apply_seed_quarantine`)
+    before the pass runs -- it may be combined with either mode, or used
+    alone (a ``download_errors.jsonl``-only run with no candidates).
     """
     cfg = config or Config()
     fetcher = fetcher or Fetcher(cfg)
     storage = Storage(cfg, fetcher)
+
+    if seed_quarantine:
+        n = _apply_seed_quarantine(storage.quarantine, seed_quarantine)
+        print(f"[recover] seeded {n} url(s) into quarantine from {seed_quarantine}",
+              file=sys.stderr, flush=True)
+
+    if candidates:
+        results, csv_rows = _run_candidates_pass(cfg, storage, fetcher, candidates,
+                                                  bank_codes, download)
+        out = csv_path or str(cfg.reports_dir / "recover_downloads.csv")
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(_CSV_FIELDS))
+            w.writeheader()
+            for row in csv_rows:
+                w.writerow(row)
+        print(f"[recover] wrote {len(csv_rows)} row(s) -> {out}", file=sys.stderr, flush=True)
+        return results
 
     entries = _read_inventory(cfg, bank_codes)
     results: dict[str, dict] = {}

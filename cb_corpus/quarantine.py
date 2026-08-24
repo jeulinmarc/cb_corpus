@@ -95,6 +95,12 @@ class Quarantine:
             if row.get("released"):
                 self._state.pop(url, None)
                 continue
+            if "seeded" in row:
+                # A seeded row is unconditionally quarantined (see seed())
+                # independent of the night-count threshold -- no synthetic
+                # nights list to replay.
+                self._state[url] = {"nights": [], "seeded": True}
+                continue
             self._state[url] = {"nights": list(row.get("nights") or [])}
 
     def _append(self, row: dict) -> None:
@@ -121,7 +127,9 @@ class Quarantine:
         a skip.
         """
         state = self._state.get(url)
-        if not state or len(state["nights"]) < _threshold():
+        if not state:
+            return False
+        if not state.get("seeded") and len(state["nights"]) < _threshold():
             return False
         if os.environ.get("QUARANTINE_RETRY") == "1":
             return False
@@ -159,6 +167,22 @@ class Quarantine:
             return
         self._state.pop(url, None)
         self._append({"url": url, "released": True})
+
+    def seed(self, url: str, reason: str = "") -> None:
+        """Seed `url` as ALREADY quarantined, for a document confirmed
+        unrecoverable after a manual hunt (recover-quarantine design §4) --
+        the nightly sync must stop re-hammering it immediately, without
+        waiting to accumulate `QUARANTINE_AFTER_NIGHTS` worth of synthetic
+        failures first (that would misrepresent the actual failure history:
+        it never really failed that many DISTINCT nights, a human just
+        confirmed it dead). Writes one line
+        `{"url": url, "seeded": reason, "quarantined": True}` -- honest
+        history, distinct from a real night-count row. The "seeded" marker
+        is unconditionally quarantined (independent of the night-count
+        threshold, so raising QUARANTINE_AFTER_NIGHTS later never
+        un-quarantines it) until a `record_success` release."""
+        self._state[url] = {"nights": [], "seeded": True}
+        self._append({"url": url, "seeded": reason, "quarantined": True})
 
     def skipped_count(self) -> int:
         """Number of is_quarantined() calls THIS RUN that returned True —
