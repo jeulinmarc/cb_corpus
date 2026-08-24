@@ -148,11 +148,14 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     ``{bank_code: {"recoverable": n, "recovered": n, "duplicate": n,
     "unrecoverable": n, "converged": n}}`` -- ``recovered`` only counts
     entries actually saved in ``--download`` mode; ``duplicate`` counts
-    entries whose ``storage.save()`` came back ``skip:*`` (the snapshot's
-    bytes hash-match a doc already in the corpus, or the doc_id was already
-    indexed) -- nothing left to recover, so the CSV action is honestly
-    ``duplicate``, not ``recoverable`` (which would keep re-downloading the
-    full PDF every run for no gain). A CSV report (``{bank, pdf_url, action,
+    ONLY the two exact dedup statuses (``skip:already-indexed``,
+    ``skip:duplicate-content``) -- nothing left to recover there, so the CSV
+    action is honestly ``duplicate``, not ``recoverable`` (which would keep
+    re-downloading the full PDF every run for no gain); any OTHER ``skip:*``
+    status is reported verbatim as the CSV action, never mislabeled --
+    recovery saves run with ``bypass_quarantine=True`` precisely so the
+    quarantine gate (fed by the same ``download_errors.jsonl`` inventory)
+    cannot silently block them. A CSV report (``{bank, pdf_url, action,
     snapshot_ts, title}``) is written in both modes so a dry-run's
     classification is never lost, and a CSV line never claims an action that
     didn't happen (a failed ``--download`` save stays ``recoverable``, not
