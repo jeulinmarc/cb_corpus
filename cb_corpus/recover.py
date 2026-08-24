@@ -213,7 +213,15 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                 if date_source:
                     rec.date_source = date_source
                 try:
-                    status = storage.save(rec)
+                    # bypass_quarantine=True: this whole inventory comes FROM
+                    # download_errors.jsonl, the same file that feeds the
+                    # quarantine counter, so by the time recovery runs its own
+                    # targets are typically already quarantined -- without the
+                    # bypass, save() would short-circuit to "skip:quarantined"
+                    # before ever trying the Wayback snapshot alt_url, and that
+                    # skip would silently fall into the "duplicate" bucket below
+                    # (a lie: nothing was actually deduplicated).
+                    status = storage.save(rec, bypass_quarantine=True)
                 except Exception as exc:  # noqa: BLE001 - audited below, never aborts the pass
                     status = "error"
                     try:
@@ -223,7 +231,7 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                 if status == "saved":
                     summary["recovered"] += 1
                     action = "recovered"
-                elif status.startswith("skip:"):
+                elif status in ("skip:already-indexed", "skip:duplicate-content"):
                     # Bytes hash-matched an existing doc (skip:duplicate-content)
                     # or the doc_id was already indexed (skip:already-indexed):
                     # either way there is nothing left to recover here. Reporting
@@ -232,6 +240,13 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                     # run just to discover the same duplicate again.
                     summary["duplicate"] += 1
                     action = "duplicate"
+                elif status.startswith("skip:"):
+                    # Any OTHER skip:* (e.g. a future status we don't special-
+                    # case here) is reported VERBATIM, never mislabeled as
+                    # "duplicate" -- an honest description of what save() said,
+                    # even if unanticipated.
+                    summary[status] = summary.get(status, 0) + 1
+                    action = status
 
         csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": action,
                          "snapshot_ts": ts, "title": title})

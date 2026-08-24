@@ -177,3 +177,87 @@ def test_save_many_prints_no_summary_when_nothing_was_skipped(tmp_path, capsys):
 
     err = capsys.readouterr().err
     assert "quarantine" not in err
+
+
+# --- bypass_quarantine: recovery flows must not be blocked by their own -----
+# quarantine (task 2b: download_errors.jsonl feeds BOTH quarantine counting
+# AND recover-downloads' inventory, so by the time recovery runs its own
+# targets are typically quarantined -- save() must offer a way past the gate).
+
+def test_bypass_quarantine_lets_save_proceed_and_leaves_the_gate_state_untouched(tmp_path):
+    """bypass_quarantine=True skips the is_quarantined() consult entirely (the
+    gate itself is never touched -- skipped_count stays 0), letting the real
+    fetch happen even though the URL is actively quarantined. A subsequent
+    success still releases the quarantine, same as any other successful save."""
+    url = "https://x.test/dead.pdf"
+    _seed_quarantine(tmp_path, url,
+                      ["2026-08-19", "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23"])
+    fetcher = _OkFetcher()
+    st = _mk_storage(tmp_path, fetcher)
+
+    status = st.save(_rec(pdf_url=url), dry_run=False, bypass_quarantine=True)
+
+    assert status == "saved"
+    assert fetcher.calls == [url]              # bypass let it through to the real fetch
+    assert st.quarantine.skipped_count() == 0  # the gate itself was never consulted
+    lines = (tmp_path / "download_quarantine.jsonl").read_text().splitlines()
+    assert json.loads(lines[-1]) == {"url": url, "released": True}
+
+
+def test_bypass_quarantine_false_by_default_still_short_circuits(tmp_path):
+    """Sanity: the new keyword-only parameter defaults to False, so every
+    existing call site (the normal nightly save() path) keeps the quarantine
+    gate as the default behaviour."""
+    url = "https://x.test/dead.pdf"
+    _seed_quarantine(tmp_path, url,
+                      ["2026-08-19", "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23"])
+    fetcher = _BoomFetcher()
+    st = _mk_storage(tmp_path, fetcher)
+
+    status = st.save(_rec(pdf_url=url), dry_run=False)
+
+    assert status == "skip:quarantined"
+    assert fetcher.calls == []
+
+
+# --- reindex releases quarantine on success ----------------------------------
+
+def test_reindex_success_releases_quarantine_so_a_fresh_load_sees_it_clear(tmp_path):
+    """An externally-recovered doc registered via reindex() (no fetch at all)
+    must release the URL's quarantine too -- otherwise the nightly sync would
+    keep the URL quarantined forever even though the corpus now has it."""
+    url = "https://x.test/dead.pdf"
+    _seed_quarantine(tmp_path, url,
+                      ["2026-08-19", "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23"])
+    st = _mk_storage(tmp_path, _BoomFetcher())
+    file_path = tmp_path / "found.pdf"
+    file_path.write_bytes(b"%PDF-fake-content")
+
+    status = st.reindex(_rec(pdf_url=url), file_path, dry_run=False)
+
+    assert status == "reindexed"
+    lines = (tmp_path / "download_quarantine.jsonl").read_text().splitlines()
+    assert json.loads(lines[-1]) == {"url": url, "released": True}
+
+    # A fresh Storage/Quarantine loading this state must see the url as clear.
+    st2 = _mk_storage(tmp_path, _BoomFetcher())
+    assert st2.quarantine.is_quarantined(url) is False
+
+
+def test_reindex_skip_already_indexed_does_not_touch_quarantine(tmp_path):
+    """A no-op reindex (doc_id already known) must not call record_success --
+    only an ACTUAL 'reindexed' success releases the quarantine."""
+    url = "https://x.test/dead.pdf"
+    _seed_quarantine(tmp_path, url, ["2026-08-22"], quarantined=False)
+    q_path = tmp_path / "download_quarantine.jsonl"
+    before = q_path.read_text()
+    st = _mk_storage(tmp_path, _BoomFetcher())
+    file_path = tmp_path / "found.pdf"
+    file_path.write_bytes(b"%PDF-fake-content")
+    rec = _rec(pdf_url=url)
+    st._ids.add(rec.doc_id)  # simulate already-indexed
+
+    status = st.reindex(rec, file_path, dry_run=False)
+
+    assert status == "skip:already-indexed"
+    assert q_path.read_text() == before  # untouched: no release tombstone appended

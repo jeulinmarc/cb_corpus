@@ -357,12 +357,20 @@ class Storage:
                 / str(year) / f"{rec.doc_id}.{ext}")
 
     # -- download --------------------------------------------------------
-    def save(self, rec: DocRecord, *, dry_run: bool = False) -> str:
+    def save(self, rec: DocRecord, *, dry_run: bool = False,
+             bypass_quarantine: bool = False) -> str:
         # Consult the quarantine BEFORE any network activity — a URL that has
         # failed QUARANTINE_AFTER_NIGHTS distinct nights running is skipped by
         # the bounded (Mon-Sat) sync entirely (Sunday full sweep bypasses via
-        # QUARANTINE_RETRY=1, handled inside is_quarantined()).
-        if self.quarantine.is_quarantined(rec.pdf_url):
+        # QUARANTINE_RETRY=1, handled inside is_quarantined()). `bypass_quarantine`
+        # is for recovery flows (recover-downloads --download): their whole
+        # inventory comes FROM download_errors.jsonl, the same file that feeds
+        # the quarantine counter, so by the time recovery runs its own targets
+        # are typically already quarantined. When True, is_quarantined() is not
+        # even called — the gate's state (skipped_count, on-disk file) is left
+        # completely untouched by the bypass itself; a subsequent success still
+        # releases the quarantine normally via record_success() below.
+        if not bypass_quarantine and self.quarantine.is_quarantined(rec.pdf_url):
             return "skip:quarantined"
         if rec.doc_id in self._ids:
             return "skip:already-indexed"
@@ -484,6 +492,11 @@ class Storage:
         if rec.source_url:
             self._source_urls.add(rec.source_url)
         self._append(rec)
+        # An externally-recovered doc registered here (no fetch at all) must
+        # release its quarantine too — otherwise the nightly sync would keep
+        # skipping a URL the corpus now actually has (recover-quarantine
+        # design §3: any success releases the URL).
+        self.quarantine.record_success(rec.pdf_url)
         return "reindexed"
 
     def _record_download_error(self, rec: DocRecord, exc: Exception, label: str) -> None:

@@ -423,6 +423,97 @@ def test_download_all_candidates_fail_stays_recoverable_and_reaudits(tmp_path):
     assert reaudited[0]["pdf_url"] == pdf_url
 
 
+# --- --download bypasses the recovery targets' own quarantine ---------------
+
+def _seed_quarantine_state(cfg: Config, url: str, nights: list[str], quarantined: bool = True) -> None:
+    path = cfg.data_dir / "download_quarantine.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"url": url, "nights": nights, "quarantined": quarantined}) + "\n")
+
+
+def test_download_bypasses_active_quarantine_and_recovers(tmp_path):
+    """`download_errors.jsonl` feeds both the quarantine counter and this
+    inventory -- by the time recovery runs, its own target is typically
+    already quarantined. --download must reach the real fetch anyway (via
+    Storage.save(bypass_quarantine=True)) and report honestly, and a
+    successful recovery must release the quarantine too."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    pdf_url = "https://www.banque-france.fr/wp2000.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=pdf_url, title="WP 2000")])
+    _seed_quarantine_state(cfg, pdf_url,
+                           ["2026-08-19", "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23"])
+
+    fetcher = _StubFetcher(
+        cdx_hits={"wp2000.pdf": "20240601000000"},
+        bytes_ok={"wp2000.pdf": (b"%PDF-1.4 official", "application/pdf")},
+    )
+    results = run_recover_downloads(bank_codes=["fr"], download=True, config=cfg,
+                                    fetcher=fetcher, csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recovered"] == 1
+    assert pdf_url in fetcher.get_bytes_calls   # bypass reached the real fetch, not short-circuited
+    rows = list(iter_manifest_rows(cfg, "fr"))
+    assert len(rows) == 1
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "recovered"
+
+    q_path = cfg.data_dir / "download_quarantine.jsonl"
+    lines = q_path.read_text().splitlines()
+    assert json.loads(lines[-1]) == {"url": pdf_url, "released": True}
+
+
+def test_download_skip_already_indexed_status_is_reported_as_duplicate(tmp_path, monkeypatch):
+    """The other EXACT skip status named by the design (skip:already-indexed)
+    must also be folded into 'duplicate', same as skip:duplicate-content. In
+    the real flow this doc_id would already have been caught by the
+    `_is_converged` short-circuit before ever reaching save() (doc_id is
+    derived from pdf_url, so a known doc_id implies a known pdf_url) -- so
+    this is exercised directly against the exact-status branch, same as the
+    unknown-status test below."""
+    from cb_corpus.recover import run_recover_downloads
+    from cb_corpus import storage as storage_mod
+
+    cfg = Config(data_dir=tmp_path)
+    pdf_url = "https://www.banque-france.fr/wp2500.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=pdf_url, title="WP 2500")])
+    fetcher = _StubFetcher(cdx_hits={"wp2500.pdf": "20240601000000"})
+
+    monkeypatch.setattr(storage_mod.Storage, "save",
+                        lambda self, rec, **kw: "skip:already-indexed")
+
+    results = run_recover_downloads(bank_codes=["fr"], download=True, config=cfg,
+                                    fetcher=fetcher, csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["duplicate"] == 1
+    assert results["fr"]["recovered"] == 0
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "duplicate"
+
+
+def test_download_unknown_skip_status_is_reported_verbatim_never_mislabeled(tmp_path, monkeypatch):
+    """A skip:* status from storage.save() other than the two named exact
+    matches (skip:already-indexed / skip:duplicate-content) must be reported
+    honestly AS ITSELF in the CSV action -- never silently folded into
+    'duplicate', which would misrepresent what actually happened."""
+    from cb_corpus.recover import run_recover_downloads
+    from cb_corpus import storage as storage_mod
+
+    cfg = Config(data_dir=tmp_path)
+    pdf_url = "https://www.banque-france.fr/wp3000.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=pdf_url, title="WP 3000")])
+    fetcher = _StubFetcher(cdx_hits={"wp3000.pdf": "20240601000000"})
+
+    monkeypatch.setattr(storage_mod.Storage, "save",
+                        lambda self, rec, **kw: "skip:weird-status")
+
+    results = run_recover_downloads(bank_codes=["fr"], download=True, config=cfg,
+                                    fetcher=fetcher, csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recovered"] == 0
+    assert results["fr"]["duplicate"] == 0
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "skip:weird-status"
+
+
 def test_download_missing_doc_type_code_is_skipped_gracefully(tmp_path):
     """An audit entry with an unrecognised doc_type must not crash the run --
     it stays 'recoverable' (not 'recovered'), never breaking the whole pass."""
