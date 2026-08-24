@@ -32,6 +32,7 @@ from .config import Config
 from .http import Fetcher
 from .htmlpdf import render_url_to_pdf
 from .models import DocRecord
+from .quarantine import Quarantine
 
 
 _EXT_FOR_MIME = {
@@ -255,6 +256,12 @@ class Storage:
         self.fetcher = fetcher or Fetcher(self.cfg)
         self.cfg.raw_dir.mkdir(parents=True, exist_ok=True)
         self.cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+        # Dead-letter state for the nightly sync loop (recover-quarantine
+        # design §3): consulted at the top of save() before any fetch, fed
+        # from _record_download_error() and save()'s success path. Quarantine
+        # writes must only ever happen from THIS serialized loop (never
+        # parallel workers) — see quarantine.py's _append docstring.
+        self.quarantine = Quarantine(self.cfg)
         self._hashes: set[str] = set()
         self._ids: set[str] = set()
         self._urls: set[str] = set()
@@ -350,7 +357,21 @@ class Storage:
                 / str(year) / f"{rec.doc_id}.{ext}")
 
     # -- download --------------------------------------------------------
-    def save(self, rec: DocRecord, *, dry_run: bool = False) -> str:
+    def save(self, rec: DocRecord, *, dry_run: bool = False,
+             bypass_quarantine: bool = False) -> str:
+        # Consult the quarantine BEFORE any network activity — a URL that has
+        # failed QUARANTINE_AFTER_NIGHTS distinct nights running is skipped by
+        # the bounded (Mon-Sat) sync entirely (Sunday full sweep bypasses via
+        # QUARANTINE_RETRY=1, handled inside is_quarantined()). `bypass_quarantine`
+        # is for recovery flows (recover-downloads --download): their whole
+        # inventory comes FROM download_errors.jsonl, the same file that feeds
+        # the quarantine counter, so by the time recovery runs its own targets
+        # are typically already quarantined. When True, is_quarantined() is not
+        # even called — the gate's state (skipped_count, on-disk file) is left
+        # completely untouched by the bypass itself; a subsequent success still
+        # releases the quarantine normally via record_success() below.
+        if not bypass_quarantine and self.quarantine.is_quarantined(rec.pdf_url):
+            return "skip:quarantined"
         if rec.doc_id in self._ids:
             return "skip:already-indexed"
         if dry_run:
@@ -432,6 +453,7 @@ class Storage:
         if rec.source_url:
             self._source_urls.add(rec.source_url)
         self._append(rec)
+        self.quarantine.record_success(rec.pdf_url)
         return "saved"
 
     # -- reindex (no download) -------------------------------------------
@@ -470,6 +492,11 @@ class Storage:
         if rec.source_url:
             self._source_urls.add(rec.source_url)
         self._append(rec)
+        # An externally-recovered doc registered here (no fetch at all) must
+        # release its quarantine too — otherwise the nightly sync would keep
+        # skipping a URL the corpus now actually has (recover-quarantine
+        # design §3: any success releases the URL).
+        self.quarantine.record_success(rec.pdf_url)
         return "reindexed"
 
     def _record_download_error(self, rec: DocRecord, exc: Exception, label: str) -> None:
@@ -491,9 +518,18 @@ class Storage:
         path = self.cfg.data_dir / "download_errors.jsonl"
         with path.open("a") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        night = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+        self.quarantine.record_failure(rec.pdf_url, night=night)
 
     def save_many(self, recs: Iterable[DocRecord], *, dry_run: bool = False,
                   progress_every: int = 100, label: str = "") -> dict[str, int]:
+        """Save each record, tallying `save()`'s status prefix (e.g. "saved",
+        "skip", "error") and printing a periodic progress line plus one
+        quarantine summary line at the end (via `Quarantine.summary_line()`,
+        which CONSUMES/resets the skip counter -- so calling `save_many()`
+        again on this same `Storage` afterwards, e.g. for the next bank in a
+        multi-bank discovery run, reports THAT batch's own skip count, not a
+        cumulative total across every batch run so far)."""
         import sys
         counts: dict[str, int] = {}
         total = 0
@@ -512,4 +548,7 @@ class Storage:
             if progress_every and total % progress_every == 0:
                 prefix = f"[{label}] " if label else ""
                 print(f"{prefix}processed {total} ({dict(counts)})", file=sys.stderr, flush=True)
+        summary = self.quarantine.summary_line()
+        if summary:
+            print(summary, file=sys.stderr, flush=True)
         return counts

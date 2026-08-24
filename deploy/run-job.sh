@@ -14,6 +14,15 @@ if [ "$JOB" = "sync" ]; then
   fi
 fi
 
+# Sunday full sweep retries quarantined URLs; bounded nightly syncs do not.
+# SYNC_MODE defaults to "full" regardless of JOB, so the guard must also
+# require JOB="sync" -- otherwise a plain campaign run (JOB="campaign",
+# SYNC_MODE left at its default) would incorrectly inherit the Sunday-only
+# quarantine bypass too.
+if [ "$JOB" = "sync" ] && [ "$SYNC_MODE" = "full" ]; then
+  export QUARANTINE_RETRY=1
+fi
+
 APP_DIR="${CB_APP_DIR:-/app}"
 DATA_DIR="${CB_DATA_DIR:-/app/data}"
 LOCK="$DATA_DIR/.cb.lock"

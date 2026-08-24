@@ -182,6 +182,15 @@ def main(argv: list[str] | None = None) -> int:
     rdl.add_argument("--download", action="store_true",
                      help="actually save recoverable documents (default: dry-run report)")
     rdl.add_argument("--csv", default="", help="CSV output path (default data/reports/recover_downloads.csv)")
+    rdl.add_argument("--candidates", default="",
+                     help="JSONL of externally-recovered docs ({dead_pdf_url, file_path, "
+                          "recovered_from: wayback|bank_site|mirror, final_url, title?}) -- "
+                          "switches to candidates-only mode, no CDX walk; --download registers "
+                          "them into the corpus via Storage.reindex")
+    rdl.add_argument("--seed-quarantine", default="",
+                     help="JSONL of {url, reason?} lines to seed as already-quarantined "
+                          "(for docs confirmed unrecoverable after a manual hunt) -- may be "
+                          "combined with --candidates or used alone")
 
     args = p.parse_args(argv)
     banks = _banks(getattr(args, "banks", ""))
@@ -309,7 +318,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "recover-downloads":
         from .recover import run_recover_downloads
         results = run_recover_downloads(bank_codes=banks, download=args.download,
-                                        csv_path=args.csv or None)
+                                        csv_path=args.csv or None,
+                                        candidates=args.candidates or None,
+                                        seed_quarantine=args.seed_quarantine or None)
         for code, counts in results.items():
             print(f"{code}: {counts}")
         return 0
