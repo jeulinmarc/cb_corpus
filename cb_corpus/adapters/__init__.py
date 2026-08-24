@@ -5,6 +5,7 @@ from . import ecb   # noqa: F401  -> overrides "ecb"
 from . import boj   # noqa: F401  -> overrides "jp" (A3 minutes + native D1 WPs)
 from . import boe   # noqa: F401  -> overrides "gb" (native D1 staff working papers)
 from . import buba  # noqa: F401  -> overrides "de" (native D1 discussion papers)
+from . import bdf   # noqa: F401  -> overrides "fr" (E2 sitemap + native D1 WPs)
 from . import rba   # noqa: F401  -> overrides "au" (A1 decisions)
 from . import declarative as _declarative
 

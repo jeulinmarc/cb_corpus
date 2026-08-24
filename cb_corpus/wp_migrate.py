@@ -33,6 +33,7 @@ from .sources.fed_wp import discover_fed_wp, fed_key_from_url, fed_key_from_hand
 from .sources.boj_wp import discover_boj_wp, boj_code
 from .sources.boe_wp import discover_boe_wp, boe_slug
 from .sources.buba_wp import discover_buba_wp, de_blob_key, de_handle_key
+from .sources.bdf_wp import discover_fr_wp, fr_wp_number
 from .storage import Storage
 
 # Native discovery per bank. doc_type ∈ {D1, D2}; returns DocRecords with day dates.
@@ -42,6 +43,7 @@ _NATIVE = {
     "jp": discover_boj_wp,
     "gb": discover_boe_wp,
     "de": discover_buba_wp,
+    "fr": discover_fr_wp,
 }
 # Per-bank join-key extractors: (pdf_url -> key) and (source_url/handle -> key).
 # Native records and manifest rows are matched on equality of these keys. Banks
@@ -53,6 +55,7 @@ _KEY_FROM_PDF = {
     "jp": boj_code,                # paper code works from both the PDF URL and the handle
     "gb": boe_slug,                # BoE WP numbers aren't in the URL — match on the slug
     "de": de_blob_key,             # DP number from the Bundesbank blob filename
+    "fr": fr_wp_number,            # WP number is the first digit run in the filename
 }
 _KEY_FROM_HANDLE = {
     "ecb": repec_ecb_number,
@@ -60,6 +63,7 @@ _KEY_FROM_HANDLE = {
     "jp": boj_code,
     "gb": lambda h: None,          # RePEc handle (boe:boeewp:NNNN) has no slug
     "de": de_handle_key,           # DP number from zbw:bubdps:{NN}{YYYY} (None if global id)
+    "fr": fr_wp_number,            # same rule reads the IDEAS URL's basename (.../{NUM}.html)
 }
 
 _IDEAS_PATH = re.compile(r"/p/([^/]+)/([^/]+)/([^/.]+)")
