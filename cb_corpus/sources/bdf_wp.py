@@ -135,11 +135,18 @@ def parse_legacy_year(html: str, base_url: str = BDF_LEGACY
     return out
 
 
-def _iter_legacy(fetcher: Fetcher, years: Optional[set] = None) -> Iterator[DocRecord]:
-    """Yield BdF legacy Working Papers (D1), 1994..2023 (frozen archive, last
-    n°924). Walks year pages newest-first; a year whose page is missing,
-    absent (e.g. the 1995 gap), or empty is skipped gracefully. `years`
-    restricts the walk to those calendar years."""
+def _iter_legacy(fetcher: Fetcher, years: Optional[set] = None
+                 ) -> Iterator[tuple[int, DocRecord]]:
+    """Yield (WP number, DocRecord) for BdF legacy Working Papers (D1),
+    1994..2023 (frozen archive, last n°924). Walks year pages newest-first; a
+    year whose page is missing, absent (e.g. the 1995 gap), or empty is
+    skipped gracefully. `years` restricts the walk to those calendar years.
+
+    The number is yielded alongside the record (private, single-consumer
+    contract) because it is IRRECOVERABLE from the built DocRecord alone —
+    titles don't reliably carry it and filenames are inconsistent (see module
+    docstring) — and Task 3's cross-system merge needs it to dedup legacy
+    rows against the new-system walker's overlap-era papers."""
     for y in range(_LEGACY_LAST_YEAR, _LEGACY_FIRST_YEAR - 1, -1):
         if years is not None and y not in years:
             continue
@@ -148,8 +155,8 @@ def _iter_legacy(fetcher: Fetcher, years: Optional[set] = None) -> Iterator[DocR
             html = fetcher.get_text(url)
         except Exception:
             continue
-        for d, prec, _number, title, pdf_url in parse_legacy_year(html, url):
-            yield DocRecord(
+        for d, prec, number, title, pdf_url in parse_legacy_year(html, url):
+            yield number, DocRecord(
                 bank_code="fr", doc_type=DocType.D1, title=title,
                 pdf_url=pdf_url, source_url=url, date=d, provenance="bank_site",
                 mime_type="application/pdf",

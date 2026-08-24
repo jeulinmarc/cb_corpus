@@ -175,21 +175,28 @@ class _FakeFetcher:
         raise RuntimeError(f"404: {url}")
 
 
-def test_iter_legacy_yields_docrecords_from_years(monkeypatch):
+def test_iter_legacy_yields_number_docrecord_pairs_from_years(monkeypatch):
     import cb_corpus.sources.bdf_wp as bdf_mod
     monkeypatch.setattr(bdf_mod, "_LEGACY_FIRST_YEAR", 1994)
     monkeypatch.setattr(bdf_mod, "_LEGACY_LAST_YEAR", 1994)
     f = _FakeFetcher({"year=1994.html": _read("legacy_1994_sparse.html")})
-    recs = list(_iter_legacy(f, years={1994}))
-    assert len(recs) == 2
+    pairs = list(_iter_legacy(f, years={1994}))
+    assert len(pairs) == 2
+    assert all(isinstance(n, int) for n, _r in pairs)
+    assert {n for n, _r in pairs} == {30, 3}
+    recs = [r for _n, r in pairs]
     assert all(isinstance(r, DocRecord) for r in recs)
     assert all(r.bank_code == "fr" and r.doc_type == DocType.D1 for r in recs)
     assert all(r.provenance == "bank_site" and r.date_source == "bank_site" for r in recs)
     assert all(r.mime_type == "application/pdf" for r in recs)
     assert all(r.date_precision == "month" for r in recs)
+    # The pairing is stable per row: n°30 keeps its own record, not n°3's.
+    by_number = dict(pairs)
+    assert by_number[30].pdf_url.endswith("document-de-travail_30_1994.pdf")
     # n°3's PDF is filed under a completely unrelated "debats-economiques_..."
     # filename (a mismatched re-upload) -- proof the link must always be
     # scraped, never derived from a document-de-travail_{num}_{year} pattern.
+    assert by_number[3].pdf_url.endswith("debats-economiques_3_2006-10.pdf")
     assert {r.pdf_url.rsplit("/", 1)[-1] for r in recs} == {
         "document-de-travail_30_1994.pdf", "debats-economiques_3_2006-10.pdf",
     }
@@ -207,8 +214,8 @@ def test_iter_legacy_years_filter_restricts_and_skips_missing_year(monkeypatch):
         # same as a live 404.
         "year=1996.html": "<html><body>no papers</body></html>",  # empty page
     })
-    recs = list(_iter_legacy(f, years={1994, 1995, 1996}))
-    assert len(recs) == 2                              # only 1994's 2 papers
+    pairs = list(_iter_legacy(f, years={1994, 1995, 1996}))
+    assert len(pairs) == 2                              # only 1994's 2 papers
     assert sorted(f.calls) == sorted([
         "https://publications.banque-france.fr/liste-chronologique/documents-de-travail_year=1994.html",
         "https://publications.banque-france.fr/liste-chronologique/documents-de-travail_year=1995.html",
@@ -229,6 +236,6 @@ def test_iter_legacy_years_none_walks_full_range_newest_first(monkeypatch):
 def test_iter_legacy_docrecord_doc_id_is_stable_and_keyed_on_pdf_url():
     import cb_corpus.sources.bdf_wp as bdf_mod
     f = _FakeFetcher({"year=1994.html": _read("legacy_1994_sparse.html")})
-    recs = list(_iter_legacy(f, years={1994}))
-    ids = {r.doc_id for r in recs}
-    assert len(ids) == len(recs)                        # distinct pdf_url -> distinct doc_id
+    pairs = list(_iter_legacy(f, years={1994}))
+    ids = {r.doc_id for _n, r in pairs}
+    assert len(ids) == len(pairs)                        # distinct pdf_url -> distinct doc_id
