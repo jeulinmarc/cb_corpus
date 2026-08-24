@@ -515,6 +515,57 @@ def test_buba_adapter_routes_d1_native(monkeypatch):
     assert [r.title for r in ad.discover(DocType.D1)] == ["x"]
 
 
+# ---- Banque de France (fr) wp_migrate wiring -------------------------
+from cb_corpus.sources.bdf_wp import fr_wp_number, discover_fr_wp
+
+
+def test_fr_wired_into_wp_migrate_native_and_key_dicts():
+    assert wp_migrate._NATIVE["fr"] is discover_fr_wp
+    assert wp_migrate._KEY_FROM_PDF["fr"] is fr_wp_number
+    assert wp_migrate._KEY_FROM_HANDLE["fr"] is fr_wp_number
+
+
+def test_build_report_fr_join_stamps_alt_url_and_upgrades_date(monkeypatch):
+    """A fake manifest row (v2, RePEc-dated, month precision, legacy filename
+    form) joined against a fake native record (day precision, different --
+    modern -- filename form) on the WP number: date upgrades to day, the
+    native URL lands in alt_urls, doc_id/pdf_url/sha256 untouched."""
+    native = [
+        DocRecord(bank_code="fr", doc_type=DocType.D1, title="Some BdF Paper",
+                  pdf_url="https://www.banque-france.fr/system/files/2006-03/WP155.pdf",
+                  date=date(2006, 3, 14), date_precision="day", date_source="bank_site"),
+    ]
+    monkeypatch.setitem(wp_migrate._NATIVE, "fr", lambda fetcher: iter(native))
+
+    manifest = [
+        {"doc_id": "fr155", "bank_code": "fr", "doc_type": "D1", "date": "2006-03-01",
+         "pdf_url": ("https://publications.banque-france.fr/sites/default/files/"
+                     "medias/documents/working-paper_155_2006.pdf"),
+         "source_url": "https://ideas.repec.org/p/bfr/banfra/155.html",
+         "sha256": "h155", "local_path": "/raw/155.pdf"},
+    ]
+    summary, changes = build_report("fr", fetcher=None, manifest_rows=manifest)
+    assert summary["matched_key"] == 1
+    assert len(changes) == 1
+    c = changes[0]
+    assert c["doc_id"] == "fr155"
+    assert c["old_date"] == "2006-03-01" and c["new_date"] == "2006-03-14"
+    assert c["date_precision"] == "day"
+    assert c["match_type"] == "key"
+    assert c["repec_handle"] == "RePEc:bfr:banfra:155"     # generic IDEAS-path parse, bank-agnostic
+    assert c["alt_url_added"] == "https://www.banque-france.fr/system/files/2006-03/WP155.pdf"
+
+    from cb_corpus.wp_migrate import apply_change
+    row = dict(manifest[0])
+    apply_change(row, c)
+    assert row["date"] == "2006-03-14" and row["date_precision"] == "day"
+    assert row["date_source"] == "bank_site"
+    assert "https://www.banque-france.fr/system/files/2006-03/WP155.pdf" in row["alt_urls"]
+    # identity untouched
+    assert row["doc_id"] == "fr155" and row["sha256"] == "h155"
+    assert row["pdf_url"] == manifest[0]["pdf_url"]
+
+
 # ---- phase 4: wp-dates day recovery ---------------------------------
 from cb_corpus import wp_dates
 from cb_corpus.wp_dates import month_ok, pdf_creation_date, row_key, recover, _abs_variant

@@ -175,7 +175,9 @@ def _iter_legacy(fetcher: Fetcher, years: Optional[set] = None
         url = _LEGACY_YEAR.format(year=y)
         try:
             html = fetcher.get_text(url)
-        except Exception:
+        except Exception as exc:
+            print(f"WARNING [bdf-legacy] year {y} fetch failed: {exc}",
+                  file=sys.stderr, flush=True)
             continue
         for d, prec, number, title, pdf_url in parse_legacy_year(html, url):
             yield number, DocRecord(
@@ -318,7 +320,9 @@ def _iter_new(fetcher: Fetcher, since: Optional[date] = None,
         if html is None:
             try:
                 html = fetcher.get_text(_NEW_PAGE.format(n=n))
-            except Exception:
+            except Exception as exc:
+                print(f"WARNING [bdf-new] page {n} fetch failed: {exc}",
+                      file=sys.stderr, flush=True)
                 continue
         rows = parse_new_listing_page(html, BDF_NEW)
         page_has_fresh = False
@@ -387,3 +391,35 @@ def discover_fr_wp(fetcher: Fetcher, since: Optional[date] = None,
     for num, rec in _iter_new(fetcher, since=None):
         merged[num] = rec          # new system wins on any overlapping number
     yield from merged.values()
+
+
+# ---------------------------------------------------------------------
+# Join key for wp_migrate (v2 manifest row <-> native record)
+# ---------------------------------------------------------------------
+
+_FR_NUM_RE = re.compile(r"(\d+)")
+
+
+def fr_wp_number(url: str) -> Optional[int]:
+    """WP number from the basename of a BdF PDF URL, or a RePEc IDEAS handle
+    URL, else None.
+
+    Both the v2 manifest's pdf_url (downloaded via RePEc, e.g.
+    ``.../working-paper_155_2006.pdf`` or ``.../WP1004_0.pdf``) and this
+    module's own natively-scraped pdf_url (e.g.
+    ``.../document-de-travail_198_2008.pdf``, ``.../wp660_0.pdf``,
+    ``.../document-de-travail-661_2018-01_0.pdf``) carry the WP number as
+    the FIRST digit run in the filename -- prefix text (French/English,
+    with/without hyphens or underscores) comes before it, and any
+    publication year or re-upload/revision suffix (``_0``, ``_1``, a
+    trailing ``-YYYY``/``_YYYYMMDD``) comes after. The same rule reads a
+    RePEc IDEAS paper URL (``.../p/bfr/banfra/{NUM}.html``): its basename's
+    only digit run is the WP number. A basename with no digits at all
+    (never observed, but not provably impossible) returns None -- the
+    caller then falls back to the exact-normalized-title tier in
+    ``wp_migrate.build_report``, same as every other bank's key function
+    when the URL doesn't carry a usable number.
+    """
+    seg = (url or "").rstrip("/").rsplit("/", 1)[-1]
+    m = _FR_NUM_RE.search(seg)
+    return int(m.group(1)) if m else None

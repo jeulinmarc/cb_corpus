@@ -202,9 +202,11 @@ def test_iter_legacy_yields_number_docrecord_pairs_from_years(monkeypatch):
     }
 
 
-def test_iter_legacy_years_filter_restricts_and_skips_missing_year(monkeypatch):
+def test_iter_legacy_years_filter_restricts_and_skips_missing_year(monkeypatch, capsys):
     """A `years` filter walks only the requested years; a year whose fetch
-    fails (e.g. the confirmed 1995 gap) is skipped gracefully, not raised."""
+    fails (e.g. the confirmed 1995 gap) is skipped gracefully, not raised --
+    but loudly (a stderr warning naming the year and the error), so a
+    transient fetch blip isn't mistaken for a real archive gap."""
     import cb_corpus.sources.bdf_wp as bdf_mod
     monkeypatch.setattr(bdf_mod, "_LEGACY_FIRST_YEAR", 1994)
     monkeypatch.setattr(bdf_mod, "_LEGACY_LAST_YEAR", 1996)
@@ -221,6 +223,8 @@ def test_iter_legacy_years_filter_restricts_and_skips_missing_year(monkeypatch):
         "https://publications.banque-france.fr/liste-chronologique/documents-de-travail_year=1995.html",
         "https://publications.banque-france.fr/liste-chronologique/documents-de-travail_year=1996.html",
     ])
+    err = capsys.readouterr().err
+    assert "WARNING [bdf-legacy] year 1995 fetch failed" in err
 
 
 def test_iter_legacy_years_none_walks_full_range_newest_first(monkeypatch):
@@ -527,6 +531,25 @@ def test_iter_new_detail_fetch_failure_is_skipped_not_raised():
     assert {n for n, _r in pairs} == {660}
 
 
+def test_iter_new_mid_walk_page_fetch_failure_is_skipped_loudly(capsys):
+    """A page fetch that fails mid-walk (n > 0) is skipped, not raised -- but
+    loudly, so it isn't mistaken for the listing having simply ended."""
+    class _FailPage1(_FakeFetcher):
+        def get_text(self, url):
+            if "?page=1" in url:
+                self.calls.append(url)
+                raise RuntimeError("503 Service Unavailable")
+            return super().get_text(url)
+
+    f = _FailPage1({
+        "working-papers?page=0": _read("new_page0.html"),
+        "working-papers?page=2": "<html><body>no papers</body></html>",
+    })
+    list(_iter_new(f, since=None, max_pages=3))
+    err = capsys.readouterr().err
+    assert "WARNING [bdf-new] page 1 fetch failed" in err
+
+
 def test_iter_new_no_listing_page_zero_returns_gracefully():
     class _AlwaysFails:
         def get_text(self, url):
@@ -734,3 +757,58 @@ def test_fr_adapter_registered_and_reaches_discover_fr_wp_for_d1(monkeypatch):
     recs = list(adapter.discover(DocType.D1, since=date(2026, 8, 1)))
     assert recs == [sentinel]
     assert calls == [date(2026, 8, 1)]                 # `since` reached the source unchanged
+
+
+# ==== fr_wp_number: wp_migrate join key ===================================
+
+from cb_corpus.sources.bdf_wp import fr_wp_number
+
+
+def test_fr_wp_number_manifest_url_forms():
+    """v2 manifest pdf_url forms (downloaded via RePEc): the old
+    `working-paper_NNN_YYYY.pdf` / `document-de-travail_NNN_YYYY.pdf` legacy
+    naming, and the modern short `WPNNN.pdf` / `DTNNN.pdf` naming."""
+    B = "https://publications.banque-france.fr/sites/default/files/medias/documents/"
+    assert fr_wp_number(B + "working-paper_155_2006.pdf") == 155
+    assert fr_wp_number(B + "document-de-travail_198_2008.pdf") == 198
+    assert fr_wp_number("https://www.banque-france.fr/system/files/2026-04/WP1042.pdf") == 1042
+    assert fr_wp_number("https://www.banque-france.fr/system/files/2025-09/DT1012.pdf") == 1012
+
+
+def test_fr_wp_number_listing_url_forms():
+    """The native walkers' own scraped pdf_url forms (see bdf_wp module
+    docstring): wild legacy prefixes, and the new site's WP{NUM}.pdf."""
+    B = "https://publications.banque-france.fr/sites/default/files/medias/documents/"
+    assert fr_wp_number(B + "document-de-travail_350_2011.pdf") == 350
+    assert fr_wp_number(B + "doc_de_travail_42_-_20050301.pdf") == 42
+    assert fr_wp_number(B + "dt42.pdf") == 42
+    assert fr_wp_number(B + "wp745.pdf") == 745
+    assert fr_wp_number("https://www.banque-france.fr/system/files/2023-05/wp660_0.pdf") == 660
+
+
+def test_fr_wp_number_revision_suffix_case():
+    """A re-upload/revised-version suffix (`_0`/`_1`) after the number must
+    not be picked up as a second number -- the number is always the FIRST
+    digit run, the suffix always comes after it."""
+    assert fr_wp_number("https://x/wp738_1.pdf") == 738
+    assert fr_wp_number("https://www.banque-france.fr/system/files/2025-12/WP1029_0.pdf") == 1029
+    assert fr_wp_number(
+        "https://www.banque-france.fr/system/files/2023-05/"
+        "document-de-travail-661_2018-01_0.pdf") == 661
+
+
+def test_fr_wp_number_repec_handle_url():
+    """The v2 manifest's source_url (RePEc IDEAS page) reads the same way --
+    the join key function doubles as both KEY_FROM_PDF and KEY_FROM_HANDLE,
+    same pattern as jp's boj_code."""
+    assert fr_wp_number("https://ideas.repec.org/p/bfr/banfra/155.html") == 155
+    assert fr_wp_number("https://ideas.repec.org/p/bfr/banfra/1042.html") == 1042
+    # native PDF key == manifest handle key for the same paper (the join works)
+    assert (fr_wp_number("https://publications.banque-france.fr/.../working-paper_155_2006.pdf")
+            == fr_wp_number("https://ideas.repec.org/p/bfr/banfra/155.html"))
+
+
+def test_fr_wp_number_no_digits_returns_none():
+    assert fr_wp_number("https://x/no-number-here.pdf") is None
+    assert fr_wp_number("") is None
+    assert fr_wp_number(None) is None
