@@ -532,3 +532,205 @@ def test_iter_new_no_listing_page_zero_returns_gracefully():
         def get_text(self, url):
             raise RuntimeError("boom")
     assert list(_iter_new(_AlwaysFails())) == []
+
+
+# ==== discover_fr_wp: merge + public entry point (Task 3) ==============
+
+from cb_corpus.sources.bdf_wp import discover_fr_wp
+
+
+def test_discover_fr_wp_full_mode_prefers_new_system_in_the_overlap(monkeypatch):
+    """Number 500 exists in both walkers (the 2018-2023 overlap era): the
+    NEW system's record must win (day precision beats legacy's month)."""
+    import cb_corpus.sources.bdf_wp as bdf_mod
+
+    legacy_500 = DocRecord(
+        bank_code="fr", doc_type=DocType.D1, title="Legacy 500",
+        pdf_url="https://legacy/wp500.pdf", source_url="https://legacy/y2019.html",
+        date=date(2019, 6, 1), provenance="bank_site", mime_type="application/pdf",
+        date_precision="month", date_source="bank_site",
+    )
+    new_500 = DocRecord(
+        bank_code="fr", doc_type=DocType.D1, title="New 500",
+        pdf_url="https://new/wp500.pdf", source_url="https://new/wp500",
+        date=date(2019, 6, 17), provenance="bank_site", mime_type="application/pdf",
+        date_precision="day", date_source="bank_site",
+    )
+
+    def fake_iter_legacy(fetcher, years=None):
+        yield 500, legacy_500
+
+    def fake_iter_new(fetcher, since=None):
+        assert since is None                        # full mode: unbounded
+        yield 500, new_500
+
+    monkeypatch.setattr(bdf_mod, "_iter_legacy", fake_iter_legacy)
+    monkeypatch.setattr(bdf_mod, "_iter_new", fake_iter_new)
+
+    recs = list(discover_fr_wp(_FakeFetcher({})))
+    assert len(recs) == 1
+    assert recs[0] is new_500                        # new system's record wins
+    assert recs[0].date_precision == "day"
+
+
+def test_discover_fr_wp_full_mode_unions_non_overlapping_numbers(monkeypatch):
+    """A legacy-only number and a new-system-only number both survive the
+    merge -- the union, not just the overlap winner."""
+    import cb_corpus.sources.bdf_wp as bdf_mod
+
+    legacy_only = DocRecord(
+        bank_code="fr", doc_type=DocType.D1, title="Legacy only n1",
+        pdf_url="https://legacy/wp1.pdf", source_url="https://legacy/y1994.html",
+        date=date(1994, 3, 1), provenance="bank_site", mime_type="application/pdf",
+        date_precision="month", date_source="bank_site",
+    )
+    new_only = DocRecord(
+        bank_code="fr", doc_type=DocType.D1, title="New only n1060",
+        pdf_url="https://new/wp1060.pdf", source_url="https://new/wp1060",
+        date=date(2026, 8, 21), provenance="bank_site", mime_type="application/pdf",
+        date_precision="day", date_source="bank_site",
+    )
+
+    def fake_iter_legacy(fetcher, years=None):
+        yield 1, legacy_only
+
+    def fake_iter_new(fetcher, since=None):
+        yield 1060, new_only
+
+    monkeypatch.setattr(bdf_mod, "_iter_legacy", fake_iter_legacy)
+    monkeypatch.setattr(bdf_mod, "_iter_new", fake_iter_new)
+
+    recs = list(discover_fr_wp(_FakeFetcher({})))
+    assert {r.title for r in recs} == {"Legacy only n1", "New only n1060"}
+
+
+def test_discover_fr_wp_full_mode_yields_each_number_once(monkeypatch):
+    import cb_corpus.sources.bdf_wp as bdf_mod
+
+    def fake_iter_legacy(fetcher, years=None):
+        yield 1, DocRecord(bank_code="fr", doc_type=DocType.D1, title="a",
+                           pdf_url="https://legacy/1.pdf", source_url="https://legacy/1",
+                           date=date(2000, 1, 1), provenance="bank_site",
+                           mime_type="application/pdf", date_precision="month",
+                           date_source="bank_site")
+        yield 2, DocRecord(bank_code="fr", doc_type=DocType.D1, title="b",
+                           pdf_url="https://legacy/2.pdf", source_url="https://legacy/2",
+                           date=date(2001, 1, 1), provenance="bank_site",
+                           mime_type="application/pdf", date_precision="month",
+                           date_source="bank_site")
+
+    def fake_iter_new(fetcher, since=None):
+        yield 2, DocRecord(bank_code="fr", doc_type=DocType.D1, title="b-new",
+                           pdf_url="https://new/2.pdf", source_url="https://new/2",
+                           date=date(2001, 3, 5), provenance="bank_site",
+                           mime_type="application/pdf", date_precision="day",
+                           date_source="bank_site")
+
+    monkeypatch.setattr(bdf_mod, "_iter_legacy", fake_iter_legacy)
+    monkeypatch.setattr(bdf_mod, "_iter_new", fake_iter_new)
+
+    recs = list(discover_fr_wp(_FakeFetcher({})))
+    assert len(recs) == 2                             # numbers 1 and 2, each once
+    titles = {r.title for r in recs}
+    assert titles == {"a", "b-new"}                    # 2's legacy row was replaced, not duplicated
+
+
+def test_discover_fr_wp_since_mode_skips_legacy_entirely(monkeypatch):
+    """Bounded mode must never call the legacy walker at all (fetch-economy
+    win: legacy is a frozen archive that can't have anything newer)."""
+    import cb_corpus.sources.bdf_wp as bdf_mod
+
+    def fake_iter_legacy(fetcher, years=None):
+        raise AssertionError("legacy walker must not run in bounded (since) mode")
+        yield  # pragma: no cover
+
+    new_rec = DocRecord(
+        bank_code="fr", doc_type=DocType.D1, title="fresh",
+        pdf_url="https://new/wp1060.pdf", source_url="https://new/wp1060",
+        date=date(2026, 8, 21), provenance="bank_site", mime_type="application/pdf",
+        date_precision="day", date_source="bank_site",
+    )
+
+    def fake_iter_new(fetcher, since=None):
+        assert since == date(2026, 8, 1)
+        yield 1060, new_rec
+
+    monkeypatch.setattr(bdf_mod, "_iter_legacy", fake_iter_legacy)
+    monkeypatch.setattr(bdf_mod, "_iter_new", fake_iter_new)
+
+    recs = list(discover_fr_wp(_FakeFetcher({}), since=date(2026, 8, 1)))
+    assert recs == [new_rec]
+
+
+def test_discover_fr_wp_since_mode_legacy_fetcher_receives_zero_requests():
+    """End-to-end (no monkeypatching of the walkers themselves): with `since`
+    set, the shared fetcher must never be asked for a legacy-host URL."""
+    f = _FakeFetcher({"working-papers?page=0": _read("new_page_last_partial.html"),
+                      "exchange-rate-movements-firm-level-exports-and-heterogeneity":
+                          _read("new_detail_wp660.html"),
+                      "global-financial-interconnectedness-non-linear-assessment-uncertainty-channel":
+                          _read("new_detail_wp661.html")})
+    recs = list(discover_fr_wp(f, since=date(2018, 1, 1)))
+    assert len(recs) == 2
+    assert all(not call.startswith(BDF_LEGACY) for call in f.calls)
+
+
+def test_discover_fr_wp_full_mode_real_fixtures_end_to_end(monkeypatch):
+    """Full mode over real fixtures: both hosts get walked, the merge covers
+    both eras, and a deliberately overlapping number would prefer new (no
+    live overlap exists between these small fixture sets, so this mainly
+    proves the union path end-to-end with real HTML)."""
+    import cb_corpus.sources.bdf_wp as bdf_mod
+    monkeypatch.setattr(bdf_mod, "_LEGACY_FIRST_YEAR", 1994)
+    monkeypatch.setattr(bdf_mod, "_LEGACY_LAST_YEAR", 1994)
+    f = _FakeFetcher({
+        "year=1994.html": _read("legacy_1994_sparse.html"),
+        "working-papers?page=0": _read("new_page_last_partial.html"),
+        "exchange-rate-movements-firm-level-exports-and-heterogeneity":
+            _read("new_detail_wp660.html"),
+        "global-financial-interconnectedness-non-linear-assessment-uncertainty-channel":
+            _read("new_detail_wp661.html"),
+    })
+    recs = list(discover_fr_wp(f, years={1994}))
+    assert len(recs) == 4                                          # 30, 3, 660, 661
+    pdf_suffixes = {r.pdf_url.rsplit("/", 1)[-1] for r in recs}
+    assert pdf_suffixes == {
+        "document-de-travail_30_1994.pdf", "debats-economiques_3_2006-10.pdf",
+        "wp660_0.pdf", "document-de-travail-661_2018-01_0.pdf",
+    }
+    assert any(call.startswith(BDF_LEGACY) for call in f.calls)   # legacy WAS walked
+    assert any(call.startswith(BDF_NEW) for call in f.calls)      # new WAS walked
+
+
+# ==== Registry wiring smoke test (Task 3) ===============================
+#
+# fr D1 must be reachable through exactly the same native-discovery path as
+# every other native-WP bank (buba/boj/boe): BankAdapter.discover(D1, since)
+# -> BdfAdapter._discover_native(D1, since) -> sources.bdf_wp.discover_fr_wp.
+
+def test_fr_adapter_registered_and_reaches_discover_fr_wp_for_d1(monkeypatch):
+    from cb_corpus.adapters.base import get_adapter
+    from cb_corpus.adapters.bdf import BdfAdapter
+    import cb_corpus.sources.bdf_wp as bdf_mod
+
+    sentinel = DocRecord(
+        bank_code="fr", doc_type=DocType.D1, title="sentinel",
+        pdf_url="https://new/sentinel.pdf", source_url="https://new/sentinel",
+        date=date(2026, 8, 21), provenance="bank_site", mime_type="application/pdf",
+        date_precision="day", date_source="bank_site",
+    )
+    calls = []
+
+    def fake_discover_fr_wp(fetcher, since=None, years=None):
+        calls.append(since)
+        yield sentinel
+
+    monkeypatch.setattr(bdf_mod, "discover_fr_wp", fake_discover_fr_wp)
+
+    adapter = get_adapter("fr", _FakeFetcher({}))
+    assert isinstance(adapter, BdfAdapter)
+    assert DocType.D1 in adapter.native_types
+
+    recs = list(adapter.discover(DocType.D1, since=date(2026, 8, 1)))
+    assert recs == [sentinel]
+    assert calls == [date(2026, 8, 1)]                 # `since` reached the source unchanged

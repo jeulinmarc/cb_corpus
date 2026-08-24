@@ -618,12 +618,13 @@ def test_ecb_index_parser():
 # ---- declarative adapters from TOML ---------------------------------
 def test_toml_factories_loaded_for_majors():
     # banks_sources.toml ships with at least these.
-    for code in ("ch", "ca", "fr"):
+    for code in ("ch", "ca"):
         assert code in INSTANCE_FACTORIES
-    # Hand-written ADAPTERS override TOML for us/ecb/au/jp.
+    # Hand-written ADAPTERS override TOML for us/ecb/au/jp/fr.
     from cb_corpus.adapters.fed import FedAdapter
     from cb_corpus.adapters.rba import RBAAdapter
     from cb_corpus.adapters.boj import BoJAdapter
+    from cb_corpus.adapters.bdf import BdfAdapter
     assert isinstance(get_adapter("us"), FedAdapter)
     # `au` moved from a (frozen-2017) TOML sitemap to the RBAAdapter class.
     assert isinstance(get_adapter("au"), RBAAdapter)
@@ -631,6 +632,13 @@ def test_toml_factories_loaded_for_majors():
     # `jp` moved from a TOML listing to the BoJAdapter class (A3 + native D1 WPs).
     assert isinstance(get_adapter("jp"), BoJAdapter)
     assert "jp" not in INSTANCE_FACTORIES
+    # `fr` moved from a TOML sitemap (E2 only) to the BdfAdapter class, which
+    # reproduces the same E2 sitemap config inline AND adds native D1 WPs
+    # (merged legacy + new-system walk).
+    fr = get_adapter("fr")
+    assert isinstance(fr, BdfAdapter)
+    assert "fr" not in INSTANCE_FACTORIES
+    assert DocType.D1 in fr.native_types and DocType.E2 in fr.native_types
 
 
 def test_sitemap_parser_handles_urlset_and_index():

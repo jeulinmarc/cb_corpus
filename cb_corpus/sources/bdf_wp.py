@@ -46,8 +46,14 @@ Two publication systems (see spec docs/superpowers/specs/2026-08-24-fr-native-wp
   number). ``source_url`` is the EN detail page (the FR page shares the same
   PDF and isn't ingested separately).
 
-This module exposes both walkers (``_iter_legacy``, ``_iter_new``); the
-merged ``discover_fr_wp`` entry point lands in Task 3 of the same plan.
+This module exposes both walkers (``_iter_legacy``, ``_iter_new``) and the
+public merged entry point ``discover_fr_wp`` (interface-parity with the
+other native-WP sources, e.g. ``discover_buba_wp``/``discover_boj_wp``):
+bounded mode (``since`` set) walks the new system only -- the legacy archive
+is frozen at 2023 and can never have anything newer, so skipping it is a
+pure fetch-economy win; full mode (``since=None``) walks and merges both,
+keyed on the WP number, with the new system's record winning any overlap
+(2018-2023) since it carries day precision where legacy is usually month.
 """
 from __future__ import annotations
 
@@ -343,3 +349,41 @@ def _iter_new(fetcher: Fetcher, since: Optional[date] = None,
             )
         if since and rows and not page_has_fresh:   # newest-first -> rest is older
             break
+
+
+# ---------------------------------------------------------------------
+# Merge: public entry point (Task 3)
+# ---------------------------------------------------------------------
+
+def discover_fr_wp(fetcher: Fetcher, since: Optional[date] = None,
+                   years: Optional[set] = None) -> Iterator[DocRecord]:
+    """Yield Banque de France Working Papers (D1) -- the public, merged entry
+    point over both publication systems (see module docstring).
+
+    Bounded mode (`since` set): only the NEW system is walked. The legacy
+    archive is frozen at n°924/Sept 2023, so it can never hold anything
+    newer than a bounded-mode cutoff in practice -- walking it would cost a
+    fetch per year for zero possible new documents, so it is skipped
+    entirely (the `fetcher` receives no legacy-host requests at all in this
+    mode).
+
+    Full mode (`since=None`): both walkers run and are merged, keyed on the
+    WP number (continuous across both systems -- see module docstring). The
+    1994-2023 legacy archive and the 2018-present new site overlap on
+    2018-2023; for any number present in both, the NEW system's record wins
+    (its date is day precision, the legacy row is usually month precision).
+    Each number is yielded exactly once. `years` restricts the legacy walk
+    to those calendar years (ignored in bounded mode, where legacy doesn't
+    run at all).
+    """
+    if since is not None:
+        for _num, rec in _iter_new(fetcher, since=since):
+            yield rec
+        return
+
+    merged: dict[int, DocRecord] = {}
+    for num, rec in _iter_legacy(fetcher, years=years):
+        merged[num] = rec
+    for num, rec in _iter_new(fetcher, since=None):
+        merged[num] = rec          # new system wins on any overlapping number
+    yield from merged.values()

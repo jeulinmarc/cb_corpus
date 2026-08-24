@@ -28,10 +28,9 @@ sitemap_url = "https://www.bankofcanada.ca/wp-sitemap.xml"
 A3 = "/core-functions/monetary-policy/.*deliberations.*"
 E1 = "/publications/mpr/.*"
 
-[fr.sitemap]
-sitemap_url = "https://www.banque-france.fr/sitemap.xml"
-[fr.sitemap.patterns]
-E2 = "/publications/.*stabilite-financiere.*\\.pdf$"
-
 # jp (BoJ) is a hand-written adapter (cb_corpus/adapters/boj.py): A3 minutes +
 # native D1 working papers. Its A3 listing config lives there, not here.
+
+# fr (BdF) is a hand-written adapter (cb_corpus/adapters/bdf.py): E2 sitemap +
+# native D1 working papers (merged legacy/new-system walk). Its E2 sitemap
+# config lives there, not here.
