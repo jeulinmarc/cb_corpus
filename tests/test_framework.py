@@ -955,6 +955,118 @@ def test_ecb_c2_dead_year_engages_wayback_cdx_fallback():
     assert rec.provenance == "bank_site"   # matches run_ecb_pub_recovery's convention for this fallback
 
 
+def test_ecb_c2_primary_failure_warns_before_wayback_fallback(capsys):
+    """(C2 failure visibility, a) When a year's PRIMARY include fails, a
+    visible breadcrumb marks the engagement of the Wayback fallback for that
+    year -- silent fallback engagement was the original failure-visibility
+    gap this covers."""
+    cdx_json = json.dumps([
+        ["original", "timestamp"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.en.html", "20250716120000"],
+    ])
+
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return cdx_json if "date/2025" in url else "[]"
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            return "<html></html>"   # every other year's primary include: live, empty
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    list(a.discover(DocType.C2, since=date(2025, 1, 1)))
+    err = capsys.readouterr().err
+    assert ("WARNING [ecb-inter] year 2025 primary include failed, "
+            "engaging wayback fallback") in err
+    assert "yielded 0 rows" not in err   # the one CDX row above is real -- isolates (a) from (b)
+
+
+def test_ecb_c2_fallback_zero_rows_warns(capsys):
+    """(C2 failure visibility, b) When a year's Wayback fallback itself
+    yields nothing (the archive never captured that dead year), that is
+    ALSO worth a breadcrumb -- distinct from (a), which only says the
+    fallback engaged, not whether it actually recovered anything."""
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return "[]"                   # nothing archived, for any year
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            return "<html></html>"            # every other year's primary include: live, empty
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    list(a.discover(DocType.C2, since=date(2025, 1, 1)))
+    err = capsys.readouterr().err
+    assert "WARNING [ecb-inter] year 2025 primary include failed, engaging wayback fallback" in err
+    assert "WARNING [ecb-inter] year 2025 wayback fallback yielded 0 rows" in err
+
+
+def test_ecb_c2_unparseable_date_skipped_on_both_primary_and_fallback_paths(capsys):
+    """(C2 failure visibility, c) The D3 blog's own unparseable-date-skip
+    idiom, extended to C2 -- on BOTH the PRIMARY include path and the
+    Wayback FALLBACK path a malformed anchor is dropped (not yielded as a
+    bad row) with a visible stderr breadcrumb rather than silently."""
+    primary_html = ("""<html><body>
+      <a href="/press/inter/date/2024/html/ecb.in240319~819f79c14e.en.html">ok</a>
+      <a href="/press/inter/date/2024/html/ecb.in-nodate.en.html">no date anywhere</a>
+    </body></html>""")
+    cdx_json = json.dumps([
+        ["original", "timestamp"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.en.html", "20250716120000"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in-nodate.en.html", "20250716120000"],   # malformed: no date digits
+    ])
+
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return cdx_json if "date/2025" in url else "[]"
+            if "/inter/date/2024/" in url:
+                return primary_html
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            return "<html></html>"
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    recs = list(a.discover(DocType.C2, since=date(2024, 1, 1)))
+    assert not any("in-nodate" in r.pdf_url for r in recs)   # malformed rows never yielded
+    err = capsys.readouterr().err
+    assert err.count("skipping anchor with no parseable date") == 2   # PRIMARY (2024) + FALLBACK (2025)
+    assert "ecb.in-nodate.en.html" in err
+
+
+def test_ecb_c2_fallback_english_filter_requires_dot_before_en(capsys):
+    """(MINOR 4) The fallback's English filter must require `.en.html`
+    (with the dot), matching PRIMARY's `exts=(\".en.html\",)` -- a bare
+    `endswith(\"en.html\")` false-positives on any filename that happens to
+    end in those 7 letters (e.g. \"...sweden.html\"), which is NOT an
+    English URL and would otherwise slip through as one."""
+    cdx_json = json.dumps([
+        ["original", "timestamp"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.sweden.html", "20250716120000"],   # false-positive bait
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.en.html", "20250716120000"],       # genuinely English
+    ])
+
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return cdx_json if "date/2025" in url else "[]"
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            return "<html></html>"
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    recs = [r for r in a.discover(DocType.C2, since=date(2025, 1, 1))
+            if r.date and r.date.year == 2025]
+    assert len(recs) == 1
+    assert recs[0].pdf_url.endswith("aa11bb22cc.en.html")
+    assert not any(r.pdf_url.endswith("sweden.html") for r in recs)
+
+
 def test_ecb_c2_double_slash_legacy_row_deduped_via_alt_url(tmp_path):
     """54 of the 637 pre-existing C2 rows carry a double-slash pdf_url
     (`europa.eu//press/...`), the same one-off scraper artifact as 15 of

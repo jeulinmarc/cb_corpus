@@ -479,7 +479,14 @@ class ECBAdapter(BankAdapter):
                         continue
                     seen.add(u)
                     d = date_from_url(u, "yymmdd")
-                    if d is None or (since and d < since):
+                    if d is None:
+                        # Same idiom as D3 blog's unparseable-date skip: a
+                        # genuinely malformed anchor, not re-runnable (so it
+                        # doesn't belong in self.errors) but visible.
+                        print(f"!! ecb C2 interview: skipping anchor with no "
+                              f"parseable date: {u}", file=sys.stderr, flush=True)
+                        continue
+                    if since and d < since:
                         continue
                     yield DocRecord(
                         bank_code="ecb", doc_type=DocType.C2,
@@ -492,13 +499,22 @@ class ECBAdapter(BankAdapter):
                         mime_type="text/html",
                     )
             else:                                                   # FALLBACK
+                print(f"WARNING [ecb-inter] year {year} primary include failed, "
+                      f"engaging wayback fallback", file=sys.stderr, flush=True)
                 prefix = f"{ECB}/press/inter/date/{year}/"
+                yielded = 0
                 for original, ts in cdx_pdfs(self.fetcher, prefix, mimetype="text/html"):
-                    if not original.lower().endswith("en.html"):    # English only
+                    if not original.lower().endswith(".en.html"):   # English only
                         continue
                     d = date_from_url(original, "yymmdd")
-                    if d is None or (since and d < since):
+                    if d is None:
+                        # D3 blog's own idiom, applied to the fallback path too.
+                        print(f"!! ecb C2 interview: skipping anchor with no "
+                              f"parseable date: {original}", file=sys.stderr, flush=True)
                         continue
+                    if since and d < since:
+                        continue
+                    yielded += 1
                     yield DocRecord(
                         bank_code="ecb", doc_type=DocType.C2,
                         title=f"ECB C2 {d.isoformat()}",
@@ -509,3 +525,6 @@ class ECBAdapter(BankAdapter):
                         provenance="bank_site",
                         mime_type="text/html",
                     )
+                if yielded == 0:
+                    print(f"WARNING [ecb-inter] year {year} wayback fallback "
+                          f"yielded 0 rows", file=sys.stderr, flush=True)
