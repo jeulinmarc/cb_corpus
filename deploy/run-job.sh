@@ -180,7 +180,12 @@ run_job() {
   case "$JOB" in
     sync)     run_sync ;;
     campaign) python -m cb_corpus "$@" ;;
-    cadence)  python -m cb_corpus cadence-watch --write ;;
+    # cadence-watch's alert payload (NEW OVERDUE lines + the "cadence: N
+    # overdue (M new)" summary, see cb_corpus/cadence.py) goes to stderr by
+    # design (CLI concern, kept out of the pure computation). Route it into
+    # $LOG so it reaches the operator surface (nas_runs.log) per README §4a
+    # instead of only the container console.
+    cadence)  python -m cb_corpus cadence-watch --write 2>> "$LOG" ;;
   esac
 }
 
@@ -205,15 +210,17 @@ if [ "$JOB" = "sync" ]; then
   else
     log "START (full)"
   fi
-elif [ "$JOB" = "cadence" ]; then
-  log "START"
 else
   log "START"
 fi
 if run_job "$@"; then
   log "${JOB_SUMMARY:-OK}"
   echo "$(ts) ${JOB_SUMMARY:-OK} [$JOB]" > "$STATUS"
-  if [ "${AUTOCOMMIT:-1}" = "1" ]; then
+  # cadence writes only gitignored files (data/cadence.jsonl,
+  # data/cadence_state.jsonl -- see .gitignore) -- there is nothing for
+  # autocommit to push, so skip it: no gratuitous Sunday clone and no
+  # AUTOCOMMIT-FAILED noise surface for a job with no state to commit.
+  if [ "${AUTOCOMMIT:-1}" = "1" ] && [ "$JOB" != "cadence" ]; then
     "${AUTOCOMMIT_BIN:-/app/deploy/autocommit.sh}" "$JOB" >> "$LOG" 2>&1 \
       || log "AUTOCOMMIT FAILED (local state intact, will retry on next run)"
   fi

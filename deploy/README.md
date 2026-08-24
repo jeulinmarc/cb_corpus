@@ -136,9 +136,11 @@ next_expected, days_until, status, expected_per_year, n_3y}`. Status is
 `overdue` (>7d past expected), `soon` (≤60d to expected), or `on-track`.
 
 **Alerting:** State file `data/cadence_state.jsonl` remembers known-overdue
-series — the job logs only NEW silences to stderr, one line per series per
-run (no alert noise on recovery). Logs to `nas_runs.log`: `cadence: N overdue
-(M new)`.
+series — the job logs only NEW silences, one line per series per run (no
+alert noise on recovery). `run-job.sh` routes the cadence job's stderr into
+`nas_runs.log`, so both the per-series `NEW OVERDUE ...` lines and the
+summary `cadence: N overdue (M new)` land there — not just the container
+console.
 
 **Muting:** Deliberately-closed series (e.g. a future decision) are silenced
 by seeding a `{"bank_code", "doc_type", "muted": true, "reason"}` line in

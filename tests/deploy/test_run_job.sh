@@ -9,6 +9,9 @@ cat > "$STUB/python" <<'EOF'
 echo "PYARGS:$*" >> "$PY_LOG"
 echo "QRETRY:${QUARANTINE_RETRY:-unset}" >> "$PY_LOG"
 echo "PYSTUB:$*"
+if [ "$*" = "-m cb_corpus cadence-watch --write" ] && [ -n "${PY_CADENCE_STDERR:-}" ]; then
+  echo "$PY_CADENCE_STDERR" >&2
+fi
 if [ "$*" = "-m cb_corpus list-banks" ]; then
   printf 'aa   Bank Aa                              aa.example\n'
   printf 'bb   Bank Bb                              bb.example  (verify domain)\n'
@@ -296,12 +299,31 @@ unset PY_EXIT
 echo "RUN_JOB_OK"
 
 # T17 — cadence watchdog: runs cadence-watch --write, exits 0 on success.
+# The stub emits a fake alert payload on stderr (mirroring cadence.py's real
+# "NEW OVERDUE ..." / "cadence: N overdue (M new)" lines) so the test can
+# confirm run-job.sh routes it into nas_runs.log (the operator surface, per
+# deploy/README.md §4a) rather than leaving it stranded on the container
+# console.
 newdir
+export AUTOCOMMIT=1 AC_LOG="$D/ac.log"
+cat > "$D/ac.sh" <<'EOF'
+#!/bin/bash
+echo "AC:$1" >> "$AC_LOG"
+EOF
+chmod +x "$D/ac.sh"; export AUTOCOMMIT_BIN="$D/ac.sh"
+export PY_CADENCE_STDERR="cadence: NEW OVERDUE fr D1 (last 2025-01-01, expected 2026-01-01, 30d late)
+cadence: 1 overdue (1 new)"
 /app/deploy/run-job.sh cadence
 grep -q "PYARGS:-m cb_corpus cadence-watch --write" "$PY_LOG" \
   || fail "cadence watchdog must run cadence-watch --write"
 grep -q "\[cadence\] OK" "$D/reports/nas_runs.log" || fail "cadence OK not logged"
 grep -q "OK \[cadence\]" "$D/reports/last_run_status" || fail "cadence status missing"
+grep -q "cadence: NEW OVERDUE fr D1" "$D/reports/nas_runs.log" \
+  || fail "cadence NEW OVERDUE alert line missing from nas_runs.log"
+grep -q "cadence: 1 overdue (1 new)" "$D/reports/nas_runs.log" \
+  || fail "cadence summary line missing from nas_runs.log"
+if [ -f "$AC_LOG" ]; then fail "autocommit must not run for the cadence job (gitignored-only output)"; fi
+unset PY_CADENCE_STDERR AUTOCOMMIT_BIN AC_LOG; export AUTOCOMMIT=0
 
 # T17b — cadence non-zero rc propagates.
 newdir; export PY_EXIT=1

@@ -255,12 +255,15 @@ class CadenceState:
     # -- writes ---------------------------------------------------------
     def record_overdue(self, bank_code: str, doc_type: str, *,
                        today: Optional[date] = None) -> None:
-        """Mark `(bank_code, doc_type)` as known-overdue. Idempotent on
-        disk (repeated calls append repeated rows) but callers should only
-        call this for NEWLY overdue series -- `apply_state` below only
-        calls it once per transition. `today` is recorded on the row purely
-        for operator forensics (when the state file is read by a human) --
-        it is never read back by `_load`."""
+        """Mark `(bank_code, doc_type)` as known-overdue. The file itself is
+        append-only (each call appends a new row, never rewrites); the
+        resulting in-memory/replayed state is idempotent (repeated
+        overdue:true rows for the same key all resolve to the same "known
+        overdue" fact). Callers should still only call this for NEWLY
+        overdue series -- `apply_state` below only calls it once per
+        transition. `today` is recorded on the row purely for operator
+        forensics (when the state file is read by a human) -- it is never
+        read back by `_load`."""
         self._overdue[(bank_code, doc_type)] = True
         row = {"bank_code": bank_code, "doc_type": doc_type, "overdue": True}
         if today is not None:
@@ -304,13 +307,20 @@ def apply_state(state: CadenceState, entries: Iterable[dict], *,
     `cadence: N overdue (M new)` themselves and the returned log_lines to
     stderr (CLI concern, kept out of this pure function for testability).
     """
+    # Note: a series that ages out of compute_series()'s qualification (e.g.
+    # drops below min_docs()/lookback_years() as old rows fall out of the
+    # window) simply stops appearing in `entries`. Its last known state
+    # (overdue:true or false) is left untouched in `state` -- there is no
+    # "series disappeared" event -- so a since-retired series can stay
+    # overdue:true in cadence_state.jsonl forever even though it no longer
+    # shows up in cadence.jsonl. Accepted bound: harmless (it only suppresses
+    # a future NEW OVERDUE line it will never need, since it can't reappear
+    # without new qualifying rows), not worth tracking further.
     overdue_count = 0
     new_count = 0
     log_lines: list[str] = []
-    seen: set[tuple[str, str]] = set()
     for entry in entries:
         key = (entry["bank_code"], entry["doc_type"])
-        seen.add(key)
         is_overdue_now = entry["status"] == "overdue"
         was_overdue = state.is_known_overdue(*key)
         if is_overdue_now:
