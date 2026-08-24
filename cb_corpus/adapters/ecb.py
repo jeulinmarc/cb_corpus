@@ -4,6 +4,7 @@ Native ECB listings on ecb.europa.eu:
   A3  monetary policy accounts   ~8/yr    (HTML-only since 2024 — stored as .html)
   E4  Economic Bulletin          ~8/yr    (PDF)
   D3  ECB Blog posts             ~2-3/wk  (HTML-only, no PDF version)
+  C2  Interviews / op-eds        ~1-2/wk  (HTML-only, INTERIM coverage — see below)
 
 Accounts are now lazy-loaded year-by-year (`<year>/html/index_include.en.html`)
 and ECB no longer publishes a PDF version — the HTML is the canonical artifact.
@@ -14,6 +15,17 @@ The Blog's old per-section per-year include endpoint
 (`/press/blog/date/<year>/html/index_include.en.html`) is dead (404 for every
 year, checked 2026-08) — discovery instead parses the human-facing master
 listing (`BLOG_INDEX`), a static HTML page that inlines posts across years.
+
+Interviews (C2) still serve the per-year include for every year through 2024
+(checked 2026-08) but 404 from 2025 on, AND — unlike the blog — have no live
+static master-listing equivalent (the human-facing interviews page is
+JS-rendered, unscrapable by plain fetch). `_discover_inter` is therefore an
+INTERIM fix, not a full one: it falls back to a per-year Wayback CDX
+enumeration for dead years, which only recovers whatever the archive
+happened to capture, on however delayed a schedule the crawler visited —
+2025-2026 coverage will be partial and lag real publication until ECB's JS
+search API is reverse-engineered (explicit follow-up, out of scope here; see
+docs/superpowers/specs/2026-08-24-silent-series-design.md design C).
 
 Speeches (C1) and WPS/Occasional papers (D1/D2) come from the base class.
 """
@@ -47,6 +59,17 @@ MOPO_INDEX = ECB + "/press/govcdec/mopo/html/index.en.html"
 # Dedicated monetary-policy STATEMENT index (A2) — same lazy-load mechanism,
 # full history (the MOPO index only links statements for recent years).
 STATEMENT_INDEX = ECB + "/press/press_conference/monetary-policy-statement/html/index.en.html"
+# Interviews (C2) — per-year static include, same convention as accounts/
+# decisions/statements (`/press/inter/date/<year>/html/index_include.en.html`).
+# Live through 2024 (checked 2026-08); 404 from 2025 (see module docstring
+# for the interim Wayback fallback and its honest limitation). Unlike D3
+# there is no live master-listing equivalent for this section.
+INTER_SECTION = "inter"
+# Earliest interview row already in the manifest (from the pre-existing
+# manual `run_ecb_pub_recovery("inter", ...)` runs) — the year the per-year
+# loop starts at, so nightly/full discovery doesn't hammer decades of years
+# that never had any interviews.
+INTER_FIRST_YEAR = 2004
 
 # Accounts use two URL conventions over time:
 #   legacy (2015-2017): /press/accounts/2015/html/mg151119.en.html
@@ -274,7 +297,7 @@ class ECBAdapter(BankAdapter):
     # WP v3 migration ran first (registered native URLs in alt_urls → zero
     # re-download; see docs/IMPLEMENTATION_PLAN.md phase 3).
     native_types = (DocType.A1, DocType.A2, DocType.A3, DocType.E4,
-                    DocType.D1, DocType.D2, DocType.D3)
+                    DocType.D1, DocType.D2, DocType.D3, DocType.C2)
     expected_per_year = {DocType.A1: 8, DocType.A2: 8, DocType.A3: 8, DocType.E4: 8}
 
     def _discover_native(self, doc_type: DocType,
@@ -299,6 +322,8 @@ class ECBAdapter(BankAdapter):
             yield from self._discover_bulletin(since)
         elif doc_type == DocType.D3:
             yield from self._discover_blog(since)
+        elif doc_type == DocType.C2:
+            yield from self._discover_inter(since)
 
     def _discover_index(self, index_url, since, parse_fn, doc_type, title_prefix
                         ) -> Iterator[DocRecord]:
@@ -404,3 +429,83 @@ class ECBAdapter(BankAdapter):
                 provenance="bank_site",
                 mime_type="text/html",
             )
+
+    def _discover_inter(self, since: Optional[date]) -> Iterator[DocRecord]:
+        """C2 — ECB interviews/op-eds/testimony. INTERIM fix (see module
+        docstring for the full rationale and its honest limitation).
+
+        PRIMARY, per year: the section's own static include
+        (`/press/inter/date/<year>/html/index_include.en.html`, reused via
+        `section_include_docs` — the SAME parser `run_ecb_pub_recovery` and
+        its unit tests already exercise for this exact section). Still live
+        through 2024; returns None (not an exception) when a year's include
+        isn't served, which is this method's signal to fall back.
+
+        FALLBACK, per year: on a dead year, a Wayback CDX enumeration scoped
+        to that year's URL prefix (`sources/wayback.cdx_pdfs` — the SAME
+        already-coded machinery `run_ecb_pub_recovery`'s `cdx_fallback_prefix`
+        uses, reused here per-year rather than section-wide since some years
+        remain live while others don't). `pdf_url` stays the official
+        (dead) ECB URL — the citation — with the Wayback raw snapshot in
+        `alt_urls` as the actual download source, same convention as
+        `run_ecb_pub_recovery`'s `_emit` (provenance stays "bank_site": the
+        document IS the bank's own, only its delivery route is archived).
+        This recovers only what the archive happened to capture, on however
+        delayed a schedule the crawler visited a now-dead page — NOT a live
+        source, so 2025-2026 coverage will be partial and lag real
+        publication (see module docstring).
+
+        Titles are generic (`ECB C2 <date>`, matching `run_ecb_pub_recovery`'s
+        convention for this section, which produced most of the pre-existing
+        637 rows) — neither the include page's row-listing form nor the CDX
+        response carries a parseable title without much heavier per-page
+        fetching, and using the same generic form for both PRIMARY and
+        FALLBACK avoids a quality asymmetry between the two paths.
+        """
+        from ..sources.ecb_pub import section_include_docs, date_from_url
+        from ..sources.wayback import cdx_pdfs, raw_url
+        cur = date.today().year
+        for year in range(INTER_FIRST_YEAR, cur + 1):
+            docs = section_include_docs(self.fetcher, INTER_SECTION, year,
+                                        exts=(".en.html",))
+            if docs is not None:                                   # PRIMARY
+                seen: set[str] = set()
+                for u in docs:
+                    # Each interview appears twice in the include (the title
+                    # anchor + the language-selector "arrow" anchor pointing
+                    # at the same .en.html URL) — same duplicate-anchor shape
+                    # as the D3 blog listing's card/arrow pair.
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    d = date_from_url(u, "yymmdd")
+                    if d is None or (since and d < since):
+                        continue
+                    yield DocRecord(
+                        bank_code="ecb", doc_type=DocType.C2,
+                        title=f"ECB C2 {d.isoformat()}",
+                        pdf_url=u,
+                        source_url=(f"{ECB}/press/inter/date/{year}/html/"
+                                   "index_include.en.html"),
+                        date=d,
+                        provenance="bank_site",
+                        mime_type="text/html",
+                    )
+            else:                                                   # FALLBACK
+                prefix = f"{ECB}/press/inter/date/{year}/"
+                for original, ts in cdx_pdfs(self.fetcher, prefix, mimetype="text/html"):
+                    if not original.lower().endswith("en.html"):    # English only
+                        continue
+                    d = date_from_url(original, "yymmdd")
+                    if d is None or (since and d < since):
+                        continue
+                    yield DocRecord(
+                        bank_code="ecb", doc_type=DocType.C2,
+                        title=f"ECB C2 {d.isoformat()}",
+                        pdf_url=original,
+                        alt_urls=[raw_url(original, ts)],
+                        source_url=prefix,
+                        date=d,
+                        provenance="bank_site",
+                        mime_type="text/html",
+                    )
