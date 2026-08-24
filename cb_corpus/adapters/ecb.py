@@ -375,9 +375,13 @@ class ECBAdapter(BankAdapter):
         — a one-off artifact of that old scraper. Rather than special-case them
         here, the manifest rows were amended to also index the normalized form
         in alt_urls (see `data: index normalized URL forms for 15 legacy D3
-        rows`), so `Storage.is_known_url()` recognises what this method yields
-        and nightly discovery skips them before any fetch — same compat
-        pattern as the WP v3 migration's native-URL alt_urls registration."""
+        rows`), so `Storage.is_known_url()` recognises what this method yields.
+        The generic native branch in `BankAdapter.discover()` (adapters/base.py)
+        applies that check via the `_skip_known_url` hook the pipeline wires up
+        (`pipeline.run()`) BEFORE any record leaves `discover()` — so nightly
+        discovery skips these 15 posts before `Storage.save()` ever fetches
+        their page, same compat pattern as the WP v3 migration's native-URL
+        alt_urls registration."""
         html = self._fetch_text(BLOG_INDEX, context="D3-index")
         if html is None:
             return
