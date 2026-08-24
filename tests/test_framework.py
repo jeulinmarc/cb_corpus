@@ -16,7 +16,7 @@ from cb_corpus.adapters.listing_crawler import (
 from cb_corpus.adapters.fed import FedAdapter, parse_minutes_links
 from cb_corpus.adapters.ecb import (
     ECBAdapter, parse_index, parse_year_includes, parse_account_items,
-    parse_bulletin_pdfs,
+    parse_bulletin_pdfs, parse_blog_items, BLOG_INDEX,
 )
 from cb_corpus.sources.bis_speeches import (
     parse_listing, parse_sitemap_index, parse_year_sitemap, parse_detail,
@@ -709,6 +709,422 @@ def test_ecb_bulletin_pdfs_keep_english_only():
     rows = parse_bulletin_pdfs(html)
     assert len(rows) == 2
     assert all(u.endswith(".en.pdf") for _, _, u in rows)
+
+
+# ---- ECB D3 blog discovery (master listing) ---------------------------
+_ECB_BLOG_FIXTURE = (Path(__file__).parent / "fixtures" / "ecb_blog_index.html").read_text()
+
+
+def test_ecb_blog_parser_dedups_by_url_excludes_non_english_and_falls_back_to_label_date():
+    """Parser-level: content-box/arrow duplicates collapse to one row per URL,
+    non-English siblings (.es.html) are excluded, and a URL with no parseable
+    date (the real 'ecb.blog0227~...' filename) still gets a day-precision
+    date from its <h5> label. The synthetic no-date-anywhere row is returned
+    with date=None (the caller's job to skip + warn)."""
+    rows = parse_blog_items(_ECB_BLOG_FIXTURE, BLOG_INDEX)
+    urls = [u for _, _, u in rows]
+    assert len(urls) == len(set(urls)) == 4          # deduped, incl. the malformed one
+    assert not any(u.endswith(".es.html") for u in urls)
+    by_url = {u: (d, t) for d, t, u in rows}
+    cccee = next(u for u in urls if "cccee738e1" in u)
+    assert by_url[cccee][0] == date(2024, 11, 19)
+    assert "resilient" in by_url[cccee][1].lower()
+    legacy = next(u for u in urls if "241114" in u)   # legacy 6-digit URL date
+    assert by_url[legacy][0] == date(2024, 11, 14)
+    labeled = next(u for u in urls if "blog0227" in u)   # URL has no full date
+    assert by_url[labeled][0] == date(2026, 2, 27)       # recovered from <h5> label
+    malformed = next(u for u in urls if "blog-untitled" in u)
+    assert by_url[malformed][0] is None
+
+
+def test_ecb_blog_discovery_yields_docrecords_day_precision_and_skips_malformed(capsys):
+    """Adapter-level: D3 discovery turns the listing into DocRecords (day
+    precision, bank_site provenance), and the anchor with no date anywhere is
+    skipped with a warning rather than crashing or yielding a bad row."""
+    class FakeFetcher:
+        def get_text(self, url):
+            assert url == BLOG_INDEX
+            return _ECB_BLOG_FIXTURE
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    recs = list(a.discover(DocType.D3))
+    assert len(recs) == 3
+    assert all(r.doc_type == DocType.D3 for r in recs)
+    assert all(r.bank_code == "ecb" for r in recs)
+    assert all(r.provenance == "bank_site" for r in recs)
+    assert all(r.date_precision == "day" for r in recs)
+    dates = sorted(r.date for r in recs)
+    assert dates == [date(2024, 11, 14), date(2024, 11, 19), date(2026, 2, 27)]
+    assert not any("blog-untitled" in r.pdf_url for r in recs)
+    err = capsys.readouterr().err
+    assert "blog-untitled" in err and "D3" in err
+
+
+def test_ecb_d3_native_and_reached_by_discover_all():
+    """Registry wiring: D3 must be declared native AND actually reachable
+    through the generic discover_all() path (supported_types() gate)."""
+    assert DocType.D3 in ECBAdapter.native_types
+
+    class FakeFetcher:
+        def get_text(self, url):
+            return _ECB_BLOG_FIXTURE
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    assert DocType.D3 in a.supported_types()
+    recs = list(a.discover_all(scope=(DocType.D3,)))
+    assert len(recs) == 3
+    assert all(r.doc_type == DocType.D3 for r in recs)
+
+
+def test_ecb_d3_double_slash_legacy_row_deduped_via_alt_url(tmp_path):
+    """15 of the 212 historical D3 rows were written by the old one-off
+    scraper with a double-slash pdf_url (`europa.eu//press/...`); the new
+    `_discover_blog` always normalizes to a single slash. Without indexing the
+    normalized form, is_known_url() would miss on every nightly run and
+    silently re-fetch those 15 posts. The data-fix registers the normalized
+    URL in alt_urls (same convention as the WP v3 migration) — this locks
+    that is_known_url() then recognises the normalized form."""
+    legacy_url = ("https://www.ecb.europa.eu//press/blog/date/2023/html/"
+                  "ecb.blog230824~362178a805.en.html")
+    normalized_url = ("https://www.ecb.europa.eu/press/blog/date/2023/html/"
+                       "ecb.blog230824~362178a805.en.html")
+    row = {
+        "bank_code": "ecb", "doc_type": "D3", "title": "ECB D3 2023-08-24",
+        "pdf_url": legacy_url, "source_url": "", "date": "2023-08-24",
+        "language": "en", "provenance": "bank_site", "mime_type": "text/html",
+        "sha256": "f8ee5df6f1402ceee7af11b4e8e9706638c8b213bfe844b1e265c6b4160e7b86",
+        "local_path": "data/raw/ecb/D3/2023/f0d212497f8b1289.html",
+        "doc_id": "f0d212497f8b1289", "year": 2023,
+        "alt_urls": [normalized_url],
+    }
+    cfg = Config(data_dir=tmp_path)
+    cfg.manifest_dir.mkdir(parents=True, exist_ok=True)
+    cfg.manifest_file("ecb").write_text(json.dumps(row, ensure_ascii=False) + "\n")
+    st = Storage(cfg)
+    assert st.is_known_url(normalized_url)   # what _discover_blog would yield
+    assert st.is_known_url(legacy_url)       # the legacy form itself still matches too
+
+
+def test_ecb_d3_known_legacy_row_filtered_before_any_fetch_through_discover_flow(tmp_path):
+    """Flow-level lock for the silent-series bug: indexing the normalized alt_url
+    (previous test) is only useful if something on the D3 discovery path actually
+    consults it. Wire `_skip_known_url` exactly as `pipeline.run()` does
+    (`adapter._skip_known_url = storage.is_known_url`) and drive the SAME already-known
+    legacy post through `discover(D3)` -> `save_many()`. The record must be filtered
+    by `discover()` itself — it must never reach `Storage.save()`'s per-item fetch."""
+    legacy_url = ("https://www.ecb.europa.eu//press/blog/date/2023/html/"
+                  "ecb.blog230824~362178a805.en.html")
+    normalized_url = ("https://www.ecb.europa.eu/press/blog/date/2023/html/"
+                       "ecb.blog230824~362178a805.en.html")
+    row = {
+        "bank_code": "ecb", "doc_type": "D3", "title": "ECB D3 2023-08-24",
+        "pdf_url": legacy_url, "source_url": "", "date": "2023-08-24",
+        "language": "en", "provenance": "bank_site", "mime_type": "text/html",
+        "sha256": "f8ee5df6f1402ceee7af11b4e8e9706638c8b213bfe844b1e265c6b4160e7b86",
+        "local_path": "data/raw/ecb/D3/2023/f0d212497f8b1289.html",
+        "doc_id": "f0d212497f8b1289", "year": 2023,
+        "alt_urls": [normalized_url],
+    }
+    cfg = Config(data_dir=tmp_path)
+    cfg.manifest_dir.mkdir(parents=True, exist_ok=True)
+    cfg.manifest_file("ecb").write_text(json.dumps(row, ensure_ascii=False) + "\n")
+
+    # The live listing re-lists this same post (normalized single-slash URL, as
+    # `_discover_blog` always yields) alongside one genuinely new post — a real
+    # nightly re-crawl would see the already-known post on every pass since blog
+    # listings don't expire old entries.
+    blog_html = """<html><body><div class="box">
+      <a class="content-box" href="/press/blog/date/2023/html/ecb.blog230824~362178a805.en.html">
+        <h5>24 August 2023</h5><h3>Already-known legacy post</h3>
+      </a>
+    </div><div class="box">
+      <a class="content-box" href="/press/blog/date/2026/html/ecb.blog20260301~abc123def0.en.html">
+        <h5>1 March 2026</h5><h3>Genuinely new post</h3>
+      </a>
+    </div></body></html>"""
+
+    class SpyFetcher:
+        """Records every URL asked for; get_bytes fails loudly on the known
+        legacy post so a regression (re-fetching it) fails the test instead of
+        silently succeeding."""
+        def __init__(self):
+            self.get_bytes_calls: list[str] = []
+
+        def get_text(self, url):
+            assert url == BLOG_INDEX
+            return blog_html
+
+        def get_bytes(self, url):
+            self.get_bytes_calls.append(url)
+            if url in (legacy_url, normalized_url):
+                raise AssertionError(f"fetched already-known D3 URL: {url}")
+            return (b"<html>new post</html>", "text/html")
+
+    fetcher = SpyFetcher()
+    storage = Storage(cfg, fetcher)
+    adapter = ECBAdapter(get_bank("ecb"), fetcher)
+    adapter._skip_known_url = storage.is_known_url   # what pipeline.run() sets
+
+    recs = list(adapter.discover(DocType.D3))
+    yielded_urls = [r.pdf_url for r in recs]
+    assert normalized_url not in yielded_urls   # filtered by discover(), not by save()
+    assert any("20260301" in u for u in yielded_urls)   # the new post still comes through
+
+    counts = storage.save_many(recs)
+    assert normalized_url not in fetcher.get_bytes_calls   # never asked for
+    assert counts.get("saved", 0) == 1                     # only the new post was saved
+
+
+# ---- ECB C2 interviews (interim wiring: primary include + per-year Wayback fallback) ----
+_ECB_INTER_2024_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "ecb_inter_2024_include.html").read_text()
+
+
+def test_ecb_c2_native_and_reached_by_discover_all():
+    """Registry wiring: C2 must be declared native AND actually reachable
+    through the generic discover_all() path (supported_types() gate)."""
+    assert DocType.C2 in ECBAdapter.native_types
+
+    class FakeFetcher:
+        def get_text(self, url):
+            if "/inter/date/2024/" in url:
+                return _ECB_INTER_2024_FIXTURE
+            raise RuntimeError("fake 404")
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    assert DocType.C2 in a.supported_types()
+    recs = list(a.discover_all(scope=(DocType.C2,), since=date(2024, 1, 1)))
+    assert len(recs) == 8
+    assert all(r.doc_type == DocType.C2 for r in recs)
+    assert all(r.bank_code == "ecb" for r in recs)
+    assert all(r.provenance == "bank_site" for r in recs)
+
+
+def test_ecb_c2_primary_include_yields_docrecords_day_precision():
+    """Primary path: a live (<=2024) per-year include page parses into
+    day-precision DocRecords, English-only (non-English sibling anchors for
+    the same interview are excluded by `section_include_docs`'s exts filter,
+    already covered at the parser level -- this is the adapter-level lock)."""
+    class FakeFetcher:
+        def get_text(self, url):
+            if "/inter/date/2024/" in url:
+                return _ECB_INTER_2024_FIXTURE
+            raise RuntimeError("fake 404")
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    recs = list(a.discover(DocType.C2, since=date(2024, 1, 1)))
+    assert len(recs) == 8
+    dates = sorted(r.date for r in recs)
+    assert dates[0] == date(2024, 1, 3) and dates[-1] == date(2024, 3, 19)
+    assert all(r.date_precision == "day" for r in recs)
+    assert all(r.pdf_url.endswith(".en.html") for r in recs)
+
+
+def test_ecb_c2_dead_year_engages_wayback_cdx_fallback():
+    """A year whose per-year include 404s (2025+, per the docstring) engages
+    the ALREADY-CODED Wayback CDX fallback (reused, not reinvented -- see
+    `sources/wayback.cdx_pdfs`) scoped to that single year -- the interim
+    fix's core behavior. The official (dead) URL is kept as pdf_url (the
+    citation); the Wayback raw snapshot is the alt_urls download fallback --
+    same convention `run_ecb_pub_recovery`'s CDX fallback already uses."""
+    cdx_json = json.dumps([
+        ["original", "timestamp"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.en.html", "20250716120000"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.fr.html", "20250716120000"],   # non-English, filtered
+    ])
+
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return cdx_json if "date/2025" in url else "[]"
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            raise RuntimeError("fake 404")
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    recs = [r for r in a.discover(DocType.C2, since=date(2025, 1, 1))
+            if r.date and r.date.year == 2025]
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec.date == date(2025, 7, 15)
+    assert rec.pdf_url.endswith("ecb.in250715~aa11bb22cc.en.html")   # official (dead) URL, the citation
+    assert not rec.pdf_url.startswith("https://web.archive.org")
+    assert rec.alt_urls and "web.archive.org/web/20250716120000id_/" in rec.alt_urls[0]
+    assert rec.provenance == "bank_site"   # matches run_ecb_pub_recovery's convention for this fallback
+
+
+def test_ecb_c2_primary_failure_warns_before_wayback_fallback(capsys):
+    """(C2 failure visibility, a) When a year's PRIMARY include fails, a
+    visible breadcrumb marks the engagement of the Wayback fallback for that
+    year -- silent fallback engagement was the original failure-visibility
+    gap this covers."""
+    cdx_json = json.dumps([
+        ["original", "timestamp"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.en.html", "20250716120000"],
+    ])
+
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return cdx_json if "date/2025" in url else "[]"
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            return "<html></html>"   # every other year's primary include: live, empty
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    list(a.discover(DocType.C2, since=date(2025, 1, 1)))
+    err = capsys.readouterr().err
+    assert ("WARNING [ecb-inter] year 2025 primary include failed, "
+            "engaging wayback fallback") in err
+    assert "yielded 0 rows" not in err   # the one CDX row above is real -- isolates (a) from (b)
+
+
+def test_ecb_c2_fallback_zero_rows_warns(capsys):
+    """(C2 failure visibility, b) When a year's Wayback fallback itself
+    yields nothing (the archive never captured that dead year), that is
+    ALSO worth a breadcrumb -- distinct from (a), which only says the
+    fallback engaged, not whether it actually recovered anything."""
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return "[]"                   # nothing archived, for any year
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            return "<html></html>"            # every other year's primary include: live, empty
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    list(a.discover(DocType.C2, since=date(2025, 1, 1)))
+    err = capsys.readouterr().err
+    assert "WARNING [ecb-inter] year 2025 primary include failed, engaging wayback fallback" in err
+    assert "WARNING [ecb-inter] year 2025 wayback fallback yielded 0 rows" in err
+
+
+def test_ecb_c2_unparseable_date_skipped_on_both_primary_and_fallback_paths(capsys):
+    """(C2 failure visibility, c) The D3 blog's own unparseable-date-skip
+    idiom, extended to C2 -- on BOTH the PRIMARY include path and the
+    Wayback FALLBACK path a malformed anchor is dropped (not yielded as a
+    bad row) with a visible stderr breadcrumb rather than silently."""
+    primary_html = ("""<html><body>
+      <a href="/press/inter/date/2024/html/ecb.in240319~819f79c14e.en.html">ok</a>
+      <a href="/press/inter/date/2024/html/ecb.in-nodate.en.html">no date anywhere</a>
+    </body></html>""")
+    cdx_json = json.dumps([
+        ["original", "timestamp"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.en.html", "20250716120000"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in-nodate.en.html", "20250716120000"],   # malformed: no date digits
+    ])
+
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return cdx_json if "date/2025" in url else "[]"
+            if "/inter/date/2024/" in url:
+                return primary_html
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            return "<html></html>"
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    recs = list(a.discover(DocType.C2, since=date(2024, 1, 1)))
+    assert not any("in-nodate" in r.pdf_url for r in recs)   # malformed rows never yielded
+    err = capsys.readouterr().err
+    assert err.count("skipping anchor with no parseable date") == 2   # PRIMARY (2024) + FALLBACK (2025)
+    assert "ecb.in-nodate.en.html" in err
+
+
+def test_ecb_c2_fallback_english_filter_requires_dot_before_en(capsys):
+    """(MINOR 4) The fallback's English filter must require `.en.html`
+    (with the dot), matching PRIMARY's `exts=(\".en.html\",)` -- a bare
+    `endswith(\"en.html\")` false-positives on any filename that happens to
+    end in those 7 letters (e.g. \"...sweden.html\"), which is NOT an
+    English URL and would otherwise slip through as one."""
+    cdx_json = json.dumps([
+        ["original", "timestamp"],
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.sweden.html", "20250716120000"],   # false-positive bait
+        ["https://www.ecb.europa.eu/press/inter/date/2025/html/"
+         "ecb.in250715~aa11bb22cc.en.html", "20250716120000"],       # genuinely English
+    ])
+
+    class FakeFetcher:
+        def get_text(self, url):
+            if "web.archive.org/cdx" in url:
+                return cdx_json if "date/2025" in url else "[]"
+            if "/inter/date/2025/" in url:
+                raise RuntimeError("404 Not Found")
+            return "<html></html>"
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    recs = [r for r in a.discover(DocType.C2, since=date(2025, 1, 1))
+            if r.date and r.date.year == 2025]
+    assert len(recs) == 1
+    assert recs[0].pdf_url.endswith("aa11bb22cc.en.html")
+    assert not any(r.pdf_url.endswith("sweden.html") for r in recs)
+
+
+def test_ecb_c2_double_slash_legacy_row_deduped_via_alt_url(tmp_path):
+    """54 of the 637 pre-existing C2 rows carry a double-slash pdf_url
+    (`europa.eu//press/...`), the same one-off scraper artifact as 15 of
+    D3's 212 rows. `_discover_inter` always yields the normalized
+    single-slash form (from `section_include_docs`/CDX `original`, neither
+    of which double the slash) -- the data-fix registers the normalized URL
+    in alt_urls (same convention as the D3 fix) so is_known_url() recognises
+    it and nightly discovery skips these before any fetch."""
+    legacy_url = ("https://www.ecb.europa.eu//press/inter/date/2019/html/"
+                  "ecb.in191216~8014b1bae6.en.html")
+    normalized_url = ("https://www.ecb.europa.eu/press/inter/date/2019/html/"
+                       "ecb.in191216~8014b1bae6.en.html")
+    row = {
+        "bank_code": "ecb", "doc_type": "C2", "title": "Interview with NOS Nieuwsuur",
+        "pdf_url": legacy_url, "source_url": "", "date": "2019-12-16",
+        "language": "en", "provenance": "bank_site", "mime_type": "text/html",
+        "sha256": "9d67b7c417f25253b3b81fe698bea2b0263f0cef430f2f2bdb239192eb2e7fb6",
+        "local_path": "data/raw/ecb/C2/2019/18f03b281e9ab1ba.html",
+        "doc_id": "18f03b281e9ab1ba", "year": 2019,
+        "alt_urls": [normalized_url],
+    }
+    cfg = Config(data_dir=tmp_path)
+    cfg.manifest_dir.mkdir(parents=True, exist_ok=True)
+    cfg.manifest_file("ecb").write_text(json.dumps(row, ensure_ascii=False) + "\n")
+    st = Storage(cfg)
+    assert st.is_known_url(normalized_url)   # what _discover_inter would yield
+    assert st.is_known_url(legacy_url)       # the legacy form itself still matches too
+
+
+def test_ecb_d1_double_slash_legacy_row_deduped_via_alt_url(tmp_path):
+    """17 live D1/D2 rows (repec_discovery, 2026-07/08 vintage) carry the same
+    double-slash pdf_url artifact (`europa.eu//pub/pdf/...`) as the D3/C2
+    legacy rows above -- repec discovery always yields the normalized
+    single-slash form, so without indexing it these rows would silently
+    re-download on every nightly run. Same amendment, same convention:
+    normalized URL appended to alt_urls."""
+    legacy_url = ("https://www.ecb.europa.eu//pub/pdf/scpwps/"
+                  "ecb.wp3252~91761af52b.en.pdf")
+    normalized_url = ("https://www.ecb.europa.eu/pub/pdf/scpwps/"
+                       "ecb.wp3252~91761af52b.en.pdf")
+    row = {
+        "bank_code": "ecb", "doc_type": "D1",
+        "title": "A theory of bank liquidity requirements",
+        "pdf_url": legacy_url,
+        "source_url": "https://ideas.repec.org/p/ecb/ecbwps/20263252.html",
+        "date": "2026-07-01", "language": "en", "provenance": "repec_discovery",
+        "mime_type": "application/pdf",
+        "sha256": "f0aa3f6773d68af8026f8c6beb33ca67df3698d46c5d5667410c20f82f579248",
+        "local_path": "data/raw/ecb/D1/2026/c58765e17500b626.pdf",
+        "doc_id": "c58765e17500b626", "year": 2026,
+        "alt_urls": [normalized_url],
+    }
+    cfg = Config(data_dir=tmp_path)
+    cfg.manifest_dir.mkdir(parents=True, exist_ok=True)
+    cfg.manifest_file("ecb").write_text(json.dumps(row, ensure_ascii=False) + "\n")
+    st = Storage(cfg)
+    assert st.is_known_url(normalized_url)   # what repec discovery would yield
+    assert st.is_known_url(legacy_url)       # the legacy form itself still matches too
 
 
 # ---- storage (no domain guard in v2 — discovery layer owns URL quality) ----

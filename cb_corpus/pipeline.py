@@ -83,10 +83,12 @@ def run(bank_codes: Optional[Iterable[str]] = None,
         last_disc_errors = []
         for code in codes:
             adapter = get_adapter(code, fetcher)
-            # Let native D1/D2 discovery skip papers already known by URL (incl.
-            # alt_urls registered during the WP v3 migration) so a native-first
-            # bank doesn't re-download its back-catalogue. Only the native D1/D2
-            # branch reads this hook; other types/banks are unaffected.
+            # Let native discovery skip documents already known by URL (incl.
+            # alt_urls registered by migrations/data fixes, e.g. WP v3's native-URL
+            # registration or the ECB D3 double-slash legacy rows) so a native-first
+            # bank doesn't re-download/re-fetch its back-catalogue. Every native
+            # branch reads this hook (see adapters/base.py `discover()`); C1 (shared
+            # BIS index) and non-native RePEc D1/D2 are unaffected.
             adapter._skip_known_url = storage.is_known_url
             recs = adapter.discover_all(scope=scope, since=since,
                                         native_only=native_only)

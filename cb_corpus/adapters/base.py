@@ -119,7 +119,28 @@ class BankAdapter(ABC):
                 yield from (r for r in self._repec.discover_bank(self.bank.code)
                             if r.doc_type == doc_type)
         else:
-            yield from self._discover_native(doc_type, since)
+            # Every other native type (A/B/D3/E/F) is subject to the SAME
+            # already-known-URL skip as D1/D2 above, for the same reason: a
+            # native scraper's URL for a given post/release can differ from
+            # the one under which it was first indexed (a migration, a site
+            # reformat, an old one-off scraper's URL quirk — e.g. the ECB D3
+            # double-slash legacy rows, see `data: index normalized URL forms
+            # for 15 legacy D3 rows`). doc_id-based dedup in Storage.save()
+            # only catches that case if doc_id happens to match; is_known_url()
+            # (primary pdf_url + alt_urls) catches it unconditionally, and
+            # doing it here — before download — is what actually stops the
+            # nightly re-fetch, since save() only skips by doc_id BEFORE
+            # fetching too, not by URL. For every native type whose URL *is*
+            # stable across runs this is a no-op optimisation (save()'s
+            # doc_id check would have skipped it anyway) — there is no native
+            # type/adapter that relies on re-yielding an already-known URL to
+            # pick up changed content (audited: no adapter re-fetches a stable
+            # URL for that purpose; see fix/silent-series task-1 report).
+            recs = self._discover_native(doc_type, since)
+            skip = getattr(self, "_skip_known_url", None)
+            if skip is not None:
+                recs = (r for r in recs if not skip(r.pdf_url))
+            yield from recs
 
     def discover_all(self, scope: tuple[DocType, ...] = FULL_SCOPE,
                      since: Optional[date] = None,

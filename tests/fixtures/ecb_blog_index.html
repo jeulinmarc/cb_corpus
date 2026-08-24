@@ -1,0 +1,65 @@
+<!--
+Trimmed REAL response, captured 2026-08-24 from
+https://www.ecb.europa.eu/press/blog/html/index.en.html (one gentle live
+fetch; see docs/superpowers/sdd task-1 report). Kept:
+  - a modern (8-digit URL date) card: <a class="content-box"> + duplicate
+    <a class="arrow"> language-selector anchor pointing at the same URL
+    (dedup-by-url case; title/date read off the content-box anchor).
+  - a legacy (6-digit URL date, still year-2024) card, same anchor shape.
+  - a non-English sibling (.es.html) next to its .en.html card, to prove the
+    ".en.html$" filter excludes it.
+  - the real "ecb.blog0227~...en.html" card: its URL carries no full date
+    (4 digits only, no year) but its <h5> label ("27 February 2026") does —
+    exercises the label fallback ("day precision ... from the URL/labels as
+    available", spec A).
+  - one SYNTHETIC anchor (marked below) whose URL and label both carry no
+    parseable date at all — the genuinely malformed case, skipped w/ warning.
+-->
+<html><body>
+<div class="cards -three-columns -landscape-img -align-left -filter -blue">
+
+<div class="container">
+  <div class="wrapper"><div class="box">
+    <a class="content-box" href="/press/blog/date/2024/html/ecb.blog20241119~cccee738e1.en.html">
+      <div data-image="/press/blog/date/2024/html//ecb.blog20241119~cccee738e1/ecb.blog20241119~cccee738e1.jpg"></div>
+      <h5>19 November 2024</h5>
+      <h3>How resilient are banks, investment funds and insurers to stresses arising during the green transition?</h3>
+      <p>ECB Vice-President Luis de Guindos explains the findings.</p>
+    </a>
+    <div class="ecb-langSelector"><span class="offeredLanguage"><a class='arrow' lang="en" href="/press/blog/date/2024/html/ecb.blog20241119~cccee738e1.en.html">
+      <span class="ecb-full">English</span></a></span></div>
+  </div><div class="box">
+    <a class="content-box" href="/press/blog/date/2021/html/ecb.blog210401~6407b23d87.es.html">
+      <h5>1 April 2021</h5>
+      <h3>Spanish-language sibling, must be excluded</h3>
+    </a>
+  </div><div class="box">
+    <a class="content-box" href="/press/blog/date/2024/html/ecb.blog241114~6a3182c0bd.en.html">
+      <div data-image="/press/blog/date/2024/html//ecb.blog241114~6a3182c0bd/ecb.blog241114~6a3182c0bd.jpg"></div>
+      <h5>14 November 2024</h5>
+      <h3>Quantitative Tightening: How do shrinking Eurosystem bond holdings affect long-term interest rates?</h3>
+      <p>The Eurosystem has started to reduce its bond holdings.</p>
+    </a>
+    <div class="ecb-langSelector"><span class="offeredLanguage"><a class='arrow' lang="en" href="/press/blog/date/2024/html/ecb.blog241114~6a3182c0bd.en.html">
+      <span class="ecb-full">English</span></a></span></div>
+  </div><div class="box">
+    <a class="content-box" href="/press/blog/date/2026/html/ecb.blog0227~6b22122610.en.html">
+      <div data-image="/press/blog/date/2026/html//ecb.blog0227~6b22122610/ecb.blog0227~6b22122610.jpg"></div>
+      <h5>27 February 2026</h5>
+      <h3>Learning from misses: what forecast errors reveal about the nature of shocks</h3>
+      <p>Economic forecasts rarely hit the mark as reality is full of surprises.</p>
+    </a>
+    <div class="ecb-langSelector"><span class="offeredLanguage"><a class='arrow' lang="en" href="/press/blog/date/2026/html/ecb.blog0227~6b22122610.en.html">
+      <span class="ecb-full">English</span></a></span></div>
+  </div><div class="box">
+    <!-- SYNTHETIC: no date anywhere (URL nor label) -> malformed, must be
+         skipped with a warning, not crash discovery. -->
+    <a class="content-box" href="/press/blog/date/2026/html/ecb.blog-untitled~deadbeef00.en.html">
+      <h3>Untitled placeholder with no date badge</h3>
+      <p>No h5 date label, no date-shaped digits in the URL.</p>
+    </a>
+  </div></div>
+</div>
+
+</div>
+</body></html>
