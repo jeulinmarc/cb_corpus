@@ -294,3 +294,23 @@ grep -q "FAILED \[campaign\] rc=1" "$D/reports/last_run_status" || fail "FAILED 
 unset PY_EXIT
 
 echo "RUN_JOB_OK"
+
+# T17 — cadence watchdog: runs cadence-watch --write, exits 0 on success.
+newdir
+/app/deploy/run-job.sh cadence
+grep -q "PYARGS:-m cb_corpus cadence-watch --write" "$PY_LOG" \
+  || fail "cadence watchdog must run cadence-watch --write"
+grep -q "\[cadence\] OK" "$D/reports/nas_runs.log" || fail "cadence OK not logged"
+grep -q "OK \[cadence\]" "$D/reports/last_run_status" || fail "cadence status missing"
+
+# T17b — cadence non-zero rc propagates.
+newdir; export PY_EXIT=1
+set +e
+/app/deploy/run-job.sh cadence
+RC=$?
+set -e
+[ "$RC" -eq 1 ] || fail "cadence exit code must equal python's rc (got $RC)"
+grep -q "FAILED \[cadence\] rc=1" "$D/reports/last_run_status" || fail "cadence FAILED status missing"
+unset PY_EXIT
+
+echo "RUN_JOB_CADENCE_OK"

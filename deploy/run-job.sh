@@ -47,7 +47,7 @@ if [ "${CB_ALLOW_EMPTY_DATA:-0}" != "1" ]; then
 fi
 
 case "$JOB" in
-  sync|campaign) ;;
+  sync|campaign|cadence) ;;
   *) echo "run-job: unknown job '$JOB'" >&2; exit 2 ;;
 esac
 
@@ -180,13 +180,14 @@ run_job() {
   case "$JOB" in
     sync)     run_sync ;;
     campaign) python -m cb_corpus "$@" ;;
+    cadence)  python -m cb_corpus cadence-watch --write ;;
   esac
 }
 
 exec 9>"$LOCK"
 case "$JOB" in
-  campaign)
-    # a campaign waits its turn (sync or another campaign in progress);
+  campaign|cadence)
+    # a campaign or cadence watchdog waits its turn (sync or another job in progress);
     # log once, visibly, before blocking so an operator watching
     # nas_runs.log isn't left guessing why nothing is happening.
     flock -n 9 || { log "WAITING (lock busy)"; flock 9; } ;;
@@ -204,6 +205,8 @@ if [ "$JOB" = "sync" ]; then
   else
     log "START (full)"
   fi
+elif [ "$JOB" = "cadence" ]; then
+  log "START"
 else
   log "START"
 fi

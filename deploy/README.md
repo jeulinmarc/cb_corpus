@@ -124,6 +124,32 @@ into the stack's folder under the name `deploy_key` → Deploy. The container
 waits for any running sync or campaign to finish (lock), runs, pushes the state, stops.
 To launch another campaign: re-edit `command:` + Deploy.
 
+## 4a. Weekly cadence watchdog (automated)
+
+The cadence watchdog detects silent series — banks/doc-types with no new
+publications for longer than their median publication interval. It runs
+Sundays at 06:30 (after the full sweep completes) via `run-job.sh cadence`.
+
+**Output:** `data/cadence.jsonl` (beside `manifest/`, auto-gitignored) contains
+one JSON line per series: `{bank_code, doc_type, last, interval_days,
+next_expected, days_until, status, expected_per_year, n_3y}`. Status is
+`overdue` (>7d past expected), `soon` (≤60d to expected), or `on-track`.
+
+**Alerting:** State file `data/cadence_state.jsonl` remembers known-overdue
+series — the job logs only NEW silences to stderr, one line per series per
+run (no alert noise on recovery). Logs to `nas_runs.log`: `cadence: N overdue
+(M new)`.
+
+**Muting:** Deliberately-closed series (e.g. a future decision) are silenced
+by seeding a `{"bank_code", "doc_type", "muted": true, "reason"}` line in
+the state file — muted series are still written to cadence.jsonl (dashboard
+transparency) but never alerted.
+
+**Tuning:** Env vars override thresholds (no hard-coded constants):
+`CADENCE_OVERDUE_GRACE_DAYS` (default 7), `CADENCE_SOON_DAYS` (default 60),
+`CADENCE_MIN_DOCS` (default 6, minimum to detect a median), `CADENCE_LOOKBACK_YEARS`
+(default 3).
+
 ## 5. Sanity checks
 
 - `data/reports/nas_runs.log` and `last_run_status` visible in Finder (SMB).
