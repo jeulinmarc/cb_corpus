@@ -89,6 +89,17 @@ def test_resurrection_then_refailure_restarts_the_night_count(tmp_path):
     assert q.is_quarantined(url) is True
 
 
+def test_record_success_is_noop_on_unknown_url(tmp_path):
+    """If record_success is called on a URL never seen before (no active state),
+    it returns without writing — a guard against unbounded growth."""
+    q = _mk(tmp_path)
+    unknown_url = "https://x.test/never-seen.pdf"
+    q.record_success(unknown_url)
+
+    path = tmp_path / "download_quarantine.jsonl"
+    assert not path.exists() or path.read_text() == ""
+
+
 # --- bypass env ---------------------------------------------------------------
 
 def test_quarantine_retry_bypasses_skip_decision_but_keeps_state(tmp_path, monkeypatch):
@@ -118,6 +129,30 @@ def test_bypass_does_not_count_toward_skipped_count(tmp_path, monkeypatch):
     q.is_quarantined(url)
     assert q.skipped_count() == 0
     assert q.summary_line() is None
+
+
+def test_decision_locking_recomputes_threshold_on_fresh_instance(tmp_path, monkeypatch):
+    """Quarantine decision is not cached — it recomputes against the CURRENT
+    threshold at call time (both is_quarantined and fresh instance reload).
+    Write 5 failures with threshold=5 (quarantined), then a fresh instance
+    with threshold=10 must see is_quarantined()=False, then back to 5 must
+    see True again."""
+    monkeypatch.setenv("QUARANTINE_AFTER_NIGHTS", "5")
+    q = _mk(tmp_path)
+    url = "https://x.test/dead.pdf"
+    for night in ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04", "2026-08-05"]:
+        q.record_failure(url, night)
+    assert q.is_quarantined(url) is True
+
+    # Fresh instance with higher threshold: same 5 nights now insufficient.
+    monkeypatch.setenv("QUARANTINE_AFTER_NIGHTS", "10")
+    q_higher = _mk(tmp_path)
+    assert q_higher.is_quarantined(url) is False
+
+    # Back to threshold=5: URL is quarantined again.
+    monkeypatch.setenv("QUARANTINE_AFTER_NIGHTS", "5")
+    q_restored = _mk(tmp_path)
+    assert q_restored.is_quarantined(url) is True
 
 
 # --- custom threshold (read at call time) -------------------------------------

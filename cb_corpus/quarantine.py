@@ -98,6 +98,11 @@ class Quarantine:
             self._state[url] = {"nights": list(row.get("nights") or [])}
 
     def _append(self, row: dict) -> None:
+        """Append a single JSON row. Each row is a single small write() call on
+        an O_APPEND handle (effectively atomic on POSIX). Unlike storage.py's
+        _append, no flock is taken because quarantine writes happen from the
+        serialized sync loop, not parallel workers — callers must keep it that
+        way."""
         self.cfg.data_dir.mkdir(parents=True, exist_ok=True)
         with self._path.open("a") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -145,7 +150,13 @@ class Quarantine:
     def record_success(self, url: str) -> None:
         """Release `url`: append a `released` tombstone and clear in-memory
         state. A subsequent failure starts a fresh night count from zero —
-        no memory of the prior failing streak survives a release."""
+        no memory of the prior failing streak survives a release.
+
+        No-op if `url` has no active state (not in the in-memory dict) — a
+        guard against unbounded growth if callers fire this on every successful
+        download without checking quarantine status first."""
+        if url not in self._state:
+            return
         self._state.pop(url, None)
         self._append({"url": url, "released": True})
 
