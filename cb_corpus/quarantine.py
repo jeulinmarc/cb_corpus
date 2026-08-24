@@ -217,8 +217,8 @@ class Quarantine:
         Quarantine instance in one process (e.g. one discovery run working
         multiple banks in turn) gets each batch's OWN skip count here,
         rather than a running cumulative total that keeps growing across
-        every batch. `skipped_count()` is unaffected by this reset -- it
-        stays a live, non-consuming read of the current run's total."""
+        every batch. `skipped_count()` reads the same counter, so after a
+        `summary_line()` call it too reports skips since that reset."""
         if self._skipped == 0:
             return None
         line = f"quarantine: skipped {self._skipped} url(s)"
