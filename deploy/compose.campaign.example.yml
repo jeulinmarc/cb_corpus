@@ -1,0 +1,18 @@
+# Dockge stack "cb-campaign" — long on-demand campaign.
+# Edit `command:` (full cb_corpus sub-command) then Deploy.
+# The container waits for the lock if a sync is running, then stops at the end.
+services:
+  cb-campaign:
+    image: ghcr.io/jeulinmarc/cb_corpus:latest
+    restart: "no"
+    user: "PUID:PGID"
+    stop_grace_period: 60s     # SIGTERM grace before SIGKILL — a mid-write kill
+                                # can torn-tail a manifest line (see storage.py repair)
+    environment:
+      TZ: Europe/Paris
+      AUTOCOMMIT: "1"
+    command: ["/app/deploy/run-job.sh", "campaign",
+              "discover", "--banks", "fr,it", "--types", "A3", "--download", "--rounds", "3"]
+    volumes:
+      - /mnt/POOL/DATASET:/app/data
+      - ./deploy_key:/run/secrets/deploy_key:ro

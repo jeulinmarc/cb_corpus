@@ -1013,7 +1013,7 @@ def test_pipeline_run_converges_and_records_errors(tmp_path, monkeypatch):
                            if rounds_seen["n"] == 0 else [])
             rounds_seen["n"] += 1
 
-        def discover_all(self, scope, since):
+        def discover_all(self, scope, since, native_only=False):
             return iter([])
 
     class FakeStorage:

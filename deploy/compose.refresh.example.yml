@@ -1,0 +1,24 @@
+# Dockge stack "cb-refresh" — one nightly sync (catalogs + native discover).
+# REPLACE the placeholders (POOL/DATASET/PUID/PGID) in Dockge ONLY.
+# NEVER commit the filled-in version: the repo is public.
+services:
+  cb-refresh:
+    image: ghcr.io/jeulinmarc/cb_corpus:latest
+    restart: unless-stopped
+    user: "PUID:PGID"          # UID:GID of the dataset owner (discover-ids stack)
+    stop_grace_period: 60s     # SIGTERM grace before SIGKILL — a mid-write kill
+                                # can torn-tail a manifest line (see storage.py repair)
+    environment:
+      TZ: Europe/Paris
+      DISCOVER_BANKS: all      # "all" or a comma list of bank codes (us,ecb,fr)
+      DISCOVER_TYPES: full     # "full" (= whole A-F scope) or a comma list (A3,E2)
+      DISCOVER_ROUNDS: "1"     # incremental: first listing pages only
+      DISCOVER_WORKERS: "6"    # banks crawled in parallel (bounds CPU/RAM/bandwidth)
+      SYNC_WINDOW_DAYS: "90"   # catalog freshness window Mon-Sat; Sunday sweeps full
+      # DISCOVER_BANK_TIMEOUT: "10800"  # s per bank before the crawl is killed
+      AUTOCOMMIT: "1"
+    volumes:
+      - /mnt/POOL/DATASET:/app/data              # host path of the SMB dataset
+      - ./deploy_key:/run/secrets/deploy_key:ro  # key dropped into the stack's folder
+    # mem_limit: 4g        # discover peak: ~6 x (python + headless chromium) = 2-3 GB
+    # cpus: "2"

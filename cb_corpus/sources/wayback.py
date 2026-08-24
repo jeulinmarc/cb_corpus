@@ -60,22 +60,34 @@ def first_capture(fetcher: Fetcher, url: str) -> Optional[str]:
     return rows[0][0] if rows else None
 
 
+def latest_capture(fetcher: Fetcher, url: str,
+                   mimetype: str = "application/pdf") -> Optional[str]:
+    """Latest HTTP-200 snapshot timestamp (YYYYMMDDhhmmss) for an EXACT url, else
+    None. Mirrors `first_capture`'s exact-url style (no `matchType=prefix` — a
+    prefix match would bleed in unrelated documents sharing the path).
+
+    `limit=-1` asks CDX for the tail of the resultset (most recent capture) —
+    same convention `wayback_for_url` already relied on. Filtered to `mimetype`
+    (default the PDF the recovery flows care about).
+    """
+    q = (f"{CDX}?url={url}&filter=statuscode:200&filter=mimetype:{mimetype}"
+         f"&output=json&fl=timestamp&limit=-1")
+    try:
+        rows = json.loads(fetcher.get_text(q))
+    except Exception:
+        return None
+    rows = [r for r in rows if r and r[0] != "timestamp"]
+    return rows[0][0] if rows else None
+
+
 def wayback_for_url(fetcher: Fetcher, url: str) -> Optional[str]:
     """Latest archived PDF snapshot (raw-bytes URL) for ONE exact url, or None.
 
     For sources with opaque paths (e.g. riksbank.com/upload/<id>/...) where a CDX
     prefix can't isolate the right documents, we query the exact url instead.
     """
-    q = (f"{CDX}?url={url}&filter=statuscode:200&filter=mimetype:application/pdf"
-         f"&output=json&fl=timestamp&limit=-1")   # limit=-1 -> most recent capture
-    try:
-        rows = json.loads(fetcher.get_text(q))
-    except Exception:
-        return None
-    rows = [r for r in rows if r and r[0] != "timestamp"]
-    if not rows:
-        return None
-    return raw_url(url, rows[0][0])
+    ts = latest_capture(fetcher, url)
+    return raw_url(url, ts) if ts else None
 
 
 class WaybackSource(Source):

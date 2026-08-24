@@ -58,7 +58,8 @@ def run(bank_codes: Optional[Iterable[str]] = None,
         since: Optional[date] = None,
         dry_run: bool = True,
         config: Optional[Config] = None,
-        max_rounds: int = 1) -> dict[str, dict[str, int]]:
+        max_rounds: int = 1,
+        native_only: bool = False) -> dict[str, dict[str, int]]:
     """Crawl + (optionally) download. dry_run=True only indexes URLs.
 
     With ``max_rounds > 1`` the crawl repeats until a round downloads nothing
@@ -87,7 +88,8 @@ def run(bank_codes: Optional[Iterable[str]] = None,
             # bank doesn't re-download its back-catalogue. Only the native D1/D2
             # branch reads this hook; other types/banks are unaffected.
             adapter._skip_known_url = storage.is_known_url
-            recs = adapter.discover_all(scope=scope, since=since)
+            recs = adapter.discover_all(scope=scope, since=since,
+                                        native_only=native_only)
             counts = storage.save_many(recs, dry_run=dry_run, label=code)
             results[code] = counts
             round_saved += counts.get("saved", 0)
@@ -358,13 +360,20 @@ def reindex_bis_from_disk(only_banks: Optional[set[str]] = None,
 
 def run_repec(bank_codes: Optional[Iterable[str]] = None,
               dry_run: bool = True,
-              config: Optional[Config] = None) -> dict[str, dict[str, int]]:
+              config: Optional[Config] = None,
+              incremental: bool = False) -> dict[str, dict[str, int]]:
     """Discover + (optionally) download RePEc working papers (D1/D2) for every
     SERIES-wired bank, following IDEAS pagination so the full back-catalogue is
     captured (not just the ~200 newest per series).
 
     One pass per bank, idempotent (dedup on doc_id + sha256), so re-running only
-    fills gaps. Returns {bank_code: {status: count}}.
+    fills gaps. Papers already known by their IDEAS source URL are skipped
+    BEFORE the per-paper fetch in BOTH modes (collision-free by construction:
+    the tested URL IS the record's own source_url). With ``incremental=True``
+    (nightly mode), a series' pagination additionally stops at the first
+    listing page that is fully known (the weekly full sweep omits this to
+    still catch backfills, keeping full pagination for completeness). Returns
+    {bank_code: {status: count}}.
     """
     from .sources.repec import RePEcDiscovery, SERIES
     cfg, fetcher, storage = _make_storage(config)
@@ -375,7 +384,17 @@ def run_repec(bank_codes: Optional[Iterable[str]] = None,
         if code not in SERIES:
             continue
         results[code] = storage.save_many(
-            rep.discover_bank(code), dry_run=dry_run, label=f"repec:{code}")
+            rep.discover_bank(
+                code,
+                # Always skip by source_url: in RePEc the tested URL IS the
+                # record's own source_url (one paper page, one record), so
+                # this pre-fetch skip is collision-free by construction, in
+                # both modes. stop_on_known stays incremental-only: full
+                # sweeps keep full pagination for completeness, they just
+                # stop re-fetching pages of papers already owned.
+                skip_url=storage.is_known_source_url,
+                stop_on_known=incremental),
+            dry_run=dry_run, label=f"repec:{code}")
     return results
 
 
