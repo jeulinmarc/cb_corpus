@@ -564,6 +564,197 @@ def test_build_report_fr_join_stamps_alt_url_and_upgrades_date(monkeypatch):
     # identity untouched
     assert row["doc_id"] == "fr155" and row["sha256"] == "h155"
     assert row["pdf_url"] == manifest[0]["pdf_url"]
+# ---- Sveriges Riksbank (se) working papers ---------------------------
+from cb_corpus.sources.riksbank_wp import (
+    parse_wp_listing, se_url_number, se_handle_number, discover_riksbank_wp, RIKSBANK,
+)
+
+# Trimmed real markup (captured live, Aug 2026): a modern "no.-NNN-slug.pdf"
+# row, a real odd row whose href has NO .pdf extension (still served as a PDF
+# on the live site — verified by content-type; never filtered on extension),
+# a legacy "wpNNN.pdf" row, an unrelated nav anchor (must be skipped), and a
+# row with neither a "No. NNN" title prefix nor a parseable date (defensive
+# fallback: title/pdf still captured, number/date come back None).
+_SE_LISTING = """
+<a href="/en-gb/other/page/">Unrelated nav link</a>
+<div class="listing-block__body"><ul>
+<li>
+<a href="/globalassets/media/rapporter/working-papers/2026/no.-465-the-role-of-firm-heterogeneity-for-the-transmission-of-aggregate-shocks.pdf" target="_blank" rel="noopener">
+	<span class="label">29/04/2026</span>
+	<span class="header">
+		<span class="header--file__title">No. 465 The Role of Firm Heterogeneity for the Transmission of Aggregate Shocks</span>
+		<span class="header--file__meta"><span class="icon icon--file icon--file-pdf"><span class="sr-only">pdf</span></span>3.2 MB</span>
+	</span>
+</a>
+</li>
+<li>
+<a href="/globalassets/media/rapporter/working-papers/2016/no.-317-subprime-borrowers-securitization-and-the-transmission-of-business-cycles" target="_blank" rel="noopener">
+	<span class="label">03/03/2016</span>
+	<span class="header">
+		<span class="header--file__title">No. 317 Subprime Borrowers, Securitization and the Transmission of Business Cycles</span>
+		<span class="header--file__meta"><span class="icon icon--file icon--file-pdf"><span class="sr-only">pdf</span></span>2.4 MB</span>
+	</span>
+</a>
+</li>
+<li>
+<a href="/globalassets/media/rapporter/working-papers/2017/wp344.pdf" target="_blank" rel="noopener">
+	<span class="label">12/05/2016</span>
+	<span class="header">
+		<span class="header--file__title">No. 344 Identification and Estimation issues in Exponential Smooth Transition Autoregressive Models</span>
+		<span class="header--file__meta"><span class="icon icon--file icon--file-pdf"><span class="sr-only">pdf</span></span>1.1 MB</span>
+	</span>
+</a>
+</li>
+<li>
+<a href="/globalassets/media/rapporter/working-papers/2015/special-report.pdf" target="_blank" rel="noopener">
+	<span class="label">not-a-date</span>
+	<span class="header">
+		<span class="header--file__title">Special Report Without A Number Prefix</span>
+	</span>
+</a>
+</li>
+</ul></div>
+<nav class="pagination"><a href="?&page=2">2</a></nav>
+"""
+
+
+def test_se_parse_listing_number_date_title_and_odd_filename():
+    rows = parse_wp_listing(_SE_LISTING)
+    assert len(rows) == 4                                 # nav link excluded
+    num0, d0, t0, u0 = rows[0]
+    assert num0 == 465 and d0 == date(2026, 4, 29)
+    assert t0 == "The Role of Firm Heterogeneity for the Transmission of Aggregate Shocks"
+    assert u0 == RIKSBANK + ("/globalassets/media/rapporter/working-papers/2026/"
+                             "no.-465-the-role-of-firm-heterogeneity-for-the-transmission-of-aggregate-shocks.pdf")
+    # real odd row: no .pdf extension, still scraped verbatim (never derived/rewritten)
+    num1, d1, t1, u1 = rows[1]
+    assert num1 == 317 and d1 == date(2016, 3, 3)
+    assert t1 == "Subprime Borrowers, Securitization and the Transmission of Business Cycles"
+    assert not u1.endswith(".pdf")
+    assert u1.endswith("no.-317-subprime-borrowers-securitization-and-the-transmission-of-business-cycles")
+    # legacy filename form
+    num2, d2, t2, u2 = rows[2]
+    assert num2 == 344 and u2.endswith("/2017/wp344.pdf")
+    # defensive fallback: no "No. NNN" prefix / unparseable date -> None, not a crash
+    num3, d3, t3, u3 = rows[3]
+    assert num3 is None and d3 is None
+    assert t3 == "Special Report Without A Number Prefix"
+    assert u3.endswith("special-report.pdf")
+
+
+def test_se_url_number_across_filename_eras():
+    from cb_corpus.sources.riksbank_wp import RIKSBANK as R
+    assert se_url_number(R + "/globalassets/.../no.-465-a-title.pdf") == 465
+    assert se_url_number(R + "/globalassets/.../no-358-predictors-of-bank-distress.pdf") == 358
+    assert se_url_number(R + "/globalassets/.../no.355-a-shadow-rate-without-a-lower-bound-constraint") == 355
+    assert se_url_number(R + "/globalassets/.../wp344.pdf") == 344
+    assert se_url_number(R + "/globalassets/.../rap_wp337_170221.pdf") == 337
+    assert se_url_number("http://www.riksbank.se/.../WP312%20Updated%20version.pdf") == 312
+    assert se_url_number("http://archive.riksbank.se/.../wp_119.pdf") == 119
+    assert se_url_number("http://www.riksbank.com/upload/993/98nr75.pdf") is None   # pre-scheme filename
+
+
+def test_se_handle_number_from_repec_handle_and_ideas_url():
+    assert se_handle_number("https://ideas.repec.org/p/hhs/rbnkwp/0465.html") == 465
+    assert se_handle_number("RePEc:hhs:rbnkwp:0179") == 179
+    assert se_handle_number("https://ideas.repec.org/p/boe/boeewp/1234.html") is None
+    # native URL key == manifest handle key for the same paper
+    assert se_url_number("https://www.riksbank.se/.../no.-317-subprime.pdf") == se_handle_number(
+        "https://ideas.repec.org/p/hhs/rbnkwp/0317.html")
+
+
+_SE_PAGE1 = """<div class="listing-block__body"><ul>
+<li><a href="/globalassets/media/rapporter/working-papers/2026/no.-465-a.pdf">
+<span class="label">29/04/2026</span><span class="header">
+<span class="header--file__title">No. 465 Paper A</span></span></a></li>
+<li><a href="/globalassets/media/rapporter/working-papers/2026/no.-464-b.pdf">
+<span class="label">13/03/2026</span><span class="header">
+<span class="header--file__title">No. 464 Paper B</span></span></a></li>
+</ul></div>"""
+_SE_PAGE2 = """<div class="listing-block__body"><ul>
+<li><a href="/globalassets/media/rapporter/working-papers/2025/no.-457-c.pdf">
+<span class="label">25/11/2025</span><span class="header">
+<span class="header--file__title">No. 457 Paper C</span></span></a></li>
+<li><a href="/globalassets/media/rapporter/working-papers/2025/no.-452-d.pdf">
+<span class="label">08/07/2025</span><span class="header">
+<span class="header--file__title">No. 452 Paper D</span></span></a></li>
+</ul></div>"""
+
+
+def test_discover_riksbank_wp_walks_pages_until_empty():
+    pages = {"page=1": _SE_PAGE1, "page=2": _SE_PAGE2, "page=3": ""}
+
+    class F:
+        def get_text(self, url):
+            for k, v in pages.items():
+                if url.endswith(k):
+                    return v
+            raise AssertionError(f"unexpected {url}")
+
+    recs = list(discover_riksbank_wp(F()))
+    assert [r.title for r in recs] == ["Paper A", "Paper B", "Paper C", "Paper D"]
+    assert all(r.bank_code == "se" and r.doc_type == DocType.D1
+               and r.provenance == "bank_site" and r.date_precision == "day"
+               for r in recs)
+
+
+def test_discover_riksbank_wp_since_stops_before_next_page():
+    pages = {"page=1": _SE_PAGE1, "page=2": _SE_PAGE2}
+
+    class F:
+        def get_text(self, url):
+            for k, v in pages.items():
+                if url.endswith(k):
+                    return v
+            raise AssertionError(f"should not fetch beyond page 2: {url}")   # early-stop proof
+
+    recs = list(discover_riksbank_wp(F(), since=date(2026, 1, 1)))
+    assert [r.title for r in recs] == ["Paper A", "Paper B"]     # page 2 all older -> stop, never re-fetched
+
+
+def test_wp_migrate_se_key_match_registers_alt_url(monkeypatch):
+    """The real production gap: a legacy RePEc-discovered se row's pdf_url (the
+    old riksbank.se/Documents/... form) differs from the current native listing
+    URL for the SAME WP number -> matched by key, day date applied, and the
+    native URL registered in alt_urls (zero re-download guard)."""
+    native = [DocRecord(
+        bank_code="se", doc_type=DocType.D1,
+        title="Subprime Borrowers, Securitization and the Transmission of Business Cycles",
+        pdf_url=("https://www.riksbank.se/globalassets/media/rapporter/working-papers/2016/"
+                 "no.-317-subprime-borrowers-securitization-and-the-transmission-of-business-cycles"),
+        date=date(2016, 3, 3))]
+    monkeypatch.setitem(wp_migrate._NATIVE, "se", lambda fetcher: iter(native))
+    manifest = [{
+        "doc_id": "s317", "bank_code": "se", "doc_type": "D1", "date": "2016-03-01",
+        "pdf_url": "http://www.riksbank.se/Documents/Rapporter/Working_papers/2016/rap_wp317_160303.pdf",
+        "source_url": "https://ideas.repec.org/p/hhs/rbnkwp/0317.html",
+    }]
+    summary, changes = build_report("se", fetcher=None, manifest_rows=manifest)
+    assert summary["matched_key"] == 1 and summary["unmatched_manifest"] == 0
+    c = changes[0]
+    assert c["match_type"] == "key"
+    assert c["old_date"] == "2016-03-01" and c["new_date"] == "2016-03-03"
+    assert c["date_precision"] == "day"
+    assert c["repec_handle"] == "RePEc:hhs:rbnkwp:0317"
+    assert c["alt_url_added"] == native[0].pdf_url          # different URL -> registered
+
+
+def test_riksbank_adapter_routes_d1_native_and_skips_known_urls(monkeypatch):
+    from cb_corpus.adapters.se import RiksbankAdapter
+    import cb_corpus.sources.riksbank_wp as se_mod
+    recs = [
+        DocRecord(bank_code="se", doc_type=DocType.D1, title="a",
+                  pdf_url="https://www.riksbank.se/globalassets/.../no.-466-a.pdf"),
+        DocRecord(bank_code="se", doc_type=DocType.D1, title="b",
+                  pdf_url="https://www.riksbank.se/globalassets/.../no.-467-b.pdf"),
+    ]
+    monkeypatch.setattr(se_mod, "discover_riksbank_wp", lambda fetcher, since=None: iter(recs))
+    ad = RiksbankAdapter(get_bank("se"), fetcher=object())
+    assert DocType.D1 in ad.native_types
+    assert [r.title for r in ad.discover(DocType.D1)] == ["a", "b"]
+    # is_known_url hook (the pipeline's zero-redownload guard) skips known URLs before download
+    ad._skip_known_url = lambda u: u.endswith("no.-466-a.pdf")
+    assert [r.title for r in ad.discover(DocType.D1)] == ["b"]
 
 
 # ---- phase 4: wp-dates day recovery ---------------------------------
