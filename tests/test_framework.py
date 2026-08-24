@@ -16,7 +16,7 @@ from cb_corpus.adapters.listing_crawler import (
 from cb_corpus.adapters.fed import FedAdapter, parse_minutes_links
 from cb_corpus.adapters.ecb import (
     ECBAdapter, parse_index, parse_year_includes, parse_account_items,
-    parse_bulletin_pdfs,
+    parse_bulletin_pdfs, parse_blog_items, BLOG_INDEX,
 )
 from cb_corpus.sources.bis_speeches import (
     parse_listing, parse_sitemap_index, parse_year_sitemap, parse_detail,
@@ -709,6 +709,71 @@ def test_ecb_bulletin_pdfs_keep_english_only():
     rows = parse_bulletin_pdfs(html)
     assert len(rows) == 2
     assert all(u.endswith(".en.pdf") for _, _, u in rows)
+
+
+# ---- ECB D3 blog discovery (master listing) ---------------------------
+_ECB_BLOG_FIXTURE = (Path(__file__).parent / "fixtures" / "ecb_blog_index.html").read_text()
+
+
+def test_ecb_blog_parser_dedups_by_url_excludes_non_english_and_falls_back_to_label_date():
+    """Parser-level: content-box/arrow duplicates collapse to one row per URL,
+    non-English siblings (.es.html) are excluded, and a URL with no parseable
+    date (the real 'ecb.blog0227~...' filename) still gets a day-precision
+    date from its <h5> label. The synthetic no-date-anywhere row is returned
+    with date=None (the caller's job to skip + warn)."""
+    rows = parse_blog_items(_ECB_BLOG_FIXTURE, BLOG_INDEX)
+    urls = [u for _, _, u in rows]
+    assert len(urls) == len(set(urls)) == 4          # deduped, incl. the malformed one
+    assert not any(u.endswith(".es.html") for u in urls)
+    by_url = {u: (d, t) for d, t, u in rows}
+    cccee = next(u for u in urls if "cccee738e1" in u)
+    assert by_url[cccee][0] == date(2024, 11, 19)
+    assert "resilient" in by_url[cccee][1].lower()
+    legacy = next(u for u in urls if "241114" in u)   # legacy 6-digit URL date
+    assert by_url[legacy][0] == date(2024, 11, 14)
+    labeled = next(u for u in urls if "blog0227" in u)   # URL has no full date
+    assert by_url[labeled][0] == date(2026, 2, 27)       # recovered from <h5> label
+    malformed = next(u for u in urls if "blog-untitled" in u)
+    assert by_url[malformed][0] is None
+
+
+def test_ecb_blog_discovery_yields_docrecords_day_precision_and_skips_malformed(capsys):
+    """Adapter-level: D3 discovery turns the listing into DocRecords (day
+    precision, bank_site provenance), and the anchor with no date anywhere is
+    skipped with a warning rather than crashing or yielding a bad row."""
+    class FakeFetcher:
+        def get_text(self, url):
+            assert url == BLOG_INDEX
+            return _ECB_BLOG_FIXTURE
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    recs = list(a.discover(DocType.D3))
+    assert len(recs) == 3
+    assert all(r.doc_type == DocType.D3 for r in recs)
+    assert all(r.bank_code == "ecb" for r in recs)
+    assert all(r.provenance == "bank_site" for r in recs)
+    assert all(r.date_precision == "day" for r in recs)
+    dates = sorted(r.date for r in recs)
+    assert dates == [date(2024, 11, 14), date(2024, 11, 19), date(2026, 2, 27)]
+    assert not any("blog-untitled" in r.pdf_url for r in recs)
+    err = capsys.readouterr().err
+    assert "blog-untitled" in err and "D3" in err
+
+
+def test_ecb_d3_native_and_reached_by_discover_all():
+    """Registry wiring: D3 must be declared native AND actually reachable
+    through the generic discover_all() path (supported_types() gate)."""
+    assert DocType.D3 in ECBAdapter.native_types
+
+    class FakeFetcher:
+        def get_text(self, url):
+            return _ECB_BLOG_FIXTURE
+
+    a = ECBAdapter(get_bank("ecb"), FakeFetcher())
+    assert DocType.D3 in a.supported_types()
+    recs = list(a.discover_all(scope=(DocType.D3,)))
+    assert len(recs) == 3
+    assert all(r.doc_type == DocType.D3 for r in recs)
 
 
 # ---- storage (no domain guard in v2 — discovery layer owns URL quality) ----

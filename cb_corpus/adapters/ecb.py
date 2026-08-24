@@ -1,19 +1,27 @@
 """European Central Bank adapter -- v2.
 
 Native ECB listings on ecb.europa.eu:
-  A3  monetary policy accounts   ~8/yr  (HTML-only since 2024 — stored as .html)
-  E4  Economic Bulletin          ~8/yr  (PDF)
+  A3  monetary policy accounts   ~8/yr    (HTML-only since 2024 — stored as .html)
+  E4  Economic Bulletin          ~8/yr    (PDF)
+  D3  ECB Blog posts             ~2-3/wk  (HTML-only, no PDF version)
 
 Accounts are now lazy-loaded year-by-year (`<year>/html/index_include.en.html`)
 and ECB no longer publishes a PDF version — the HTML is the canonical artifact.
 The Economic Bulletin index (`all_releases.en.html`) still inlines all PDF
 links for every release across years.
 
+The Blog's old per-section per-year include endpoint
+(`/press/blog/date/<year>/html/index_include.en.html`) is dead (404 for every
+year, checked 2026-08) — discovery instead parses the human-facing master
+listing (`BLOG_INDEX`), a static HTML page that inlines posts across years.
+
 Speeches (C1) and WPS/Occasional papers (D1/D2) come from the base class.
 """
 from __future__ import annotations
 
+import calendar
 import re
+import sys
 from datetime import date, datetime
 from typing import Iterator, Optional
 from urllib.parse import urljoin
@@ -27,6 +35,11 @@ from .base import BankAdapter, register
 ECB = "https://www.ecb.europa.eu"
 ACCOUNTS_INDEX = ECB + "/press/accounts/html/index.en.html"
 BULLETIN_INDEX = ECB + "/press/economic-bulletin/html/all_releases.en.html"
+# ECB Blog (D3) master listing — the per-year include endpoint
+# (`/press/blog/date/<year>/html/index_include.en.html`) is dead (404, all
+# years) as of 2026-08; this human-facing listing is the live static-HTML
+# source (posts inlined across years, no JS needed).
+BLOG_INDEX = ECB + "/press/blog/html/index.en.html"
 # Monetary-policy DECISIONS index (A1) — same lazy-load year-include mechanism
 # as accounts. Each year lists decisions (mp/legacy pr), accounts (mg) and
 # statements (is); we keep the decisions.
@@ -55,6 +68,14 @@ _STATEMENT_HTML_RE = re.compile(
     r"/(?:ecb\.)?is(\d{6})[~a-z0-9]*\.en\.html$", re.I)
 _BULLETIN_PDF_RE = re.compile(r"/pub/pdf/ecbu/eb(\d{4})(\d{2})\.en\.pdf$", re.I)
 _DATE_IN_HREF = re.compile(r"(\d{4})(\d{2})(\d{2})")
+# Blog post pages (D3), English only. Two filename eras coexist on the live
+# listing: modern `ecb.blog<YYYYMMDD>~<hash>.en.html` and legacy
+# `ecb.blog<YYMMDD>~<hash>.en.html` (both handled by `date_from_url(fmt="auto")`
+# from sources/ecb_pub.py — the same idiom `run_ecb_pub_recovery` used to
+# produce the original 212 rows).
+_BLOG_HTML_RE = re.compile(r"/press/blog/date/\d{4}/html/.*\.en\.html$", re.I)
+_LABEL_DATE_RE = re.compile(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})")
+_MONTH_NUMBER = {name.lower(): i for i, name in enumerate(calendar.month_name) if name}
 
 
 def _yymmdd_to_date(s: str) -> Optional[date]:
@@ -172,6 +193,58 @@ def parse_bulletin_pdfs(html: str, base_url: str = BULLETIN_INDEX
     return out
 
 
+def _date_from_label(text: str) -> Optional[date]:
+    """Parse a 'DD Month YYYY' label (the blog listing's <h5> date badge,
+    e.g. '27 February 2026') into a date. Returns None if unparseable."""
+    m = _LABEL_DATE_RE.search(text or "")
+    if not m:
+        return None
+    day, month_name, year = m.groups()
+    month = _MONTH_NUMBER.get(month_name.lower())
+    if not month:
+        return None
+    try:
+        return date(int(year), month, int(day))
+    except ValueError:
+        return None
+
+
+def parse_blog_items(html: str, base_url: str = BLOG_INDEX
+                     ) -> list[tuple[Optional[date], str, str]]:
+    """From the ECB blog master listing, return (date, title, url) for each
+    English-language post (`.en.html` only — non-English siblings share the
+    same card and must be excluded).
+
+    Each post appears in 1-2 anchors on the page (the card itself, plus a
+    duplicate "arrow" language-selector link) — deduped by url, first
+    occurrence wins. Date comes primarily from the URL (`date_from_url`,
+    handles both the modern 8-digit and legacy 6-digit filename eras);
+    when the URL carries no parseable date, falls back to the card's <h5>
+    label. A url with NEITHER is returned with date=None — the caller's
+    job to skip it (and warn), not this pure parser's.
+    """
+    from ..sources.ecb_pub import date_from_url
+    soup = BeautifulSoup(html, "lxml")
+    out: list[tuple[Optional[date], str, str]] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not _BLOG_HTML_RE.search(href):
+            continue
+        url = urljoin(base_url, href)
+        if url in seen:
+            continue
+        seen.add(url)
+        d = date_from_url(href, "auto")
+        h5 = a.find("h5") or (a.parent.find("h5") if a.parent is not None else None)
+        if d is None and h5 is not None:
+            d = _date_from_label(h5.get_text(" ", strip=True))
+        h3 = a.find("h3") or (a.parent.find("h3") if a.parent is not None else None)
+        title = h3.get_text(" ", strip=True) if h3 else ""
+        out.append((d, title, url))
+    return out
+
+
 # legacy fixture parser - kept so the existing unit test still runs
 def parse_index(html: str, base_url: str = ECB,
                 href_must_contain: str = "") -> list[tuple[Optional[date], str, str]]:
@@ -201,7 +274,7 @@ class ECBAdapter(BankAdapter):
     # WP v3 migration ran first (registered native URLs in alt_urls → zero
     # re-download; see docs/IMPLEMENTATION_PLAN.md phase 3).
     native_types = (DocType.A1, DocType.A2, DocType.A3, DocType.E4,
-                    DocType.D1, DocType.D2)
+                    DocType.D1, DocType.D2, DocType.D3)
     expected_per_year = {DocType.A1: 8, DocType.A2: 8, DocType.A3: 8, DocType.E4: 8}
 
     def _discover_native(self, doc_type: DocType,
@@ -224,6 +297,8 @@ class ECBAdapter(BankAdapter):
             yield from self._discover_accounts(since)
         elif doc_type == DocType.E4:
             yield from self._discover_bulletin(since)
+        elif doc_type == DocType.D3:
+            yield from self._discover_blog(since)
 
     def _discover_index(self, index_url, since, parse_fn, doc_type, title_prefix
                         ) -> Iterator[DocRecord]:
@@ -287,4 +362,32 @@ class ECBAdapter(BankAdapter):
                 mime_type="application/pdf",
                 # The all-releases page gives no day; date is Jan 1 of the year.
                 date_precision="year",
+            )
+
+    def _discover_blog(self, since: Optional[date]) -> Iterator[DocRecord]:
+        """D3 — ECB Blog posts, from the live master listing (see BLOG_INDEX
+        docstring: the old per-year include endpoint is dead). Blog posts are
+        HTML-only artifacts (no PDF version), same convention as the historical
+        212 rows recovered via the old one-off `run_ecb_pub_recovery` path."""
+        html = self._fetch_text(BLOG_INDEX, context="D3-index")
+        if html is None:
+            return
+        for d, title, url in parse_blog_items(html, BLOG_INDEX):
+            if d is None:
+                # Neither the URL nor the <h5> label carried a parseable date —
+                # a genuinely malformed anchor. Skip it (not re-runnable, so it
+                # doesn't belong in self.errors) but leave a visible breadcrumb.
+                print(f"!! ecb D3 blog: skipping anchor with no parseable date: {url}",
+                      file=sys.stderr, flush=True)
+                continue
+            if since and d < since:
+                continue
+            yield DocRecord(
+                bank_code="ecb", doc_type=DocType.D3,
+                title=title or f"ECB Blog {d.isoformat()}",
+                pdf_url=url,
+                source_url=BLOG_INDEX,
+                date=d,
+                provenance="bank_site",
+                mime_type="text/html",
             )
