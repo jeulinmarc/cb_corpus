@@ -984,6 +984,37 @@ def test_ecb_c2_double_slash_legacy_row_deduped_via_alt_url(tmp_path):
     assert st.is_known_url(legacy_url)       # the legacy form itself still matches too
 
 
+def test_ecb_d1_double_slash_legacy_row_deduped_via_alt_url(tmp_path):
+    """17 live D1/D2 rows (repec_discovery, 2026-07/08 vintage) carry the same
+    double-slash pdf_url artifact (`europa.eu//pub/pdf/...`) as the D3/C2
+    legacy rows above -- repec discovery always yields the normalized
+    single-slash form, so without indexing it these rows would silently
+    re-download on every nightly run. Same amendment, same convention:
+    normalized URL appended to alt_urls."""
+    legacy_url = ("https://www.ecb.europa.eu//pub/pdf/scpwps/"
+                  "ecb.wp3252~91761af52b.en.pdf")
+    normalized_url = ("https://www.ecb.europa.eu/pub/pdf/scpwps/"
+                       "ecb.wp3252~91761af52b.en.pdf")
+    row = {
+        "bank_code": "ecb", "doc_type": "D1",
+        "title": "A theory of bank liquidity requirements",
+        "pdf_url": legacy_url,
+        "source_url": "https://ideas.repec.org/p/ecb/ecbwps/20263252.html",
+        "date": "2026-07-01", "language": "en", "provenance": "repec_discovery",
+        "mime_type": "application/pdf",
+        "sha256": "f0aa3f6773d68af8026f8c6beb33ca67df3698d46c5d5667410c20f82f579248",
+        "local_path": "data/raw/ecb/D1/2026/c58765e17500b626.pdf",
+        "doc_id": "c58765e17500b626", "year": 2026,
+        "alt_urls": [normalized_url],
+    }
+    cfg = Config(data_dir=tmp_path)
+    cfg.manifest_dir.mkdir(parents=True, exist_ok=True)
+    cfg.manifest_file("ecb").write_text(json.dumps(row, ensure_ascii=False) + "\n")
+    st = Storage(cfg)
+    assert st.is_known_url(normalized_url)   # what repec discovery would yield
+    assert st.is_known_url(legacy_url)       # the legacy form itself still matches too
+
+
 # ---- storage (no domain guard in v2 — discovery layer owns URL quality) ----
 def test_storage_indexes_any_url_in_dry_run(tmp_path):
     cfg = Config(data_dir=tmp_path)
