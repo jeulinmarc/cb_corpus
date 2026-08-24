@@ -14,6 +14,11 @@ if [ "$JOB" = "sync" ]; then
   fi
 fi
 
+# Sunday full sweep retries quarantined URLs; bounded nightly syncs do not.
+if [ "$SYNC_MODE" = "full" ]; then
+  export QUARANTINE_RETRY=1
+fi
+
 APP_DIR="${CB_APP_DIR:-/app}"
 DATA_DIR="${CB_DATA_DIR:-/app/data}"
 LOCK="$DATA_DIR/.cb.lock"

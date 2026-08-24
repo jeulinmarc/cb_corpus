@@ -91,6 +91,15 @@ catalogs OK`, and the native discovery summary line. The Sunday full sweep
 is the one that re-walks everything and produces full audit counts; use it
 (not the nightly numbers) to judge whether a series is actually stalled.
 
+**Quarantine:** URLs that fail to download for N distinct nights are quarantined
+and stop being retried in nightly syncs, freeing bandwidth for healthy URLs. The
+quarantine state lives in `data/download_quarantine.jsonl` (operational state,
+never committed — alongside `download_errors.jsonl`). Quarantined URLs are retried
+during the Sunday full sweep (via `QUARANTINE_RETRY=1`, set automatically by the
+`sync full` job). Tune the quarantine threshold with `QUARANTINE_AFTER_NIGHTS`
+(default: 5 nights of failure before quarantine); Monday–Saturday bounded syncs
+do not bypass quarantine, keeping them nimble.
+
 **Migration:** stacks created before 2026-07-15 used the refresh/discover job
 pair — the crontab and job names changed; recreate the stack after re-pulling
 the image. Stacks created before 2026-07-16 ran a single unbounded sync every
