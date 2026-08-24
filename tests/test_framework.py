@@ -776,6 +776,35 @@ def test_ecb_d3_native_and_reached_by_discover_all():
     assert all(r.doc_type == DocType.D3 for r in recs)
 
 
+def test_ecb_d3_double_slash_legacy_row_deduped_via_alt_url(tmp_path):
+    """15 of the 212 historical D3 rows were written by the old one-off
+    scraper with a double-slash pdf_url (`europa.eu//press/...`); the new
+    `_discover_blog` always normalizes to a single slash. Without indexing the
+    normalized form, is_known_url() would miss on every nightly run and
+    silently re-fetch those 15 posts. The data-fix registers the normalized
+    URL in alt_urls (same convention as the WP v3 migration) — this locks
+    that is_known_url() then recognises the normalized form."""
+    legacy_url = ("https://www.ecb.europa.eu//press/blog/date/2023/html/"
+                  "ecb.blog230824~362178a805.en.html")
+    normalized_url = ("https://www.ecb.europa.eu/press/blog/date/2023/html/"
+                       "ecb.blog230824~362178a805.en.html")
+    row = {
+        "bank_code": "ecb", "doc_type": "D3", "title": "ECB D3 2023-08-24",
+        "pdf_url": legacy_url, "source_url": "", "date": "2023-08-24",
+        "language": "en", "provenance": "bank_site", "mime_type": "text/html",
+        "sha256": "f8ee5df6f1402ceee7af11b4e8e9706638c8b213bfe844b1e265c6b4160e7b86",
+        "local_path": "data/raw/ecb/D3/2023/f0d212497f8b1289.html",
+        "doc_id": "f0d212497f8b1289", "year": 2023,
+        "alt_urls": [normalized_url],
+    }
+    cfg = Config(data_dir=tmp_path)
+    cfg.manifest_dir.mkdir(parents=True, exist_ok=True)
+    cfg.manifest_file("ecb").write_text(json.dumps(row, ensure_ascii=False) + "\n")
+    st = Storage(cfg)
+    assert st.is_known_url(normalized_url)   # what _discover_blog would yield
+    assert st.is_known_url(legacy_url)       # the legacy form itself still matches too
+
+
 # ---- storage (no domain guard in v2 — discovery layer owns URL quality) ----
 def test_storage_indexes_any_url_in_dry_run(tmp_path):
     cfg = Config(data_dir=tmp_path)

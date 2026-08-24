@@ -368,7 +368,16 @@ class ECBAdapter(BankAdapter):
         """D3 — ECB Blog posts, from the live master listing (see BLOG_INDEX
         docstring: the old per-year include endpoint is dead). Blog posts are
         HTML-only artifacts (no PDF version), same convention as the historical
-        212 rows recovered via the old one-off `run_ecb_pub_recovery` path."""
+        212 rows recovered via the old one-off `run_ecb_pub_recovery` path.
+
+        This method always yields normalized single-slash pdf_urls. 15 of the
+        212 historical rows carry a double-slash pdf_url (`europa.eu//press/...`)
+        — a one-off artifact of that old scraper. Rather than special-case them
+        here, the manifest rows were amended to also index the normalized form
+        in alt_urls (see `data: index normalized URL forms for 15 legacy D3
+        rows`), so `Storage.is_known_url()` recognises what this method yields
+        and nightly discovery skips them before any fetch — same compat
+        pattern as the WP v3 migration's native-URL alt_urls registration."""
         html = self._fetch_text(BLOG_INDEX, context="D3-index")
         if html is None:
             return
