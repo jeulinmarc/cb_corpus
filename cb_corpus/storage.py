@@ -32,6 +32,7 @@ from .config import Config
 from .http import Fetcher
 from .htmlpdf import render_url_to_pdf
 from .models import DocRecord
+from .quarantine import Quarantine
 
 
 _EXT_FOR_MIME = {
@@ -255,6 +256,12 @@ class Storage:
         self.fetcher = fetcher or Fetcher(self.cfg)
         self.cfg.raw_dir.mkdir(parents=True, exist_ok=True)
         self.cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+        # Dead-letter state for the nightly sync loop (recover-quarantine
+        # design §3): consulted at the top of save() before any fetch, fed
+        # from _record_download_error() and save()'s success path. Quarantine
+        # writes must only ever happen from THIS serialized loop (never
+        # parallel workers) — see quarantine.py's _append docstring.
+        self.quarantine = Quarantine(self.cfg)
         self._hashes: set[str] = set()
         self._ids: set[str] = set()
         self._urls: set[str] = set()
@@ -351,6 +358,12 @@ class Storage:
 
     # -- download --------------------------------------------------------
     def save(self, rec: DocRecord, *, dry_run: bool = False) -> str:
+        # Consult the quarantine BEFORE any network activity — a URL that has
+        # failed QUARANTINE_AFTER_NIGHTS distinct nights running is skipped by
+        # the bounded (Mon-Sat) sync entirely (Sunday full sweep bypasses via
+        # QUARANTINE_RETRY=1, handled inside is_quarantined()).
+        if self.quarantine.is_quarantined(rec.pdf_url):
+            return "skip:quarantined"
         if rec.doc_id in self._ids:
             return "skip:already-indexed"
         if dry_run:
@@ -432,6 +445,7 @@ class Storage:
         if rec.source_url:
             self._source_urls.add(rec.source_url)
         self._append(rec)
+        self.quarantine.record_success(rec.pdf_url)
         return "saved"
 
     # -- reindex (no download) -------------------------------------------
@@ -491,6 +505,8 @@ class Storage:
         path = self.cfg.data_dir / "download_errors.jsonl"
         with path.open("a") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        night = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+        self.quarantine.record_failure(rec.pdf_url, night=night)
 
     def save_many(self, recs: Iterable[DocRecord], *, dry_run: bool = False,
                   progress_every: int = 100, label: str = "") -> dict[str, int]:
@@ -512,4 +528,7 @@ class Storage:
             if progress_every and total % progress_every == 0:
                 prefix = f"[{label}] " if label else ""
                 print(f"{prefix}processed {total} ({dict(counts)})", file=sys.stderr, flush=True)
+        summary = self.quarantine.summary_line()
+        if summary:
+            print(summary, file=sys.stderr, flush=True)
         return counts
