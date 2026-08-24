@@ -8,6 +8,10 @@ data/manifest/*
 # committed date-recovery index (run-once, replay-forever — DATE_RECOVERY.md)
 !data/wp_dates_index.jsonl
 
+# Cadence watchdog — derived operational state, regenerated weekly.
+data/cadence.jsonl
+data/cadence_state.jsonl
+
 # Python
 __pycache__/
 *.py[cod]
