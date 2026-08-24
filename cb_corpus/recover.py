@@ -50,6 +50,7 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Iterable, Optional
+from urllib.parse import urlparse
 
 from .banks import get_bank
 from .config import Config
@@ -326,8 +327,28 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
             csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
                              "snapshot_ts": "", "title": fallback_title})
             continue
-        provenance_result = _candidate_provenance(dead_url, final_url,
-                                                   cand.get("recovered_from") or "")
+        if final_url == dead_url:
+            # final_url resolving back to the exact dead URL carries no
+            # honest byte-origin trail -- this is exactly the failure mode
+            # that once produced a "wayback" manifest row whose alt_urls[0]
+            # silently equalled its own dead pdf_url (final-review finding
+            # 1: no real snapshot behind it at all). Reject before
+            # provenance mapping ever sees it, for every recovered_from.
+            _bump(bank, "bad-candidate")
+            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
+                             "snapshot_ts": "", "title": fallback_title})
+            continue
+        recovered_from = cand.get("recovered_from") or ""
+        if recovered_from == "wayback" and urlparse(final_url).hostname != "web.archive.org":
+            # A candidate claiming a wayback recovery whose final_url isn't
+            # actually hosted on web.archive.org is not honestly a snapshot
+            # -- same finding, the other half of it (a plausible-looking but
+            # non-archive.org URL rather than the dead URL itself).
+            _bump(bank, "bad-candidate")
+            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
+                             "snapshot_ts": "", "title": fallback_title})
+            continue
+        provenance_result = _candidate_provenance(dead_url, final_url, recovered_from)
         if provenance_result is None:
             _bump(bank, "bad-provenance")
             csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-provenance",
@@ -367,54 +388,63 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
         _bump(bank, "recoverable")
         action = "recoverable"
 
-        if download:
-            # dest == storage.target_path(rec) is DERIVED FROM doc_id, so for
-            # an already-indexed doc_id it is the SAME PATH as that doc's
-            # real local_path. Probe with a dry-run BEFORE copying anything:
-            # if this doc_id is already indexed, report "duplicate" without
-            # ever touching the corpus file -- copying then unlinking on
-            # "skip:already-indexed" would DELETE the real canonical file,
-            # leaving a dangling manifest row (the exact bug this guards).
-            probe = storage.reindex(rec, file_path, dry_run=True)
-            if probe == "skip:already-indexed":
+        # dest == storage.target_path(rec) is DERIVED FROM doc_id, so for an
+        # already-indexed doc_id it is the SAME PATH as that doc's real
+        # local_path. Probe with a dry-run BEFORE copying anything -- in
+        # BOTH modes (MINOR 7: mode parity), not just --download: if this
+        # doc_id is already indexed there is nothing left to recover, dry-run
+        # or not, so "recoverable" would be a lie either way. In --download
+        # mode it's also a safety guard -- copying then unlinking on
+        # "skip:already-indexed" would DELETE the real canonical file,
+        # leaving a dangling manifest row (the exact bug this guards).
+        probe = storage.reindex(rec, file_path, dry_run=True)
+        if probe == "skip:already-indexed":
+            _bump(bank, "duplicate")
+            action = "duplicate"
+        elif download:
+            dest = storage.target_path(rec)
+            status = "error"
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file_path, dest)
+                status = storage.reindex(rec, dest)
+            except Exception as exc:  # noqa: BLE001 - audited below, never aborts the pass
+                try:
+                    storage._record_download_error(rec, exc, "recover-downloads-candidates")
+                except Exception:
+                    pass
+            if status == "reindexed":
+                _bump(bank, "recovered")
+                action = "recovered"
+                # MINOR 5: tombstone the OLD dead URL's quarantine too.
+                # reindex() above already released quarantine on rec.pdf_url
+                # -- for wayback/mirror that IS dead_url (this call is then a
+                # harmless no-op), but for bank_site rec.pdf_url is the NEW
+                # final_url, so without this the OLD dead_url would stay
+                # quarantined forever even though the corpus now has the doc
+                # under its new address.
+                storage.quarantine.record_success(dead_url)
+            elif status == "skip:duplicate-content":
+                # Bytes hash-matched a DIFFERENT doc_id's content -- dest
+                # is this (not-yet-indexed) doc_id's own path, so the
+                # copy just made is safe orphan bytes, never the other
+                # doc's canonical file. Remove it.
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
                 _bump(bank, "duplicate")
                 action = "duplicate"
-            else:
-                dest = storage.target_path(rec)
-                status = "error"
-                try:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(file_path, dest)
-                    status = storage.reindex(rec, dest)
-                except Exception as exc:  # noqa: BLE001 - audited below, never aborts the pass
-                    try:
-                        storage._record_download_error(rec, exc, "recover-downloads-candidates")
-                    except Exception:
-                        pass
-                if status == "reindexed":
-                    _bump(bank, "recovered")
-                    action = "recovered"
-                elif status == "skip:duplicate-content":
-                    # Bytes hash-matched a DIFFERENT doc_id's content -- dest
-                    # is this (not-yet-indexed) doc_id's own path, so the
-                    # copy just made is safe orphan bytes, never the other
-                    # doc's canonical file. Remove it.
-                    try:
-                        dest.unlink()
-                    except OSError:
-                        pass
-                    _bump(bank, "duplicate")
-                    action = "duplicate"
-                elif status.startswith("skip:"):
-                    # Any other non-"reindexed" status (e.g. skip:missing-file,
-                    # or skip:already-indexed from a same-run race with an
-                    # earlier candidate line for the same doc_id): leave the
-                    # file alone -- never guess it's safe to delete -- and
-                    # report the status verbatim.
-                    summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
-                    summary[status] = summary.get(status, 0) + 1
-                    action = status
-                # status == "error": action stays "recoverable" (audited above).
+            elif status.startswith("skip:"):
+                # Any other non-"reindexed" status (e.g. skip:missing-file,
+                # or skip:already-indexed from a same-run race with an
+                # earlier candidate line for the same doc_id): leave the
+                # file alone -- never guess it's safe to delete -- and
+                # report the status verbatim.
+                summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
+                summary[status] = summary.get(status, 0) + 1
+                action = status
+            # status == "error": action stays "recoverable" (audited above).
 
         csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": action,
                          "snapshot_ts": "", "title": title})

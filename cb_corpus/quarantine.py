@@ -3,7 +3,11 @@
 One month of production left exactly 76 unique documents failing every
 single night (dead RePEc-sourced PDF URLs, `download_errors.jsonl` audit).
 This module stops that re-hammering: it tracks, per URL, the number of
-CONSECUTIVE DISTINCT nights a download has failed, and once that reaches
+DISTINCT ATTEMPTED nights a download has failed — not necessarily calendar-
+consecutive: once a URL is actually quarantined it stops being attempted on
+bounded nights, so its night list only grows on nights it's retried (e.g. the
+Sunday full sweep's `QUARANTINE_RETRY=1` bypass) and failed again. Only a
+SUCCESS resets the count. Once the distinct-attempted-nights count reaches
 `QUARANTINE_AFTER_NIGHTS` (env, default 5) the caller is told to skip the URL
 in the nightly bounded (Mon-Sat) sync — only the Sunday full sweep (`sync
 full`, via `QUARANTINE_RETRY=1`) still tries it. Any success releases the
@@ -197,14 +201,26 @@ class Quarantine:
         self._append({"url": url, "seeded": reason, "quarantined": True})
 
     def skipped_count(self) -> int:
-        """Number of is_quarantined() calls THIS RUN that returned True —
-        i.e. URLs the calling sync loop actually skipped (bypassed calls
-        never count, since nothing was skipped)."""
+        """Number of is_quarantined() calls since the counter was last reset
+        that returned True — i.e. URLs the calling sync loop actually
+        skipped (bypassed calls never count, since nothing was skipped).
+        A live, non-consuming read: unlike `summary_line()`, calling this
+        does NOT reset the counter."""
         return self._skipped
 
     def summary_line(self) -> Optional[str]:
         """One-line nightly log summary, or None when nothing was skipped
-        (keeps a clean run's log free of a zero-noise line)."""
+        (keeps a clean run's log free of a zero-noise line).
+
+        CONSUMES the skip counter: reading it resets it to zero, so a caller
+        that runs several `save_many()` batches against the SAME Storage/
+        Quarantine instance in one process (e.g. one discovery run working
+        multiple banks in turn) gets each batch's OWN skip count here,
+        rather than a running cumulative total that keeps growing across
+        every batch. `skipped_count()` is unaffected by this reset -- it
+        stays a live, non-consuming read of the current run's total."""
         if self._skipped == 0:
             return None
-        return f"quarantine: skipped {self._skipped} url(s)"
+        line = f"quarantine: skipped {self._skipped} url(s)"
+        self._skipped = 0
+        return line

@@ -1,7 +1,8 @@
 """Per-URL download quarantine (recover-quarantine design §3).
 
 State file `data/download_quarantine.jsonl` (append-only, latest line per url
-wins) tracks per-URL consecutive DISTINCT failing nights. A URL is
+wins) tracks per-URL DISTINCT ATTEMPTED failing nights (only a success
+resets the count — the nights need not be calendar-consecutive). A URL is
 quarantined once it accumulates `QUARANTINE_AFTER_NIGHTS` (env, default 5)
 distinct nights of failure; the nightly bounded sync then skips it (one
 summary log line) and only the Sunday full sweep retries it
@@ -211,6 +212,31 @@ def test_skipped_count_and_summary_line_count_true_hits_this_run(tmp_path):
 def test_summary_line_is_none_when_nothing_skipped(tmp_path):
     q = _mk(tmp_path)
     assert q.summary_line() is None
+
+
+def test_summary_line_consumes_and_resets_the_skip_counter(tmp_path):
+    """IMPORTANT 4: summary_line() must CONSUME the skip counter it reports,
+    so a caller that runs multiple save_many() batches against the same
+    Quarantine instance (e.g. one process working several banks) gets each
+    batch's OWN skip count from summary_line(), not a running cumulative
+    total that keeps growing across every batch."""
+    q = _mk(tmp_path)
+    quarantined_url = "https://x.test/dead.pdf"
+    for night in ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04", "2026-08-05"]:
+        q.record_failure(quarantined_url, night)
+
+    # Batch 1: one skip.
+    q.is_quarantined(quarantined_url)
+    assert q.summary_line() == "quarantine: skipped 1 url(s)"
+
+    # Batch 2: no calls at all -- the counter must have been reset to zero
+    # by the previous summary_line() call, not merely by skipped_count().
+    assert q.summary_line() is None
+
+    # Batch 3: two more skips -- reports its OWN count, not 1 + 2 = 3.
+    q.is_quarantined(quarantined_url)
+    q.is_quarantined(quarantined_url)
+    assert q.summary_line() == "quarantine: skipped 2 url(s)"
 
 
 # --- state-file format / round-trip -------------------------------------------

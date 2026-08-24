@@ -550,6 +550,106 @@ def test_mirror_empty_final_url_is_bad_candidate(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# IMPORTANT 2 — final_url honesty: reject a candidate whose byte origin is
+# not honestly distinguishable from the dead URL, or (for wayback) not
+# actually an archive.org snapshot. This is exactly the failure mode that
+# produced a "wayback" manifest row whose alt_urls[0] silently equalled its
+# own dead pdf_url (final-review finding 1: no real snapshot trail at all).
+# ---------------------------------------------------------------------------
+
+def test_final_url_equal_to_dead_url_is_bad_candidate_for_wayback(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/samething.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": dead_url,  # dishonest: no real snapshot
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["bad-candidate"] == 1
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "bad-candidate"
+
+
+def test_final_url_equal_to_dead_url_is_bad_candidate_for_bank_site(tmp_path, monkeypatch):
+    """Rule (a) is not wayback-specific: ANY recovered_from with final_url ==
+    dead_pdf_url is rejected -- a "moved" doc that resolves to its own dead
+    URL never actually moved."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/samething-bs.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "bank_site", "final_url": dead_url,
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["bad-candidate"] == 1
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+
+
+def test_wayback_final_url_not_archive_org_is_bad_candidate(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/notarchive.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path)
+    # A different, live-looking URL -- NOT web.archive.org -- claiming to be
+    # a wayback recovery. Not honestly a snapshot.
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback",
+        "final_url": "https://www.banque-france.fr/moved/notarchive.pdf",
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["bad-candidate"] == 1
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "bad-candidate"
+
+
+def test_wayback_final_url_on_archive_org_is_accepted(tmp_path, monkeypatch):
+    """Sanity: a genuine web.archive.org snapshot host still passes."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/realsnapshot.pdf"
+    snapshot_url = "https://web.archive.org/web/20250101000000id_/https://www.banque-france.fr/realsnapshot.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": snapshot_url,
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recovered"] == 1
+    assert results["fr"].get("bad-candidate", 0) == 0
+
+
+# ---------------------------------------------------------------------------
 # MINOR 1 — copy2/reindex exceptions stay recoverable + audited, never crash
 # ---------------------------------------------------------------------------
 
@@ -662,6 +762,133 @@ def test_bad_doc_type_action(tmp_path, monkeypatch):
     assert list(iter_manifest_rows(cfg, "fr")) == []
     csv_rows = _csv_rows(tmp_path / "r.csv")
     assert csv_rows[0]["action"] == "bad-doc-type"
+
+
+# ---------------------------------------------------------------------------
+# MINOR 5 — bank_site recovery also tombstones the OLD dead URL's quarantine
+# ---------------------------------------------------------------------------
+
+def test_bank_site_recovery_releases_the_dead_urls_quarantine(tmp_path, monkeypatch):
+    """reindex() releases rec.pdf_url on success, which for bank_site IS the
+    NEW final_url -- the OLD dead_url would otherwise stay quarantined
+    forever even though the corpus now has the doc under its new address."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/old-path/dt989.pdf"
+    final_url = "https://www.banque-france.fr/new-path/dt989.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+
+    q_path = cfg.data_dir / "download_quarantine.jsonl"
+    q_path.parent.mkdir(parents=True, exist_ok=True)
+    q_path.write_text(json.dumps({
+        "url": dead_url,
+        "nights": ["2026-08-19", "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23"],
+        "quarantined": True,
+    }) + "\n")
+
+    local_pdf = _make_local_pdf(tmp_path, "banksite989.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "bank_site", "final_url": final_url,
+    }])
+    _stub_refresh_metadata(monkeypatch, title="WP 989")
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recovered"] == 1
+
+    q_after = Quarantine(cfg)
+    assert q_after.is_quarantined(dead_url) is False
+
+
+def test_wayback_recovery_dead_url_release_stays_a_noop(tmp_path, monkeypatch):
+    """For wayback/mirror, rec.pdf_url IS dead_url, so reindex() already
+    released it -- the extra record_success(dead_url) call must be a
+    harmless no-op, never a crash or a double-release error."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/dt990.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path, "wayback990.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback",
+        "final_url": "https://web.archive.org/web/20250101000000id_/https://www.banque-france.fr/dt990.pdf",
+    }])
+    _stub_refresh_metadata(monkeypatch, title="WP 990")
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recovered"] == 1
+    q_after = Quarantine(cfg)
+    assert q_after.is_quarantined(dead_url) is False
+
+
+# ---------------------------------------------------------------------------
+# MINOR 7 — dry-run reports "duplicate" for an already-indexed candidate too
+# (mode parity with --download's dry-run probe)
+# ---------------------------------------------------------------------------
+
+def test_dry_run_reports_duplicate_for_already_indexed_doc_id(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/dryrun-dup.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Dry-run dup WP")])
+    local_pdf = _make_local_pdf(tmp_path, "dryrundup.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "https://web.archive.org/dryrundup",
+    }])
+    _stub_refresh_metadata(monkeypatch, title="Dry-run dup WP")
+
+    # First pass, --download: actually recovers and indexes the doc.
+    results1 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                     candidates=str(cand_path), download=True,
+                                     csv_path=str(tmp_path / "r1.csv"))
+    assert results1["fr"]["recovered"] == 1
+
+    # Second pass, dry-run (download=False) against the now-converged corpus:
+    # must report "duplicate", not "recoverable" -- the doc_id is already
+    # indexed, so there is nothing left to recover, dry-run or not.
+    results2 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                     candidates=str(cand_path), download=False,
+                                     csv_path=str(tmp_path / "r2.csv"))
+    # "recoverable" is bumped provisionally for every candidate before the
+    # probe classifies it further (same convention as the CDX-walk path and
+    # the existing --download duplicate tests) -- the CSV action, not this
+    # counter, is the authoritative per-candidate classification.
+    assert results2["fr"]["duplicate"] == 1
+
+    csv_rows = _csv_rows(tmp_path / "r2.csv")
+    assert csv_rows[0]["action"] == "duplicate"
+
+
+def test_dry_run_still_reports_recoverable_for_a_new_doc(tmp_path, monkeypatch):
+    """Sanity: the dry-run probe doesn't turn EVERY dry-run into 'duplicate'
+    -- a genuinely new doc_id still reports 'recoverable'."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/dryrun-new.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Dry-run new WP")])
+    local_pdf = _make_local_pdf(tmp_path, "dryrunnew.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "https://web.archive.org/dryrunnew",
+    }])
+    _stub_refresh_metadata(monkeypatch, title="Dry-run new WP")
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=False,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recoverable"] == 1
+    assert results["fr"].get("duplicate", 0) == 0
+    assert list(iter_manifest_rows(cfg, "fr")) == []
 
 
 def test_bad_provenance_action(tmp_path, monkeypatch):

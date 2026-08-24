@@ -523,6 +523,13 @@ class Storage:
 
     def save_many(self, recs: Iterable[DocRecord], *, dry_run: bool = False,
                   progress_every: int = 100, label: str = "") -> dict[str, int]:
+        """Save each record, tallying `save()`'s status prefix (e.g. "saved",
+        "skip", "error") and printing a periodic progress line plus one
+        quarantine summary line at the end (via `Quarantine.summary_line()`,
+        which CONSUMES/resets the skip counter -- so calling `save_many()`
+        again on this same `Storage` afterwards, e.g. for the next bank in a
+        multi-bank discovery run, reports THAT batch's own skip count, not a
+        cumulative total across every batch run so far)."""
         import sys
         counts: dict[str, int] = {}
         total = 0

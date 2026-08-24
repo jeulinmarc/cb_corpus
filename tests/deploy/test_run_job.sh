@@ -7,6 +7,7 @@ STUB=$(mktemp -d)
 cat > "$STUB/python" <<'EOF'
 #!/bin/bash
 echo "PYARGS:$*" >> "$PY_LOG"
+echo "QRETRY:${QUARANTINE_RETRY:-unset}" >> "$PY_LOG"
 echo "PYSTUB:$*"
 if [ "$*" = "-m cb_corpus list-banks" ]; then
   printf 'aa   Bank Aa                              aa.example\n'
@@ -57,6 +58,7 @@ grep -q "\[sync\] bis-sitemap OK" "$D/reports/nas_runs.log" || fail "bis-sitemap
 grep -q "\[sync\] catalogs OK" "$D/reports/nas_runs.log" || fail "catalogs OK not logged"
 grep -q "\[sync\] OK 2/2" "$D/reports/nas_runs.log" || fail "native summary missing"
 grep -q "OK 2/2 \[sync\]" "$D/reports/last_run_status" || fail "status summary missing"
+grep -q "QRETRY:1" "$PY_LOG" || fail "default (full) sync must export QUARANTINE_RETRY=1"
 DAY=$(date +%Y-%m-%d)
 [ -f "$D/reports/discover/$DAY/us.log" ] || fail "per-bank log missing"
 [ -f "$D/reports/discover/$DAY/catalogs.log" ] || fail "catalogs.log missing"
@@ -76,6 +78,7 @@ grep -q "PYARGS:-m cb_corpus bis-sitemap --years ${Y0}-${Y1} --download" "$PY_LO
 grep -q "PYARGS:-m cb_corpus repec --incremental --download" "$PY_LOG" \
   || fail "bounded sync must pass --incremental"
 grep -q "\[sync\] START (window 90d)" "$D/reports/nas_runs.log" || fail "window START marker missing"
+if grep -q "QRETRY:1" "$PY_LOG"; then fail "bounded (window) sync must NOT export QUARANTINE_RETRY=1"; fi
 unset DISCOVER_BANKS SYNC_WINDOW_DAYS
 
 # T1c — 'sync full' ignores the window: unbounded catalogs.
@@ -84,6 +87,7 @@ newdir; export DISCOVER_BANKS="us" SYNC_WINDOW_DAYS=90
 grep -q "PYARGS:-m cb_corpus bis-sitemap --download" "$PY_LOG" || fail "full sync must omit --years"
 if grep -q "\-\-incremental" "$PY_LOG"; then fail "full sync must omit --incremental"; fi
 grep -q "\[sync\] START (full)" "$D/reports/nas_runs.log" || fail "full START marker missing"
+grep -q "QRETRY:1" "$PY_LOG" || fail "'sync full' must export QUARANTINE_RETRY=1"
 unset DISCOVER_BANKS SYNC_WINDOW_DAYS
 
 # T1d — window unset: sync behaves as full.
@@ -92,6 +96,7 @@ newdir; export DISCOVER_BANKS="us"
 grep -q "PYARGS:-m cb_corpus bis-sitemap --download" "$PY_LOG" || fail "unset window must run full"
 if grep -q "\-\-incremental" "$PY_LOG"; then fail "unset window must omit --incremental"; fi
 grep -q "\[sync\] START (full)" "$D/reports/nas_runs.log" || fail "full START marker missing (unset window)"
+grep -q "QRETRY:1" "$PY_LOG" || fail "unset-window (full) sync must export QUARANTINE_RETRY=1"
 unset DISCOVER_BANKS
 
 # T2 — catalog failure aborts sync: no native phase, FAILED status, non-zero exit,
@@ -140,6 +145,20 @@ grep -q "PYARGS:-m cb_corpus discover --banks fr --native-only --download" "$PY_
   || fail "incorrect campaign args"
 grep -q "\[campaign\] WAITING (lock busy)" "$D/reports/nas_runs.log" || fail "WAITING not logged"
 wait "$HOLDER"
+
+# T4b — QUARANTINE_RETRY must never leak into campaign jobs. SYNC_MODE
+# defaults to "full" regardless of JOB, so a guard keyed on SYNC_MODE alone
+# (without also requiring JOB="sync") incorrectly exports
+# QUARANTINE_RETRY=1 for a plain campaign run too -- the Sunday-only
+# quarantine bypass has no business applying to an on-demand campaign.
+newdir
+/app/deploy/run-job.sh campaign discover --banks fr --native-only --download
+grep -q "PYARGS:-m cb_corpus discover --banks fr --native-only --download" "$PY_LOG" \
+  || fail "campaign call missing (T4b)"
+if grep -q "QRETRY:1" "$PY_LOG"; then
+  fail "QUARANTINE_RETRY must not be exported for a campaign job"
+fi
+grep -q "QRETRY:unset" "$PY_LOG" || fail "campaign job's QUARANTINE_RETRY must be unset"
 
 # T5 — DISCOVER_BANKS unset: sync refused before any python call.
 newdir

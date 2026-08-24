@@ -98,7 +98,13 @@ never committed — alongside `download_errors.jsonl`). Quarantined URLs are ret
 during the Sunday full sweep (via `QUARANTINE_RETRY=1`, set automatically by the
 `sync full` job). Tune the quarantine threshold with `QUARANTINE_AFTER_NIGHTS`
 (default: 5 nights of failure before quarantine); Monday–Saturday bounded syncs
-do not bypass quarantine, keeping them nimble.
+do not bypass quarantine, keeping them nimble. For docs confirmed unrecoverable
+after a manual `recover-downloads --candidates` hunt, `recover-downloads
+--seed-quarantine <file>` is a one-time operator action that seeds them as
+already-quarantined immediately (no need to accumulate synthetic failed
+nights) — run it against (or copy its resulting `download_quarantine.jsonl`
+into) the same data directory the NAS deployment actually uses, otherwise the
+seeded state never reaches the running container.
 
 **Migration:** stacks created before 2026-07-15 used the refresh/discover job
 pair — the crontab and job names changed; recreate the stack after re-pulling

@@ -179,6 +179,42 @@ def test_save_many_prints_no_summary_when_nothing_was_skipped(tmp_path, capsys):
     assert "quarantine" not in err
 
 
+def test_two_sequential_save_many_batches_each_report_their_own_skip_count(tmp_path, capsys):
+    """IMPORTANT 4: two save_many() batches against the SAME Storage/
+    Quarantine instance (e.g. one process discovering several banks in
+    turn) must each print their OWN skip count -- not a cumulative total
+    that keeps growing across batches."""
+    q1_url = "https://x.test/dead-batch1.pdf"
+    q2a_url = "https://x.test/dead-batch2-a.pdf"
+    q2b_url = "https://x.test/dead-batch2-b.pdf"
+    nights = ["2026-08-19", "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23"]
+    _seed_quarantine(tmp_path, q1_url, nights)
+    st = _mk_storage(tmp_path, _OkFetcher())
+    # Seed the batch-2 quarantines AFTER Storage init (Storage builds its own
+    # Quarantine at __init__, which already loaded state for q1_url) --
+    # append directly to the same on-disk state file so st's in-memory
+    # Quarantine (which reads it live via is_quarantined -> self._state) sees
+    # them too. We instead just seed via the SAME live Quarantine instance
+    # storage already holds, by writing failures directly.
+    for night in nights:
+        st.quarantine.record_failure(q2a_url, night)
+        st.quarantine.record_failure(q2b_url, night)
+
+    # Batch 1: exactly one quarantined URL.
+    st.save_many([_rec(pdf_url=q1_url), _rec(pdf_url="https://x.test/alive1.pdf")],
+                 dry_run=False, label="repec:aa")
+    err1 = capsys.readouterr().err
+    assert err1.count("quarantine: skipped 1 url(s)") == 1
+
+    # Batch 2: exactly two quarantined URLs -- must NOT report 1 + 2 = 3.
+    st.save_many([_rec(pdf_url=q2a_url), _rec(pdf_url=q2b_url),
+                 _rec(pdf_url="https://x.test/alive2.pdf")],
+                 dry_run=False, label="repec:bb")
+    err2 = capsys.readouterr().err
+    assert err2.count("quarantine: skipped 2 url(s)") == 1
+    assert "skipped 3 url(s)" not in err2
+
+
 # --- bypass_quarantine: recovery flows must not be blocked by their own -----
 # quarantine (task 2b: download_errors.jsonl feeds BOTH quarantine counting
 # AND recover-downloads' inventory, so by the time recovery runs its own
