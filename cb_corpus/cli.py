@@ -192,6 +192,16 @@ def main(argv: list[str] | None = None) -> int:
                           "(for docs confirmed unrecoverable after a manual hunt) -- may be "
                           "combined with --candidates or used alone")
 
+    cw = sub.add_parser("cadence-watch",
+                        help="Median-gap publication-cadence watchdog: report "
+                             "overdue/soon/on-track per (bank, doc_type) series. "
+                             "Default dry-run (prints the table only); --write "
+                             "emits data/cadence.jsonl and updates "
+                             "data/cadence_state.jsonl (new-silence alerting).")
+    cw.add_argument("--write", action="store_true",
+                    help="write data/cadence.jsonl + update cadence_state.jsonl "
+                         "(default: dry-run table only, no files touched)")
+
     args = p.parse_args(argv)
     banks = _banks(getattr(args, "banks", ""))
 
@@ -313,6 +323,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from .repec_check import run_repec_reconcile
             run_repec_reconcile(bank_codes=banks, write=args.write, csv_path=args.csv or None)
+        return 0
+
+    if args.cmd == "cadence-watch":
+        from .cadence import run_cadence_watch
+        from .config import Config
+        run_cadence_watch(Config(), write=args.write)
         return 0
 
     if args.cmd == "recover-downloads":

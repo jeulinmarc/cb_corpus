@@ -4,3 +4,5 @@
 # command in Dockge to point to a crontab mounted as a volume.
 0 1 * * 1-6 /app/deploy/run-job.sh sync
 0 1 * * 0 /app/deploy/run-job.sh sync full
+# Sunday 06:30 — median-gap silence detection after full sweep completes.
+30 6 * * 0 /app/deploy/run-job.sh cadence

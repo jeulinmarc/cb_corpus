@@ -47,7 +47,7 @@ if [ "${CB_ALLOW_EMPTY_DATA:-0}" != "1" ]; then
 fi
 
 case "$JOB" in
-  sync|campaign) ;;
+  sync|campaign|cadence) ;;
   *) echo "run-job: unknown job '$JOB'" >&2; exit 2 ;;
 esac
 
@@ -180,13 +180,19 @@ run_job() {
   case "$JOB" in
     sync)     run_sync ;;
     campaign) python -m cb_corpus "$@" ;;
+    # cadence-watch's alert payload (NEW OVERDUE lines + the "cadence: N
+    # overdue (M new)" summary, see cb_corpus/cadence.py) goes to stderr by
+    # design (CLI concern, kept out of the pure computation). Route it into
+    # $LOG so it reaches the operator surface (nas_runs.log) per README §4a
+    # instead of only the container console.
+    cadence)  python -m cb_corpus cadence-watch --write 2>> "$LOG" ;;
   esac
 }
 
 exec 9>"$LOCK"
 case "$JOB" in
-  campaign)
-    # a campaign waits its turn (sync or another campaign in progress);
+  campaign|cadence)
+    # a campaign or cadence watchdog waits its turn (sync or another job in progress);
     # log once, visibly, before blocking so an operator watching
     # nas_runs.log isn't left guessing why nothing is happening.
     flock -n 9 || { log "WAITING (lock busy)"; flock 9; } ;;
@@ -210,7 +216,11 @@ fi
 if run_job "$@"; then
   log "${JOB_SUMMARY:-OK}"
   echo "$(ts) ${JOB_SUMMARY:-OK} [$JOB]" > "$STATUS"
-  if [ "${AUTOCOMMIT:-1}" = "1" ]; then
+  # cadence writes only gitignored files (data/cadence.jsonl,
+  # data/cadence_state.jsonl -- see .gitignore) -- there is nothing for
+  # autocommit to push, so skip it: no gratuitous Sunday clone and no
+  # AUTOCOMMIT-FAILED noise surface for a job with no state to commit.
+  if [ "${AUTOCOMMIT:-1}" = "1" ] && [ "$JOB" != "cadence" ]; then
     "${AUTOCOMMIT_BIN:-/app/deploy/autocommit.sh}" "$JOB" >> "$LOG" 2>&1 \
       || log "AUTOCOMMIT FAILED (local state intact, will retry on next run)"
   fi
