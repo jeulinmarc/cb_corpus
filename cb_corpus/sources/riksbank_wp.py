@@ -9,11 +9,10 @@ of the form ``"No. <NNN> <Title>"``. No per-paper fetch is needed — number, da
 and PDF URL are all on the listing. An out-of-range page returns 200 with an
 empty listing (no PDF anchors), which is how discovery finds the end.
 
-The site's own year filter stops at 2016 (older papers are behind a separate
-"Archive" link to archive.riksbank.se, out of scope here — those years already
-have RePEc/Wayback-sourced rows in the manifest and are not rediscovered by this
-scraper). This is why se, unlike the other WP-v3 native flips, only supersedes
-RePEc discovery from ~WP #315 forward; earlier rows stay as-is.
+Native coverage is bounded to ~2016+ by design (the site's own listing); pre-2016
+rows remain RePEc/Wayback-sourced. The nightly/Sunday `cb_corpus repec` catalog
+job continues to provide full-history dual-source coverage for se, identically to
+the other WP-v3 banks.
 
 PDF filenames are NOT uniform across the site's history — modern papers use
 ``no.-<NNN>-<slug>.pdf`` (sometimes ``no-<NNN>-`` or ``no.<NNN>-``, and
