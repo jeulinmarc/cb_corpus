@@ -163,14 +163,24 @@ def _find_snapshot(fetcher: Fetcher, pdf_url: str,
 def _read_candidates(path: str) -> list[dict]:
     """Read a ``--candidates`` JSONL file: one externally-recovered doc per
     line. No dedup here (unlike ``_read_inventory``) -- each line is its own
-    recovery decision, matched independently below."""
+    recovery decision, matched independently below.
+
+    A malformed JSON line is tolerated: skipped with ONE stderr warning for
+    that line (identifying it by line number), the good lines around it
+    still collected. There is no CSV row for it -- a line that doesn't even
+    parse has no URL to report against, unlike the recognised bad-* actions
+    below which all start from a valid, parsed candidate."""
     out: list[dict] = []
     with open(path) as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
-            out.append(json.loads(line))
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                print(f"[recover] WARNING: malformed JSON on line {lineno} of "
+                      f"{path}, skipped: {exc}", file=sys.stderr, flush=True)
     return out
 
 
@@ -196,8 +206,15 @@ def _apply_seed_quarantine(quarantine: Quarantine, path: str) -> int:
     line) -- for the docs that remain unrecoverable after the manual hunt,
     so the nightly sync stops re-hammering them immediately (recover-
     quarantine design §3/§4). Returns the number of lines applied; a
-    missing/blank ``url`` is skipped, never crashes the pass."""
-    n = 0
+    missing/blank ``url`` on an otherwise well-formed line is skipped,
+    never crashes the pass.
+
+    Reads and validates the WHOLE file first, THEN applies every seed --
+    never interleaved. A malformed line ANYWHERE in the file raises (surfaced
+    loudly to the operator) BEFORE a single ``quarantine.seed()`` call has
+    happened, so a bad line never leaves a partial prefix of the file
+    seeded while the rest silently never runs."""
+    rows: list[tuple[str, str]] = []
     with open(path) as fh:
         for line in fh:
             line = line.strip()
@@ -207,8 +224,12 @@ def _apply_seed_quarantine(quarantine: Quarantine, path: str) -> int:
             url = row.get("url")
             if not url:
                 continue
-            quarantine.seed(url, row.get("reason") or "")
-            n += 1
+            rows.append((url, row.get("reason") or ""))
+
+    n = 0
+    for url, reason in rows:
+        quarantine.seed(url, reason)
+        n += 1
     return n
 
 
@@ -238,9 +259,15 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
     """The ``--candidates`` mode of ``run_recover_downloads`` -- see the
     module docstring. No CDX walk: every candidate's fate is decided from
     the audit entry it matches (by ``dead_pdf_url``) plus the already-
-    downloaded local file."""
-    entries = _read_inventory(cfg, bank_codes)
+    downloaded local file.
+
+    The inventory is read UNFILTERED (``bank_codes=None``) so an entry that
+    exists but is out of the ``--banks`` scope can be told apart from one
+    that genuinely doesn't exist -- the former is ``filtered``, the latter
+    ``unknown-entry`` (never conflated)."""
+    entries = _read_inventory(cfg, None)
     by_url = {e["pdf_url"]: e for e in entries if e.get("pdf_url")}
+    codes = set(bank_codes) if bank_codes else None
 
     results: dict[str, dict] = {}
     csv_rows: list[dict] = []
@@ -264,6 +291,12 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
         bank = entry.get("bank_code") or "_unknown"
         fallback_title = entry.get("title") or cand.get("title") or ""
 
+        if codes is not None and bank not in codes:
+            _bump(bank, "filtered")
+            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "filtered",
+                             "snapshot_ts": "", "title": fallback_title})
+            continue
+
         file_path = Path(cand.get("file_path") or "")
         if not _verify_local_pdf(file_path):
             _bump(bank, "bad-file")
@@ -283,6 +316,16 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
             continue
 
         final_url = cand.get("final_url") or ""
+        if not final_url:
+            # An empty/missing final_url would otherwise create a degenerate
+            # pdf_url (e.g. bank_site's pdf_url = final_url = "") shared by
+            # every such candidate -- reject it honestly, before it ever
+            # reaches provenance mapping, rather than let it become an alias
+            # for a doc_id that isn't really this document's identity.
+            _bump(bank, "bad-candidate")
+            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
+                             "snapshot_ts": "", "title": fallback_title})
+            continue
         provenance_result = _candidate_provenance(dead_url, final_url,
                                                    cand.get("recovered_from") or "")
         if provenance_result is None:
@@ -325,27 +368,53 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
         action = "recoverable"
 
         if download:
-            dest = storage.target_path(rec)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file_path, dest)
-            status = storage.reindex(rec, dest)
-            if status == "reindexed":
-                _bump(bank, "recovered")
-                action = "recovered"
-            elif status.startswith("skip:"):
-                # No orphan bytes: the file was copied into the corpus layout
-                # in anticipation of being indexed, but wasn't -- remove it.
+            # dest == storage.target_path(rec) is DERIVED FROM doc_id, so for
+            # an already-indexed doc_id it is the SAME PATH as that doc's
+            # real local_path. Probe with a dry-run BEFORE copying anything:
+            # if this doc_id is already indexed, report "duplicate" without
+            # ever touching the corpus file -- copying then unlinking on
+            # "skip:already-indexed" would DELETE the real canonical file,
+            # leaving a dangling manifest row (the exact bug this guards).
+            probe = storage.reindex(rec, file_path, dry_run=True)
+            if probe == "skip:already-indexed":
+                _bump(bank, "duplicate")
+                action = "duplicate"
+            else:
+                dest = storage.target_path(rec)
+                status = "error"
                 try:
-                    dest.unlink()
-                except OSError:
-                    pass
-                if status in ("skip:already-indexed", "skip:duplicate-content"):
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file_path, dest)
+                    status = storage.reindex(rec, dest)
+                except Exception as exc:  # noqa: BLE001 - audited below, never aborts the pass
+                    try:
+                        storage._record_download_error(rec, exc, "recover-downloads-candidates")
+                    except Exception:
+                        pass
+                if status == "reindexed":
+                    _bump(bank, "recovered")
+                    action = "recovered"
+                elif status == "skip:duplicate-content":
+                    # Bytes hash-matched a DIFFERENT doc_id's content -- dest
+                    # is this (not-yet-indexed) doc_id's own path, so the
+                    # copy just made is safe orphan bytes, never the other
+                    # doc's canonical file. Remove it.
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
                     _bump(bank, "duplicate")
                     action = "duplicate"
-                else:
+                elif status.startswith("skip:"):
+                    # Any other non-"reindexed" status (e.g. skip:missing-file,
+                    # or skip:already-indexed from a same-run race with an
+                    # earlier candidate line for the same doc_id): leave the
+                    # file alone -- never guess it's safe to delete -- and
+                    # report the status verbatim.
                     summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
                     summary[status] = summary.get(status, 0) + 1
                     action = status
+                # status == "error": action stays "recoverable" (audited above).
 
         csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": action,
                          "snapshot_ts": "", "title": title})

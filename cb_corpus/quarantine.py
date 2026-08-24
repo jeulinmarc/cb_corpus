@@ -144,7 +144,19 @@ class Quarantine:
         retry happened). The nights list is capped at the current threshold
         so a URL that fails for months doesn't grow this file's per-url
         state without bound — only the most recent nights are kept.
+
+        No-op (nothing written, nothing mutated) when `url`'s CURRENT state
+        is a SEEDED quarantined row (see `seed()`): a seeded row carries no
+        night-count history to update, and it must not decay into a fresh
+        1-night count row just because the Sunday full sweep
+        (`QUARANTINE_RETRY=1`) retried it and failed — that would let the
+        bounded Mon-Sat sync start re-hammering the URL again before it
+        re-accumulates `QUARANTINE_AFTER_NIGHTS` worth of failures. A seeded
+        row stays quarantined until an explicit `record_success()` release.
         """
+        existing = self._state.get(url)
+        if existing and existing.get("seeded"):
+            return
         state = self._state.setdefault(url, {"nights": []})
         nights = state["nights"]
         if not nights or nights[-1] != night:

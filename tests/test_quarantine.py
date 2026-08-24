@@ -295,6 +295,28 @@ def test_seed_then_record_success_releases_it(tmp_path):
     assert q.is_quarantined(url) is False
 
 
+def test_record_failure_is_noop_on_seeded_row(tmp_path):
+    """A seeded row must not decay into a night-count row. Scenario: the
+    Sunday full sweep (QUARANTINE_RETRY=1) retries a seeded dead URL and the
+    retry fails -- record_failure must leave the seed standing (not
+    overwrite it with a fresh 1-night count row, which would let the
+    bounded Mon-Sat sync start re-hammering the URL again before it
+    re-accumulates QUARANTINE_AFTER_NIGHTS worth of failures)."""
+    q = _mk(tmp_path)
+    url = "https://x.test/confirmed-dead.pdf"
+    q.seed(url, "hunt exhausted")
+
+    q.record_failure(url, "2026-08-01")
+
+    q2 = _mk(tmp_path)
+    assert q2.is_quarantined(url) is True
+
+    lines = (tmp_path / "download_quarantine.jsonl").read_text().splitlines()
+    last_row = json.loads(lines[-1])
+    assert "seeded" in last_row
+    assert last_row["seeded"] == "hunt exhausted"
+
+
 # --- corrupt/torn line tolerance ----------------------------------------------
 
 def test_corrupt_line_is_skipped_with_a_single_warning(tmp_path, capsys):

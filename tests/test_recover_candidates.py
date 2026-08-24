@@ -374,3 +374,313 @@ def test_seed_quarantine_flag_applies_seed_before_the_pass(tmp_path):
     assert q.is_quarantined(url) is True
     lines = (cfg.data_dir / "download_quarantine.jsonl").read_text().splitlines()
     assert json.loads(lines[-1]) == {"url": url, "seeded": "hunt exhausted", "quarantined": True}
+
+
+def test_apply_seed_quarantine_validates_whole_file_before_applying_any_seed(tmp_path):
+    """A malformed line ANYWHERE in the seed file must abort the whole
+    application with NO partial effect -- not seed the good lines that came
+    before it and then blow up on the bad one."""
+    from cb_corpus.recover import _apply_seed_quarantine
+
+    cfg = Config(data_dir=tmp_path)
+    q = Quarantine(cfg)
+    good_url = "https://www.banque-france.fr/good.pdf"
+    seed_path = tmp_path / "seed.jsonl"
+    seed_path.write_text(
+        json.dumps({"url": good_url, "reason": "ok"}) + "\n"
+        '{"url": "https://bad.test/x.pdf", "reason": '  # malformed JSON (no closing)
+    )
+
+    with pytest.raises(Exception):
+        _apply_seed_quarantine(q, str(seed_path))
+
+    # No partial application: the good line above the bad one must not have
+    # been seeded either.
+    assert q.is_quarantined(good_url) is False
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL — orphan unlink must never delete a canonical corpus file
+# ---------------------------------------------------------------------------
+
+def test_rerunning_same_candidates_file_twice_does_not_delete_corpus_file(tmp_path, monkeypatch):
+    """The exact data-loss scenario: a --candidates pass is re-run (e.g. a
+    retry) after the corpus already converged on these docs. dest ==
+    storage.target_path(rec) for the SAME doc_id as the already-indexed row
+    -- the second run must recognise that via a dry-run probe BEFORE copying
+    anything, never copy2-then-unlink the real corpus file."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/rerun.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Rerun WP")])
+    local_pdf = _make_local_pdf(tmp_path, "rerun.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "https://web.archive.org/rerun",
+    }])
+    _stub_refresh_metadata(monkeypatch, title="Rerun WP")
+
+    results1 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                     candidates=str(cand_path), download=True,
+                                     csv_path=str(tmp_path / "r1.csv"))
+    assert results1["fr"]["recovered"] == 1
+
+    rows = list(iter_manifest_rows(cfg, "fr"))
+    assert len(rows) == 1
+    local_path = Path(rows[0]["local_path"])
+    assert local_path.is_file()
+
+    # Re-run the exact same candidates file against the now-converged corpus.
+    results2 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                     candidates=str(cand_path), download=True,
+                                     csv_path=str(tmp_path / "r2.csv"))
+    assert results2["fr"]["duplicate"] == 1
+    assert results2["fr"].get("recovered", 0) == 0
+
+    # The real corpus file must still be present -- the exact bug this fix
+    # prevents (copy2 -> reindex -> skip:already-indexed -> unlink(dest)).
+    assert local_path.is_file()
+    rows_after = list(iter_manifest_rows(cfg, "fr"))
+    assert len(rows_after) == 1
+
+    csv_rows = _csv_rows(tmp_path / "r2.csv")
+    assert csv_rows[0]["action"] == "duplicate"
+
+
+def test_duplicated_candidate_line_within_one_run_is_deduped_without_deleting_file(tmp_path, monkeypatch):
+    """Same scenario as above but within a SINGLE run: the same candidate
+    line appears twice in the file (an operator mistake / a hand-hunted
+    list built by concatenating sources)."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/dupline.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Dup line WP")])
+    local_pdf = _make_local_pdf(tmp_path, "dupline.pdf")
+    cand = {
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "https://web.archive.org/dupline",
+    }
+    cand_path = _write_candidates(tmp_path, [cand, cand])
+    _stub_refresh_metadata(monkeypatch, title="Dup line WP")
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recovered"] == 1
+    assert results["fr"]["duplicate"] == 1
+
+    rows = list(iter_manifest_rows(cfg, "fr"))
+    assert len(rows) == 1
+    assert Path(rows[0]["local_path"]).is_file()
+
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert [r["action"] for r in csv_rows] == ["recovered", "duplicate"]
+
+
+# ---------------------------------------------------------------------------
+# IMPORTANT A — empty/missing final_url must be rejected before provenance
+# ---------------------------------------------------------------------------
+
+def test_wayback_empty_final_url_is_bad_candidate(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/nofinalurl-wb.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "",
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["bad-candidate"] == 1
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "bad-candidate"
+
+
+def test_bank_site_missing_final_url_key_is_bad_candidate(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/nofinalurl-bs.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "bank_site",   # no "final_url" key at all
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["bad-candidate"] == 1
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "bad-candidate"
+
+
+def test_mirror_empty_final_url_is_bad_candidate(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/nofinalurl-mirror.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "mirror", "final_url": "",
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["bad-candidate"] == 1
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "bad-candidate"
+
+
+# ---------------------------------------------------------------------------
+# MINOR 1 — copy2/reindex exceptions stay recoverable + audited, never crash
+# ---------------------------------------------------------------------------
+
+def test_copy_exception_stays_recoverable_and_is_audited(tmp_path, monkeypatch):
+    from cb_corpus import recover as recover_mod
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/copyfail.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Copy fail WP")])
+    local_pdf = _make_local_pdf(tmp_path, "copyfail.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "https://web.archive.org/copyfail",
+    }])
+    _stub_refresh_metadata(monkeypatch, title="Copy fail WP")
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(recover_mod.shutil, "copy2", _boom)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["recoverable"] == 1
+    assert results["fr"].get("recovered", 0) == 0
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "recoverable"
+
+    errors_path = cfg.data_dir / "download_errors.jsonl"
+    error_lines = [json.loads(l) for l in errors_path.read_text().splitlines() if l.strip()]
+    reaudited = [e for e in error_lines if e.get("label") == "recover-downloads-candidates"]
+    assert len(reaudited) == 1
+    assert reaudited[0]["pdf_url"] == dead_url
+
+
+# ---------------------------------------------------------------------------
+# MINOR 2 — _read_candidates tolerates a malformed JSON line
+# ---------------------------------------------------------------------------
+
+def test_read_candidates_skips_malformed_line_with_one_warning(tmp_path, capsys):
+    from cb_corpus.recover import _read_candidates
+
+    path = tmp_path / "candidates.jsonl"
+    good1 = json.dumps({"dead_pdf_url": "https://x.test/a.pdf", "file_path": "a.pdf",
+                        "recovered_from": "wayback", "final_url": "https://web.archive.org/a"})
+    bad = '{"dead_pdf_url": "https://x.test/b.pdf", '  # malformed JSON
+    good2 = json.dumps({"dead_pdf_url": "https://x.test/c.pdf", "file_path": "c.pdf",
+                        "recovered_from": "wayback", "final_url": "https://web.archive.org/c"})
+    path.write_text(good1 + "\n" + bad + "\n" + good2 + "\n")
+
+    rows = _read_candidates(str(path))
+
+    assert [r["dead_pdf_url"] for r in rows] == ["https://x.test/a.pdf", "https://x.test/c.pdf"]
+    err = capsys.readouterr().err
+    assert err.count("WARNING") == 1
+
+
+# ---------------------------------------------------------------------------
+# MINOR 4 — --banks filter + candidates: out-of-scope match is "filtered"
+# ---------------------------------------------------------------------------
+
+def test_out_of_scope_candidate_is_filtered_not_unknown_entry(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.bundesbank.de/oos.pdf"
+    _write_inventory(cfg, [_entry(bank="de", pdf_url=dead_url, title="DE WP")])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "https://web.archive.org/oos",
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(bank_codes=["fr"], config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["de"]["filtered"] == 1
+    assert results.get("_unknown", {}).get("unknown-entry", 0) == 0
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "filtered"
+    assert list(iter_manifest_rows(cfg, "de")) == []
+
+
+# ---------------------------------------------------------------------------
+# MINOR 5 — coverage for the existing bad-doc-type / bad-provenance actions
+# ---------------------------------------------------------------------------
+
+def test_bad_doc_type_action(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/baddoctype.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, doc_type="ZZZ")])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "https://web.archive.org/baddoctype",
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["bad-doc-type"] == 1
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "bad-doc-type"
+
+
+def test_bad_provenance_action(tmp_path, monkeypatch):
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/badprov.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url)])
+    local_pdf = _make_local_pdf(tmp_path)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "some_unrecognised_source", "final_url": "https://example.org/x",
+    }])
+    _stub_refresh_metadata(monkeypatch)
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["bad-provenance"] == 1
+    assert list(iter_manifest_rows(cfg, "fr")) == []
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "bad-provenance"
