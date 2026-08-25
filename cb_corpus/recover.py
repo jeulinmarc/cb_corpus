@@ -48,7 +48,12 @@ follows the provenance rules per ``recovered_from`` (decision 2). Because the
 bytes already exist locally, this mode registers them via
 ``Storage.reindex`` (copy to ``Storage.target_path`` + index, sha256 dedup)
 instead of ``Storage.save`` (no network fetch) -- same storage discipline,
-never bypassed.
+never bypassed. Like the CDX-walk pass, ``--candidates`` also short-circuits
+on ``_is_converged`` before touching a line at all: re-running the same
+candidates file after a prior pass already self-healed it (stamped the dead
+URL onto the canonical row) reports ``converged``, not ``duplicate`` -- "the
+corpus already has it" is a different truth than "nothing left to recover",
+and both modes now share the same vocabulary for it.
 """
 from __future__ import annotations
 
@@ -575,7 +580,11 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     cannot silently block them. Every ``duplicate`` verdict self-heals (see
     the module docstring): its dead URL is stamped onto the matched row's
     ``alt_urls`` and its quarantine released, in ONE ``Storage.stamp_alt_urls``
-    call applied at the end of the pass -- never during a dry-run. A CSV
+    call collected across the pass and applied from a ``finally`` block --
+    at the end of the pass on the normal path, but also on a mid-pass crash
+    (PR #13 final review, Minor 1), so a crash never loses stamps already
+    collected for entries processed before it hit -- never during a
+    dry-run. A CSV
     report (``{bank, pdf_url, action, snapshot_ts, title, canonical_doc_id}``)
     is written in both modes so a dry-run's classification is never lost, and
     a CSV line never claims an action that didn't happen (a failed
