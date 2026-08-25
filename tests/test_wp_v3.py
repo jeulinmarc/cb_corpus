@@ -252,7 +252,7 @@ def _interview_fetcher(pub_base, flat, extra=None):
     return _URLFetcher(entries)
 
 
-def test_discover_ecb_interviews_yields_c2_html_rows():
+def test_discover_ecb_interviews_yields_c2_html_rows(capsys):
     en_interview = [_pub_ts(2026, 8, 24), 27,
                     ["/press/inter/date/2026/html/ecb.in260824~x.en.html"],
                     {"Title": "Interview with X"}]
@@ -273,6 +273,19 @@ def test_discover_ecb_interviews_yields_c2_html_rows():
     assert str(d.date) == "2026-08-24" and d.date_precision == "day"
     assert d.mime_type == "text/html" and d.provenance == "bank_site"
     assert d.date_source == "bank_site" and d.source_url == FOEDB_DB
+    # EN-only exclusion is counted and reported on stderr, never silent.
+    assert "1 non-English-only interview(s) excluded" in capsys.readouterr().err
+
+
+def test_discover_ecb_interviews_silent_when_no_non_en_excluded(capsys):
+    en_interview = [_pub_ts(2026, 8, 24), 27,
+                    ["/press/inter/date/2026/html/ecb.in260824~x.en.html"],
+                    {"Title": "Interview with X"}]
+    f = _interview_fetcher({"total": 1, "chunk_size": 250}, en_interview)
+
+    docs = list(discover_ecb_interviews(f))
+    assert len(docs) == 1
+    assert "excluded" not in capsys.readouterr().err
 
 
 def test_discover_ecb_interviews_since_early_stop():

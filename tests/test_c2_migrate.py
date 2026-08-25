@@ -152,6 +152,78 @@ def test_c2_migrate_dry_run_touches_nothing(tmp_path, monkeypatch):
     assert csv_rows and csv_rows[0]["doc_id"] == "id1"
 
 
+def test_c2_migrate_matches_corrupted_url(tmp_path, monkeypatch):
+    """A row whose pdf_url carries the ``.en.html/nter/...`` concatenation
+    artifact still joins the native foedb record (by the cleaned form) and
+    gets the clean URL registered in alt_urls -- pdf_url itself is left
+    untouched (same file-on-disk invariant as every other match path)."""
+    clean_url = ("https://www.ecb.europa.eu/press/inter/date/2019/html/"
+                "ecb.in191216~e43be9798e.en.html")
+    native = [
+        DocRecord(bank_code="ecb", doc_type=DocType.C2, title="Interview X",
+                  pdf_url=clean_url,
+                  date=date(2019, 12, 16), provenance="bank_site", mime_type="text/html",
+                  date_precision="day", date_source="bank_site"),
+    ]
+    monkeypatch.setattr(c2_migrate, "discover_ecb_interviews",
+                        lambda fetcher, since=None: iter(native))
+
+    cfg = Config(data_dir=tmp_path)
+    corrupted_url = clean_url + "/nter/date/2019/html/ecb.in191216~e43be9798e.en.html"
+    row = {"doc_id": "id1", "bank_code": "ecb", "doc_type": "C2",
+          "title": "ECB C2 2019-12-16", "pdf_url": corrupted_url,
+          "date": "2019-12-16", "date_precision": "day", "date_source": "bank_site"}
+    _write_ecb_manifest(cfg, [row])
+
+    summary = run_c2_migrate(cfg, fetcher=object(), write=True)
+    assert summary["matched"] == 1 and summary["no_match"] == 0
+
+    csv_rows = _read_csv(cfg)
+    r1 = next(r for r in csv_rows if r["doc_id"] == "id1")
+    assert r1["match_type"] == "url-corrupted"
+
+    after = {r["doc_id"]: r for r in iter_manifest_rows(cfg, "ecb")}
+    a = after["id1"]
+    assert a["pdf_url"] == corrupted_url                       # pdf_url untouched
+    assert clean_url in a["alt_urls"]                          # clean form registered
+
+
+def test_c2_migrate_matches_known_rehash(tmp_path, monkeypatch):
+    """The one documented URL-churn pair: foedb only reports the interview
+    under its NEW hash, but the manifest row still carries the OLD hash --
+    _KNOWN_REHASH bridges the join and the new-hash URL lands in alt_urls."""
+    old_url = ("https://www.ecb.europa.eu/press/inter/date/2019/html/"
+              "ecb.in191202~fe0bc873b8.en.html")
+    new_url = ("https://www.ecb.europa.eu/press/inter/date/2019/html/"
+              "ecb.in191202~869aa1e5ad.en.html")
+    native = [
+        DocRecord(bank_code="ecb", doc_type=DocType.C2, title="Interview Y",
+                  pdf_url=new_url,
+                  date=date(2019, 12, 2), provenance="bank_site", mime_type="text/html",
+                  date_precision="day", date_source="bank_site"),
+    ]
+    monkeypatch.setattr(c2_migrate, "discover_ecb_interviews",
+                        lambda fetcher, since=None: iter(native))
+
+    cfg = Config(data_dir=tmp_path)
+    row = {"doc_id": "id1", "bank_code": "ecb", "doc_type": "C2",
+          "title": "ECB C2 2019-12-02", "pdf_url": old_url,
+          "date": "2019-12-02", "date_precision": "day", "date_source": "bank_site"}
+    _write_ecb_manifest(cfg, [row])
+
+    summary = run_c2_migrate(cfg, fetcher=object(), write=True)
+    assert summary["matched"] == 1 and summary["no_match"] == 0
+
+    csv_rows = _read_csv(cfg)
+    r1 = next(r for r in csv_rows if r["doc_id"] == "id1")
+    assert r1["match_type"] == "url-rehash"
+
+    after = {r["doc_id"]: r for r in iter_manifest_rows(cfg, "ecb")}
+    a = after["id1"]
+    assert a["pdf_url"] == old_url                              # pdf_url untouched
+    assert new_url in a["alt_urls"]                             # new-hash form registered
+
+
 def test_c2_migrate_non_c2_ecb_rows_pass_through_unchanged(tmp_path, monkeypatch):
     """rewrite_manifest replaces a bank's file wholesale -- a non-C2 ecb row
     must survive the --write pass byte-for-byte (no schema fields injected)."""
