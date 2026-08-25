@@ -28,8 +28,9 @@ so it is never relabelled ``recoverable`` (which would just re-download the
 same duplicate PDF every run). A ``duplicate`` verdict also SELF-HEALS: the
 dead URL (and, in ``--candidates`` mode, the candidate's own verified
 ``final_url``) is stamped onto the matched row's ``alt_urls`` and its
-quarantine is released (one ``Storage.stamp_alt_urls`` call, applied once at
-the end of the pass -- never during a dry-run), so the same dead URL is
+quarantine is released (one ``Storage.stamp_alt_urls`` call in a ``finally``
+-- applied even if the pass dies mid-loop, never during a dry-run), so the
+same dead URL is
 recognised as already known on every future pass instead of being
 rediscovered as ``duplicate`` forever. The matched row's doc_id is recorded
 per-entry in the CSV's ``canonical_doc_id`` column (empty for every other
@@ -49,7 +50,7 @@ bytes already exist locally, this mode registers them via
 ``Storage.reindex`` (copy to ``Storage.target_path`` + index, sha256 dedup)
 instead of ``Storage.save`` (no network fetch) -- same storage discipline,
 never bypassed. Like the CDX-walk pass, ``--candidates`` also short-circuits
-on ``_is_converged`` before touching a line at all: re-running the same
+on ``_is_converged`` before any file validation or download: re-running the same
 candidates file after a prior pass already self-healed it (stamped the dead
 URL onto the canonical row) reports ``converged``, not ``duplicate`` -- "the
 corpus already has it" is a different truth than "nothing left to recover",
