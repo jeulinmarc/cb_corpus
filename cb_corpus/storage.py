@@ -26,7 +26,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, Mapping, Optional
 
 from .config import Config
 from .http import Fetcher
@@ -262,7 +262,11 @@ class Storage:
         # writes must only ever happen from THIS serialized loop (never
         # parallel workers) — see quarantine.py's _append docstring.
         self.quarantine = Quarantine(self.cfg)
-        self._hashes: set[str] = set()
+        # sha256 -> doc_id of the row that owns that content, not just a
+        # membership set: a same-bytes save under a different doc_id needs to
+        # report WHICH existing doc_id matched (`skip:duplicate-content:<id>`)
+        # so a caller (recover.py) can stamp the dead URL onto the right row.
+        self._hash_docid: dict[str, str] = {}
         self._ids: set[str] = set()
         self._urls: set[str] = set()
         self._source_urls: set[str] = set()
@@ -283,7 +287,7 @@ class Storage:
         for rec in self.iter_manifest():
             self._ids.add(rec["doc_id"])
             if rec.get("sha256"):
-                self._hashes.add(rec["sha256"])
+                self._hash_docid[rec["sha256"]] = rec["doc_id"]
             url = rec.get("pdf_url")
             if url:
                 self._urls.add(url)
@@ -342,10 +346,55 @@ class Storage:
         indexes so a long-lived Storage stays consistent with disk.
         """
         n = write_per_bank(self.cfg, rows)
-        self._ids.clear(); self._hashes.clear(); self._urls.clear()
+        self._ids.clear(); self._hash_docid.clear(); self._urls.clear()
         self._source_urls.clear()
         self._load_existing()
         return n
+
+    def stamp_alt_urls(self, stamps: Mapping[str, Iterable[str]]) -> int:
+        """Add URLs to the `alt_urls` of already-indexed rows, by doc_id.
+
+        `stamps`: doc_id -> URLs to add (recover.py's duplicate-path
+        self-healing: a dead URL whose content/doc_id matched an existing
+        row gets stamped onto THAT row so `_skip_known_url`/`_is_converged`
+        recognise it forever). For each row whose doc_id appears in
+        `stamps`, every URL that is neither the row's own `pdf_url` nor
+        already present in its `alt_urls` is appended -- this only ADDS
+        alt_urls, never touches `pdf_url`/`doc_id` (dedup identity is never
+        rewritten). Unknown doc_ids are silently ignored (defensive; the
+        caller logs totals, this method doesn't need to explain a no-match).
+
+        Only the bank file(s) that actually changed are rewritten, in ONE
+        `rewrite_manifest` call covering all of them together (never a
+        rewrite per row). Returns the number of URLs actually stamped; 0
+        means nothing changed and no rewrite happened at all.
+        """
+        if not stamps:
+            return 0
+        by_bank: dict[str, list[dict]] = {}
+        touched_banks: set[str] = set()
+        stamped = 0
+        for row in self.iter_manifest():
+            bank = row.get("bank_code") or "_unknown"
+            by_bank.setdefault(bank, []).append(row)
+            urls = stamps.get(row.get("doc_id"))
+            if not urls:
+                continue
+            pdf_url = row.get("pdf_url")
+            alt_urls = list(row.get("alt_urls") or [])
+            for url in urls:
+                if not url or url == pdf_url or url in alt_urls:
+                    continue
+                alt_urls.append(url)
+                stamped += 1
+            if alt_urls != (row.get("alt_urls") or []):
+                row["alt_urls"] = alt_urls
+                touched_banks.add(bank)
+        if stamped == 0:
+            return 0
+        rows_to_write = [r for bank in touched_banks for r in by_bank[bank]]
+        self.rewrite_manifest(rows_to_write)
+        return stamped
 
     # -- paths -----------------------------------------------------------
     def target_path(self, rec: DocRecord) -> Path:
@@ -404,8 +453,8 @@ class Storage:
         if mime:
             rec.mime_type = mime
         digest = hashlib.sha256(content).hexdigest()
-        if digest in self._hashes:
-            return "skip:duplicate-content"
+        if digest in self._hash_docid:
+            return f"skip:duplicate-content:{self._hash_docid[digest]}"
 
         is_html = mime.startswith("text/html") or mime.startswith("application/xhtml")
         if is_html:
@@ -448,7 +497,7 @@ class Storage:
         rec.sha256 = digest
         rec.local_path = str(path)
         self._ids.add(rec.doc_id)
-        self._hashes.add(digest)
+        self._hash_docid[digest] = rec.doc_id
         self._urls.add(rec.pdf_url)
         if rec.source_url:
             self._source_urls.add(rec.source_url)
@@ -477,8 +526,8 @@ class Storage:
 
         content = path.read_bytes()
         digest = hashlib.sha256(content).hexdigest()
-        if digest in self._hashes:
-            return "skip:duplicate-content"
+        if digest in self._hash_docid:
+            return f"skip:duplicate-content:{self._hash_docid[digest]}"
 
         ext = path.suffix.lower().lstrip(".")
         rec.mime_type = {"pdf": "application/pdf", "html": "text/html"}.get(ext, rec.mime_type)
@@ -487,7 +536,7 @@ class Storage:
         rec.sha256 = digest
         rec.local_path = str(path)
         self._ids.add(rec.doc_id)
-        self._hashes.add(digest)
+        self._hash_docid[digest] = rec.doc_id
         self._urls.add(rec.pdf_url)
         if rec.source_url:
             self._source_urls.add(rec.source_url)

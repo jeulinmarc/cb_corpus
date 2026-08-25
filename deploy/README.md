@@ -104,7 +104,12 @@ after a manual `recover-downloads --candidates` hunt, `recover-downloads
 already-quarantined immediately (no need to accumulate synthetic failed
 nights) — run it against (or copy its resulting `download_quarantine.jsonl`
 into) the same data directory the NAS deployment actually uses, otherwise the
-seeded state never reaches the running container.
+seeded state never reaches the running container. A `duplicate` verdict from
+`recover-downloads` (the dead URL's bytes or doc_id match a document already
+in the corpus) now self-heals: the dead URL is stamped onto the matching
+row's `alt_urls` and its quarantine entry is released, so it stops
+reappearing as a fresh failure on every future nightly/recover pass instead
+of being rediscovered as `duplicate` forever.
 
 **Migration:** stacks created before 2026-07-15 used the refresh/discover job
 pair — the crontab and job names changed; recreate the stack after re-pulling

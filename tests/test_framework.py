@@ -1173,6 +1173,133 @@ def test_dry_run_does_not_persist_and_never_blocks_real_save(tmp_path):
     assert len(list(iter_manifest_rows(cfg))) == 1  # exactly 1 row
 
 
+def test_duplicate_content_status_carries_matched_doc_id(tmp_path):
+    """A same-bytes save under a DIFFERENT doc_id must report which existing
+    doc_id the content matches (`skip:duplicate-content:<doc_id>`) -- the
+    recover.py duplicate-stamping design needs this to know which manifest
+    row to stamp the dead URL onto."""
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (b"%PDF-1.4 same body", "application/pdf")
+    rec_a = DocRecord(bank_code="fr", doc_type=DocType.D1, title="A",
+                      pdf_url="https://www.banque-france.fr/a.pdf",
+                      date=date(2020, 1, 1))
+    assert st.save(rec_a) == "saved"
+    rec_b = DocRecord(bank_code="fr", doc_type=DocType.D1, title="B",
+                      pdf_url="https://www.banque-france.fr/b.pdf",
+                      date=date(2020, 1, 1))
+    assert st.save(rec_b) == f"skip:duplicate-content:{rec_a.doc_id}"
+
+    # Same for reindex() (no-fetch path).
+    st2 = Storage(cfg)
+    local_pdf = tmp_path / "reindex-src.pdf"
+    local_pdf.write_bytes(b"%PDF-1.4 same body")
+    rec_c = DocRecord(bank_code="fr", doc_type=DocType.D1, title="C",
+                      pdf_url="https://www.banque-france.fr/c.pdf",
+                      date=date(2020, 1, 1))
+    assert st2.reindex(rec_c, local_pdf) == f"skip:duplicate-content:{rec_a.doc_id}"
+
+
+def test_duplicate_content_map_survives_reload(tmp_path):
+    """The sha256 -> doc_id map must be rebuilt on `_load_existing` (a fresh
+    Storage over the same data dir), not just maintained in-memory at the
+    write sites."""
+    cfg = Config(data_dir=tmp_path)
+    st1 = Storage(cfg)
+    st1.fetcher.get_bytes = lambda url: (b"%PDF-1.4 reload body", "application/pdf")
+    rec_a = DocRecord(bank_code="fr", doc_type=DocType.D1, title="A",
+                      pdf_url="https://www.banque-france.fr/reload-a.pdf",
+                      date=date(2020, 1, 1))
+    assert st1.save(rec_a) == "saved"
+
+    st2 = Storage(cfg)   # fresh instance, re-reads the manifest
+    st2.fetcher.get_bytes = lambda url: (b"%PDF-1.4 reload body", "application/pdf")
+    rec_b = DocRecord(bank_code="fr", doc_type=DocType.D1, title="B",
+                      pdf_url="https://www.banque-france.fr/reload-b.pdf",
+                      date=date(2020, 1, 1))
+    assert st2.save(rec_b) == f"skip:duplicate-content:{rec_a.doc_id}"
+
+
+def test_stamp_alt_urls_adds_missing_url_and_persists(tmp_path):
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (b"%PDF-1.4 stamp body", "application/pdf")
+    rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="A",
+                    pdf_url="https://www.banque-france.fr/stamp-a.pdf",
+                    date=date(2020, 1, 1))
+    assert st.save(rec) == "saved"
+
+    n = st.stamp_alt_urls({rec.doc_id: ["https://dead.example/stamp-a.pdf"]})
+    assert n == 1
+
+    # Persisted -- a fresh Storage sees the stamped alt_url.
+    st2 = Storage(cfg)
+    row = next(r for r in st2.iter_manifest("fr") if r["doc_id"] == rec.doc_id)
+    assert row["alt_urls"] == ["https://dead.example/stamp-a.pdf"]
+
+
+def test_stamp_alt_urls_skips_url_equal_to_pdf_url(tmp_path):
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (b"%PDF-1.4 stamp body 2", "application/pdf")
+    rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="A",
+                    pdf_url="https://www.banque-france.fr/stamp-b.pdf",
+                    date=date(2020, 1, 1))
+    assert st.save(rec) == "saved"
+
+    n = st.stamp_alt_urls({rec.doc_id: [rec.pdf_url]})
+    assert n == 0
+    row = next(r for r in st.iter_manifest("fr") if r["doc_id"] == rec.doc_id)
+    assert row["alt_urls"] == []
+
+
+def test_stamp_alt_urls_skips_already_present_alt(tmp_path):
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (b"%PDF-1.4 stamp body 3", "application/pdf")
+    rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="A",
+                    pdf_url="https://www.banque-france.fr/stamp-c.pdf",
+                    alt_urls=["https://mirror.example/stamp-c.pdf"],
+                    date=date(2020, 1, 1))
+    assert st.save(rec) == "saved"
+
+    n = st.stamp_alt_urls({rec.doc_id: ["https://mirror.example/stamp-c.pdf"]})
+    assert n == 0
+    row = next(r for r in st.iter_manifest("fr") if r["doc_id"] == rec.doc_id)
+    assert row["alt_urls"] == ["https://mirror.example/stamp-c.pdf"]
+
+
+def test_stamp_alt_urls_no_op_returns_zero_and_does_not_rewrite(tmp_path, monkeypatch):
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (b"%PDF-1.4 stamp body 4", "application/pdf")
+    rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="A",
+                    pdf_url="https://www.banque-france.fr/stamp-d.pdf",
+                    date=date(2020, 1, 1))
+    assert st.save(rec) == "saved"
+
+    calls = []
+    monkeypatch.setattr(st, "rewrite_manifest", lambda rows: calls.append(rows))
+    assert st.stamp_alt_urls({}) == 0
+    assert st.stamp_alt_urls({rec.doc_id: []}) == 0
+    assert calls == []   # never rewritten on a no-op
+
+
+def test_stamp_alt_urls_ignores_unknown_doc_id(tmp_path):
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (b"%PDF-1.4 stamp body 5", "application/pdf")
+    rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="A",
+                    pdf_url="https://www.banque-france.fr/stamp-e.pdf",
+                    date=date(2020, 1, 1))
+    assert st.save(rec) == "saved"
+
+    n = st.stamp_alt_urls({"not-a-real-doc-id": ["https://dead.example/x.pdf"]})
+    assert n == 0
+    row = next(r for r in st.iter_manifest("fr") if r["doc_id"] == rec.doc_id)
+    assert row["alt_urls"] == []
+
+
 def test_sweep_chrome_profiles_removes_dead_pids(tmp_path):
     """R3: stale `.chrome-profile-<pid>` dirs of dead processes are swept; the
     live one (ours + current PID) is kept."""
