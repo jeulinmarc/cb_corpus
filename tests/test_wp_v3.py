@@ -6,6 +6,9 @@ fixtures under tests/fixtures/ are trimmed real responses captured June 2026.
 import json
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pytest
 
 from cb_corpus.config import Config
 from cb_corpus.models import DocRecord
@@ -14,6 +17,7 @@ from cb_corpus.taxonomy import DocType
 from cb_corpus.sources.ecb_foedb import (
     parse_versions, parse_metadata, chunk_records, wp_op_from_record,
     ecb_wp_number, repec_ecb_number, discover_ecb_wp, FOEDB_DB,
+    TYPES_DB, resolve_interview_type_id, discover_ecb_interviews,
 )
 from cb_corpus import wp_migrate
 from cb_corpus.wp_migrate import (
@@ -184,6 +188,107 @@ def test_discover_ecb_wp_since_early_stops():
     # since after the newest record -> nothing; since before -> all four.
     assert list(discover_ecb_wp(_foedb_fetcher(), since=date(2030, 1, 1))) == []
     assert len(list(discover_ecb_wp(_foedb_fetcher(), since=date(2000, 1, 1)))) == 4
+
+
+# ---- ECB C2 interviews (foedb publications_types + type==27 filter) --
+class _URLFetcher:
+    """Maps exact request URL -> canned text; records every URL asked for so
+    tests can assert on what was (not) fetched -- e.g. the early-stop tests."""
+    def __init__(self, mapping):
+        self.mapping = mapping
+        self.requested: list[str] = []
+
+    def get_text(self, url):
+        self.requested.append(url)
+        if url not in self.mapping:
+            raise AssertionError(f"unexpected url {url}")
+        return self.mapping[url]
+
+
+def _types_db_entries(chunk0_flat):
+    base = f"{TYPES_DB}/1/th"
+    return {
+        f"{TYPES_DB}/versions.json": json.dumps([{"version": "1", "hash": "th"}]),
+        f"{base}/metadata.json": json.dumps({
+            "total_records": len(chunk0_flat) // 2, "chunk_size": 250,
+            "header": ["id_publication_type", "publication_name"]}),
+        f"{base}/data/0/chunk_0.json": json.dumps(chunk0_flat),
+    }
+
+
+_GOOD_TYPES_CHUNK = [2, "WP Series", 27, "ECB Interview", 226, "The ECB Blog"]
+_RENAMED_TYPES_CHUNK = [2, "WP Series", 226, "The ECB Blog"]
+
+
+def test_resolve_interview_type_id_reads_types_db():
+    f = _URLFetcher(_types_db_entries(_GOOD_TYPES_CHUNK))
+    assert resolve_interview_type_id(f) == 27
+
+
+def test_resolve_interview_type_id_fails_loudly_when_renamed():
+    f = _URLFetcher(_types_db_entries(_RENAMED_TYPES_CHUNK))
+    with pytest.raises(ValueError):
+        resolve_interview_type_id(f)
+
+
+_PUB_HEADER = ["pub_timestamp", "type", "documentTypes", "publicationProperties"]
+
+
+def _pub_ts(y, m, d, hour=11):
+    return int(datetime(y, m, d, hour, 0, tzinfo=ZoneInfo("Europe/Berlin")).timestamp())
+
+
+def _interview_fetcher(pub_base, flat, extra=None):
+    entries = _types_db_entries(_GOOD_TYPES_CHUNK)
+    entries.update({
+        f"{FOEDB_DB}/versions.json": json.dumps([{"version": "1", "hash": "ph"}]),
+        f"{FOEDB_DB}/1/ph/metadata.json": json.dumps({
+            "total_records": pub_base["total"], "chunk_size": pub_base["chunk_size"],
+            "header": _PUB_HEADER}),
+        f"{FOEDB_DB}/1/ph/data/0/chunk_0.json": json.dumps(flat),
+    })
+    if extra:
+        entries.update(extra)
+    return _URLFetcher(entries)
+
+
+def test_discover_ecb_interviews_yields_c2_html_rows():
+    en_interview = [_pub_ts(2026, 8, 24), 27,
+                    ["/press/inter/date/2026/html/ecb.in260824~x.en.html"],
+                    {"Title": "Interview with X"}]
+    wp_record = [_pub_ts(2026, 8, 1), 2,
+                ["/pub/pdf/scpwps/ecb.wp1.en.pdf"], {"Title": "WP Title"}]
+    non_en_interview = [_pub_ts(2020, 1, 1), 27,
+                        ["/press/inter/date/2020/html/ecb.in200101~y.it.html"],
+                        {"Title": "Intervista"}]
+    flat = en_interview + wp_record + non_en_interview
+    f = _interview_fetcher({"total": 3, "chunk_size": 250}, flat)
+
+    docs = list(discover_ecb_interviews(f))
+    assert len(docs) == 1
+    d = docs[0]
+    assert (d.doc_type, d.bank_code) == (DocType.C2, "ecb")
+    assert d.pdf_url == "https://www.ecb.europa.eu/press/inter/date/2026/html/ecb.in260824~x.en.html"
+    assert d.title == "Interview with X"
+    assert str(d.date) == "2026-08-24" and d.date_precision == "day"
+    assert d.mime_type == "text/html" and d.provenance == "bank_site"
+    assert d.date_source == "bank_site" and d.source_url == FOEDB_DB
+
+
+def test_discover_ecb_interviews_since_early_stop():
+    newer = [_pub_ts(2026, 8, 24), 27,
+             ["/press/inter/date/2026/html/ecb.in260824~x.en.html"],
+             {"Title": "Newer"}]
+    older = [_pub_ts(2020, 1, 1), 27,
+             ["/press/inter/date/2020/html/ecb.in200101~y.en.html"],
+             {"Title": "Older"}]
+    flat = newer + older     # both land in chunk_0 (chunk_size=2)
+    f = _interview_fetcher({"total": 4, "chunk_size": 2}, flat)
+
+    docs = list(discover_ecb_interviews(f, since=date(2025, 1, 1)))
+    assert [d.title for d in docs] == ["Newer"]
+    # the older record triggered early-stop inside chunk_0 -> chunk_1 never requested
+    assert f"{FOEDB_DB}/1/ph/data/0/chunk_1.json" not in f.requested
 
 
 # ---- migration helpers + join ---------------------------------------

@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 from datetime import date, datetime
 from typing import Iterator, Optional
 from zoneinfo import ZoneInfo
@@ -37,6 +38,10 @@ from ..taxonomy import DocType
 
 ECB = "https://www.ecb.europa.eu"
 FOEDB_DB = ECB + "/foedb/dbs/foedb/publications.en"
+# The same foedb DB engine also serves a "publications_types" table mapping
+# each numeric `type` value in publications.en to its human name (e.g. 27 ->
+# "ECB Interview"). Read at run time by resolve_interview_type_id() below.
+TYPES_DB = ECB + "/foedb/dbs/foedb/publications_types"
 
 # WP/OP number from a PDF path. The series comes from the scpwps/scpops folder;
 # the number is the first digit run in the filename AFTER the ECB `~hash` is
@@ -192,3 +197,85 @@ def discover_ecb_wp(fetcher: Fetcher,
             doc = _record_to_doc(rec)
             if doc is not None:
                 yield doc
+
+
+_INTERVIEW_TYPE_NAME = "ECB Interview"
+_SKIP_NON_EN = object()   # sentinel: a real interview, excluded by language policy
+
+
+def resolve_interview_type_id(fetcher: Fetcher) -> int:
+    """The numeric `type` value meaning "ECB Interview", read from the ECB's own
+    publications_types DB at run time. Resolving instead of hard-coding 27 is a
+    honesty guard: if the ECB ever renumbers its types, a hard-coded id would
+    silently harvest nothing -- this raises instead."""
+    version, db_hash = parse_versions(json.loads(fetcher.get_text(f"{TYPES_DB}/versions.json")))
+    base = f"{TYPES_DB}/{version}/{db_hash}"
+    total, chunk_size, header = parse_metadata(json.loads(fetcher.get_text(f"{base}/metadata.json")))
+    n_chunks = math.ceil(total / chunk_size) if chunk_size else 0
+    for i in range(n_chunks):
+        flat = json.loads(fetcher.get_text(f"{base}/data/0/chunk_{i}.json"))
+        for rec in chunk_records(flat, header):
+            if rec.get("publication_name") == _INTERVIEW_TYPE_NAME:
+                return int(rec["id_publication_type"])
+    raise ValueError(f"ECB publications_types DB has no {_INTERVIEW_TYPE_NAME!r} entry"
+                     " -- the type map changed; refusing to harvest C2 silently")
+
+
+def interview_from_record(rec: dict, type_id: int):
+    """(title, date, absolute_url) if `rec` is an English interview; the
+    `_SKIP_NON_EN` sentinel if it is an interview without an English version
+    (9 known records, 2013-2020 -- EN-only policy, spec 2026-08-25, decision
+    Marc); None if it is not an interview at all."""
+    try:
+        if int(rec.get("type")) != type_id:
+            return None
+    except (TypeError, ValueError):
+        return None
+    docs = [u for u in (rec.get("documentTypes") or []) if isinstance(u, str)]
+    en = [u for u in docs if u.lower().endswith(".en.html")]
+    if not en:
+        return _SKIP_NON_EN if docs else None
+    title = ((rec.get("publicationProperties") or {}).get("Title") or "").strip()
+    return title, _record_date(rec.get("pub_timestamp")), _abs_url(en[0])
+
+
+def discover_ecb_interviews(fetcher: Fetcher,
+                            since: Optional[date] = None) -> Iterator[DocRecord]:
+    """Yield ECB interviews/op-eds (C2) from the live foedb DB.
+
+    Same walk as `discover_ecb_wp` (global pub_timestamp DESC -> early stop on
+    `since`). Non-English-only interviews are excluded by policy, counted, and
+    reported on stderr -- a documented exclusion, never a silent one."""
+    type_id = resolve_interview_type_id(fetcher)
+    version, db_hash = parse_versions(json.loads(fetcher.get_text(f"{FOEDB_DB}/versions.json")))
+    base = f"{FOEDB_DB}/{version}/{db_hash}"
+    total, chunk_size, header = parse_metadata(
+        json.loads(fetcher.get_text(f"{base}/metadata.json")))
+    n_chunks = math.ceil(total / chunk_size) if chunk_size else 0
+    skipped_non_en = 0
+    try:
+        for i in range(n_chunks):
+            flat = json.loads(fetcher.get_text(f"{base}/data/0/chunk_{i}.json"))
+            for rec in chunk_records(flat, header):
+                if since is not None:
+                    d = _record_date(rec.get("pub_timestamp"))
+                    if d is not None and d < since:
+                        return
+                got = interview_from_record(rec, type_id)
+                if got is _SKIP_NON_EN:
+                    skipped_non_en += 1
+                    continue
+                if got is None:
+                    continue
+                title, d, url = got
+                yield DocRecord(
+                    bank_code="ecb", doc_type=DocType.C2,
+                    title=title or f"ECB interview {d or ''}".strip(),
+                    pdf_url=url, source_url=FOEDB_DB, date=d,
+                    provenance="bank_site", mime_type="text/html",
+                    date_precision="day", date_source="bank_site",
+                )
+    finally:
+        if skipped_non_en:
+            print(f"[ecb-c2] {skipped_non_en} non-English-only interview(s) excluded"
+                  " (EN-only policy)", file=sys.stderr, flush=True)
