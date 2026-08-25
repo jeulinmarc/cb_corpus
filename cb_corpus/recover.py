@@ -279,17 +279,28 @@ def _duplicate_doc_id(status: str) -> Optional[str]:
     return None
 
 
-def _apply_stamps(storage: Storage, stamps: dict[str, set[str]]) -> None:
+def _add_stamp(stamps: dict[str, list[str]], doc_id: str, *urls: str) -> None:
+    """Ordered, deduped stamp collection: dead URL first (provenance
+    history), then any live alternative. Order is part of the contract --
+    a set here made alt_urls append order vary across runs (hash
+    randomization), churning autocommitted manifest diffs for nothing."""
+    bucket = stamps.setdefault(doc_id, [])
+    for url in urls:
+        if url and url not in bucket:
+            bucket.append(url)
+
+
+def _apply_stamps(storage: Storage, stamps: dict[str, list[str]]) -> None:
     """Apply the alt_url stamps collected during a pass (see
     `run_recover_downloads`/`_run_candidates_pass`) in ONE
-    `Storage.stamp_alt_urls` call, and print the one-line audit summary.
-    A no-op (no print, no rewrite) when nothing was collected -- callers
-    only build `stamps` at all when `download` is True, so this never runs
-    during a dry-run."""
+    `Storage.stamp_alt_urls` call, and print the honest (urls, rows)
+    accounting. A no-op (no print, no rewrite) when nothing was collected --
+    callers only build `stamps` at all when `download` is True, so this
+    never runs during a dry-run."""
     if not stamps:
         return
-    n = storage.stamp_alt_urls(stamps)
-    print(f"[recover] stamped {n} alt_url(s) on {len(stamps)} row(s)",
+    urls_stamped, rows_modified = storage.stamp_alt_urls(stamps)
+    print(f"[recover] stamped {urls_stamped} alt_url(s) on {rows_modified} row(s)",
           file=sys.stderr, flush=True)
 
 
@@ -311,10 +322,10 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
 
     results: dict[str, dict] = {}
     csv_rows: list[dict] = []
-    # doc_id -> URLs to stamp onto its alt_urls, applied ONCE at the end
-    # (never during dry-run -- only ever populated inside `if download:`
+    # doc_id -> ordered URLs to stamp onto its alt_urls, applied ONCE at the
+    # end (never during dry-run -- only ever populated inside `if download:`
     # branches below).
-    stamps: dict[str, set[str]] = {}
+    stamps: dict[str, list[str]] = {}
 
     def _bump(bank: str, action: str) -> dict:
         summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
@@ -455,7 +466,7 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
             # land in alt_urls (the flagship self-heal case this PR exists
             # for). Either way the quarantine release still matters.
             if download:
-                stamps.setdefault(rec.doc_id, set()).add(dead_url)
+                _add_stamp(stamps, rec.doc_id, dead_url)
                 storage.quarantine.record_success(dead_url)
         elif download:
             dest = storage.target_path(rec)
@@ -501,7 +512,7 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
                     # onto the matched row -- final_url was never dead, so
                     # only dead_url's quarantine is released.
                     canonical_doc_id = matched_id
-                    stamps.setdefault(matched_id, set()).update({dead_url, final_url})
+                    _add_stamp(stamps, matched_id, dead_url, final_url)
                     storage.quarantine.record_success(dead_url)
             elif status.startswith("skip:"):
                 # Any other non-"reindexed" status (e.g. skip:missing-file,
@@ -586,10 +597,11 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     entries = _read_inventory(cfg, bank_codes)
     results: dict[str, dict] = {}
     csv_rows: list[dict] = []
-    # doc_id -> URLs to stamp onto its alt_urls, applied ONCE at the end
-    # (never during dry-run -- this whole CDX-walk pass only ever attempts a
-    # save, and so can only classify a duplicate, inside `if download:`).
-    stamps: dict[str, set[str]] = {}
+    # doc_id -> ordered URLs to stamp onto its alt_urls, applied ONCE at the
+    # end (never during dry-run -- this whole CDX-walk pass only ever
+    # attempts a save, and so can only classify a duplicate, inside
+    # `if download:`).
+    stamps: dict[str, list[str]] = {}
 
     for entry in entries:
         bank = entry.get("bank_code") or "_unknown"
@@ -666,7 +678,7 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                     summary["duplicate"] += 1
                     action = "duplicate"
                     canonical_doc_id = rec.doc_id
-                    stamps.setdefault(rec.doc_id, set()).add(pdf_url)
+                    _add_stamp(stamps, rec.doc_id, pdf_url)
                     storage.quarantine.record_success(pdf_url)
                 elif status.startswith("skip:duplicate-content"):
                     # Bytes hash-matched a DIFFERENT existing doc_id, carried
@@ -683,7 +695,7 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                     matched_id = _duplicate_doc_id(status)
                     if matched_id:
                         canonical_doc_id = matched_id
-                        stamps.setdefault(matched_id, set()).add(pdf_url)
+                        _add_stamp(stamps, matched_id, pdf_url)
                         storage.quarantine.record_success(pdf_url)
                 elif status.startswith("skip:"):
                     # Any OTHER skip:* (e.g. a future status we don't special-

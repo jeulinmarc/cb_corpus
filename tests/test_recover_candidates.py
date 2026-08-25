@@ -344,6 +344,45 @@ def test_duplicate_content_is_deduped_and_orphan_file_removed(tmp_path, monkeypa
     assert "[recover] stamped 2 alt_url(s) on 1 row(s)" in stderr
 
 
+def test_candidates_duplicate_stamp_order_dead_then_final(tmp_path, monkeypatch):
+    """Deterministic alt_urls append order (spec §4): the duplicate-content
+    site stamps [dead_url, final_url] onto the canonical row in that exact
+    order -- a set here would make append order vary across runs (hash
+    randomization), churning autocommitted manifest diffs for nothing."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dup_bytes = b"%PDF-1.4 duplicate-body-order " + b"y" * (25 * 1024)
+
+    seed_storage = Storage(cfg, _NullFetcher())
+    seed_rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Existing copy",
+                        pdf_url="https://www.banque-france.fr/existing-order.pdf",
+                        date=date(2020, 1, 1), mime_type="application/pdf")
+    seed_path = cfg.data_dir / "seed-source-order.pdf"
+    seed_path.write_bytes(dup_bytes)
+    assert seed_storage.reindex(seed_rec, seed_path) == "reindexed"
+
+    dead_url = "https://www.banque-france.fr/dt-alias-order.pdf"
+    final_url = "https://web.archive.org/alias-order"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Alias copy order")])
+    local_pdf = tmp_path / "alias-order.pdf"
+    local_pdf.write_bytes(dup_bytes)
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": final_url,
+    }])
+    _stub_refresh_metadata(monkeypatch, title="Alias copy order")
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["duplicate"] == 1
+
+    rows = list(iter_manifest_rows(cfg, "fr"))
+    assert rows[0]["doc_id"] == seed_rec.doc_id
+    assert rows[0]["alt_urls"][-2:] == [dead_url, final_url]
+
+
 # ---------------------------------------------------------------------------
 # dry-run
 # ---------------------------------------------------------------------------

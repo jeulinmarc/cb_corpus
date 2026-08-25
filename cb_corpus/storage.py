@@ -351,7 +351,7 @@ class Storage:
         self._load_existing()
         return n
 
-    def stamp_alt_urls(self, stamps: Mapping[str, Iterable[str]]) -> int:
+    def stamp_alt_urls(self, stamps: Mapping[str, Iterable[str]]) -> tuple[int, int]:
         """Add URLs to the `alt_urls` of already-indexed rows, by doc_id.
 
         `stamps`: doc_id -> URLs to add (recover.py's duplicate-path
@@ -366,14 +366,15 @@ class Storage:
 
         Only the bank file(s) that actually changed are rewritten, in ONE
         `rewrite_manifest` call covering all of them together (never a
-        rewrite per row). Returns the number of URLs actually stamped; 0
+        rewrite per row). Returns `(urls_stamped, rows_modified)`; `(0, 0)`
         means nothing changed and no rewrite happened at all.
         """
         if not stamps:
-            return 0
+            return (0, 0)
         by_bank: dict[str, list[dict]] = {}
         touched_banks: set[str] = set()
         stamped = 0
+        rows_modified = 0
         for row in self.iter_manifest():
             bank = row.get("bank_code") or "_unknown"
             by_bank.setdefault(bank, []).append(row)
@@ -389,12 +390,13 @@ class Storage:
                 stamped += 1
             if alt_urls != (row.get("alt_urls") or []):
                 row["alt_urls"] = alt_urls
+                rows_modified += 1
                 touched_banks.add(bank)
         if stamped == 0:
-            return 0
+            return (0, 0)
         rows_to_write = [r for bank in touched_banks for r in by_bank[bank]]
         self.rewrite_manifest(rows_to_write)
-        return stamped
+        return (stamped, rows_modified)
 
     # -- paths -----------------------------------------------------------
     def target_path(self, rec: DocRecord) -> Path:
