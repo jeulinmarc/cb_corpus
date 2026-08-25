@@ -353,6 +353,18 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
                                  "snapshot_ts": "", "title": fallback_title})
                 continue
 
+            if _is_converged(storage, entry):
+                # The index already knows every URL of this entry (typically
+                # via a stamp from a previous pass): "the corpus already has
+                # it" is a different truth than "nothing left to recover"
+                # (duplicate), and the CDX pass already reports it as such --
+                # keep the two modes' vocabulary consistent (PR #13 final
+                # review, prior Minor 1). No stamping, no quarantine call.
+                _bump(bank, "converged")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "converged",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
+
             file_path = Path(cand.get("file_path") or "")
             if not _verify_local_pdf(file_path):
                 _bump(bank, "bad-file")

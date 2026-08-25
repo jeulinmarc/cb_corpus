@@ -416,11 +416,12 @@ def test_dry_run_writes_nothing(tmp_path, monkeypatch):
     assert csv_rows[0]["action"] == "recoverable"
 
 
-def test_candidates_probe_duplicate_dry_run_does_not_release_quarantine(tmp_path, monkeypatch):
-    """The probe (`storage.reindex(..., dry_run=True)`) runs in BOTH modes
-    (mode parity, see `_run_candidates_pass`'s docstring), so a pure dry-run
-    (no `--download`) can still classify a candidate as 'duplicate' -- but
-    the dry-run contract must still hold: no quarantine release, no manifest
+def test_candidates_converged_dry_run_does_not_release_quarantine(tmp_path, monkeypatch):
+    """A row already indexed under the entry's own `pdf_url` (wayback
+    provenance keeps the candidate's `pdf_url == dead_url`) makes the entry
+    `_is_converged` from the start -- the short-circuit fires before the
+    probe is even reached, in EITHER mode (dry-run or --download). The
+    dry-run contract must still hold: no quarantine release, no manifest
     write, ever."""
     from cb_corpus.recover import run_recover_downloads
 
@@ -430,7 +431,8 @@ def test_candidates_probe_duplicate_dry_run_does_not_release_quarantine(tmp_path
 
     # Pre-seed a row already indexed under the EXACT identity the candidate's
     # own doc_id resolves to (wayback provenance keeps pdf_url == dead_url)
-    # -- makes the dry-run probe honestly report "skip:already-indexed".
+    # -- makes the entry `_is_converged` honestly, before ever reaching the
+    # probe.
     seed_storage = Storage(cfg, _NullFetcher())
     seed_rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Already here",
                         pdf_url=dead_url, date=date(2020, 1, 1),
@@ -454,7 +456,7 @@ def test_candidates_probe_duplicate_dry_run_does_not_release_quarantine(tmp_path
     results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
                                     candidates=str(cand_path), download=False,
                                     csv_path=str(tmp_path / "r.csv"))
-    assert results["fr"]["duplicate"] == 1
+    assert results["fr"]["converged"] == 1
 
     # No quarantine release: still exactly the one seeded line, no
     # "released" tombstone appended.
@@ -577,16 +579,15 @@ def test_apply_seed_quarantine_validates_whole_file_before_applying_any_seed(tmp
 
 def test_rerunning_same_candidates_file_twice_does_not_delete_corpus_file(tmp_path, monkeypatch):
     """The exact data-loss scenario: a --candidates pass is re-run (e.g. a
-    retry) after the corpus already converged on these docs. dest ==
-    storage.target_path(rec) for the SAME doc_id as the already-indexed row
-    -- the second run must recognise that via a dry-run probe BEFORE copying
-    anything, never copy2-then-unlink the real corpus file.
+    retry) after the corpus already converged on these docs. The second run
+    must recognise that via the `_is_converged` short-circuit BEFORE ever
+    touching the local file (the check runs even before the file/doc-type
+    validations), never copy2-then-unlink the real corpus file.
 
-    Also covers the probe-based `skip:already-indexed` duplicate path's
-    self-healing: the dead URL IS this row's own pdf_url already (wayback
-    provenance), so stamping is inherently a no-op for alt_urls -- what's
-    actually observable is the quarantine release and the canonical_doc_id
-    audit trail."""
+    Converged means "the index already knows every URL" (spec §2): no
+    stamping, no quarantine call -- so a quarantine entry set after the
+    first run (e.g. an independent nightly-sync race) is left exactly as
+    is, never released again by a converged verdict."""
     from cb_corpus.recover import run_recover_downloads
 
     cfg = Config(data_dir=tmp_path)
@@ -608,12 +609,10 @@ def test_rerunning_same_candidates_file_twice_does_not_delete_corpus_file(tmp_pa
     assert len(rows) == 1
     local_path = Path(rows[0]["local_path"])
     assert local_path.is_file()
-    canonical_id = rows[0]["doc_id"]
 
     # Simulate the nightly sync having independently re-quarantined the dead
-    # URL since the first run (record_success already released it once, but
-    # a later failing streak restarts the count from zero) -- makes the
-    # second run's release actually observable.
+    # URL since the first run -- a converged verdict must leave this exactly
+    # as is (no quarantine call at all).
     q_path = cfg.data_dir / "download_quarantine.jsonl"
     with q_path.open("a") as fh:
         fh.write(json.dumps({"url": dead_url,
@@ -625,7 +624,8 @@ def test_rerunning_same_candidates_file_twice_does_not_delete_corpus_file(tmp_pa
     results2 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
                                      candidates=str(cand_path), download=True,
                                      csv_path=str(tmp_path / "r2.csv"))
-    assert results2["fr"]["duplicate"] == 1
+    assert results2["fr"]["converged"] == 1
+    assert results2["fr"].get("duplicate", 0) == 0
     assert results2["fr"].get("recovered", 0) == 0
 
     # The real corpus file must still be present -- the exact bug this fix
@@ -635,17 +635,23 @@ def test_rerunning_same_candidates_file_twice_does_not_delete_corpus_file(tmp_pa
     assert len(rows_after) == 1
 
     csv_rows = _csv_rows(tmp_path / "r2.csv")
-    assert csv_rows[0]["action"] == "duplicate"
-    assert csv_rows[0]["canonical_doc_id"] == canonical_id
+    assert csv_rows[0]["action"] == "converged"
 
+    # No quarantine call for a converged verdict: the manually re-quarantined
+    # line is untouched, no "released" tombstone appended.
     q_lines = q_path.read_text().splitlines()
-    assert json.loads(q_lines[-1]) == {"url": dead_url, "released": True}
+    assert len(q_lines) == 1
+    assert json.loads(q_lines[-1]).get("released") is not True
 
 
 def test_duplicated_candidate_line_within_one_run_is_deduped_without_deleting_file(tmp_path, monkeypatch):
     """Same scenario as above but within a SINGLE run: the same candidate
     line appears twice in the file (an operator mistake / a hand-hunted
-    list built by concatenating sources)."""
+    list built by concatenating sources). The first occurrence recovers and
+    indexes the doc in-memory immediately (`Storage.reindex` updates `_ids`/
+    `_urls` without needing a manifest reload) -- so the second occurrence
+    is already `_is_converged` by the time its turn comes, deduped even
+    earlier than the probe (no file/doc-type validation at all)."""
     from cb_corpus.recover import run_recover_downloads
 
     cfg = Config(data_dir=tmp_path)
@@ -663,15 +669,14 @@ def test_duplicated_candidate_line_within_one_run_is_deduped_without_deleting_fi
                                     candidates=str(cand_path), download=True,
                                     csv_path=str(tmp_path / "r.csv"))
     assert results["fr"]["recovered"] == 1
-    assert results["fr"]["duplicate"] == 1
+    assert results["fr"]["converged"] == 1
 
     rows = list(iter_manifest_rows(cfg, "fr"))
     assert len(rows) == 1
     assert Path(rows[0]["local_path"]).is_file()
 
     csv_rows = _csv_rows(tmp_path / "r.csv")
-    assert [r["action"] for r in csv_rows] == ["recovered", "duplicate"]
-    assert csv_rows[1]["canonical_doc_id"] == rows[0]["doc_id"]
+    assert [r["action"] for r in csv_rows] == ["recovered", "converged"]
 
 
 # ---------------------------------------------------------------------------
@@ -1048,19 +1053,18 @@ def test_dry_run_reports_duplicate_for_already_indexed_doc_id(tmp_path, monkeypa
     assert results1["fr"]["recovered"] == 1
 
     # Second pass, dry-run (download=False) against the now-converged corpus:
-    # must report "duplicate", not "recoverable" -- the doc_id is already
-    # indexed, so there is nothing left to recover, dry-run or not.
+    # must report "converged", not "recoverable" -- the `_is_converged`
+    # short-circuit fires before the probe is ever reached, dry-run or not
+    # (spec §2: "the corpus already has it" is a different truth than
+    # "nothing left to recover").
     results2 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
                                      candidates=str(cand_path), download=False,
                                      csv_path=str(tmp_path / "r2.csv"))
-    # "recoverable" is bumped provisionally for every candidate before the
-    # probe classifies it further (same convention as the CDX-walk path and
-    # the existing --download duplicate tests) -- the CSV action, not this
-    # counter, is the authoritative per-candidate classification.
-    assert results2["fr"]["duplicate"] == 1
+    assert results2["fr"]["converged"] == 1
+    assert results2["fr"].get("recoverable", 0) == 0
 
     csv_rows = _csv_rows(tmp_path / "r2.csv")
-    assert csv_rows[0]["action"] == "duplicate"
+    assert csv_rows[0]["action"] == "converged"
 
 
 def test_dry_run_still_reports_recoverable_for_a_new_doc(tmp_path, monkeypatch):
@@ -1180,3 +1184,66 @@ def test_stamps_applied_even_if_pass_dies_mid_loop(tmp_path, monkeypatch):
     rows = {r["pdf_url"]: r for r in iter_manifest_rows(cfg, "fr")}
     assert dead_url_1 in rows[final_url_1]["alt_urls"]
     assert dead_url_2 not in rows[final_url_2]["alt_urls"]
+
+
+# ---------------------------------------------------------------------------
+# PR #13 final review, Minor 1 (prior) / spec §2 -- candidates re-run reports
+# converged, matching the CDX-walk pass's vocabulary
+# ---------------------------------------------------------------------------
+
+def test_candidates_rerun_over_healed_corpus_reports_converged(tmp_path, monkeypatch):
+    """Re-running a --candidates file after a prior pass already self-healed
+    it (stamped the dead URL onto the canonical row) must report
+    `converged`, not `duplicate` -- "the corpus already has it" (converged)
+    is a different truth than "nothing left to recover" (duplicate), and the
+    CDX-walk pass already reports the former as such."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/old-path/converge.pdf"
+    final_url = "https://www.banque-france.fr/new-path/converge.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Converge WP")])
+
+    seed_storage = Storage(cfg, _NullFetcher())
+    seed_rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Already here",
+                        pdf_url=final_url, date=date(2020, 1, 1),
+                        mime_type="application/pdf")
+    seed_path = tmp_path / "seed-converge.pdf"
+    seed_path.write_bytes(b"%PDF-1.4 " + b"v" * (25 * 1024))
+    assert seed_storage.reindex(seed_rec, seed_path) == "reindexed"
+
+    q_path = cfg.data_dir / "download_quarantine.jsonl"
+    q_path.parent.mkdir(parents=True, exist_ok=True)
+    q_path.write_text(json.dumps({"url": dead_url, "nights": ["2026-08-19"],
+                                  "quarantined": False}) + "\n")
+
+    local_pdf = _make_local_pdf(tmp_path, "converge-local.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "bank_site", "final_url": final_url,
+    }])
+    _stub_refresh_metadata(monkeypatch, title="Converge WP")
+
+    # First pass: self-heals via the duplicate path (stamps dead_url onto
+    # the pre-seeded canonical row, releases quarantine).
+    results1 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                     candidates=str(cand_path), download=True,
+                                     csv_path=str(tmp_path / "r1.csv"))
+    assert results1["fr"]["duplicate"] == 1
+    q_lines_after_first = q_path.read_text().splitlines()
+    assert len(q_lines_after_first) == 2   # seeded line + released tombstone
+
+    # Second pass over the SAME file, now-healed corpus: must report
+    # converged, not duplicate -- no new stamping, no new quarantine call.
+    results2 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                     candidates=str(cand_path), download=True,
+                                     csv_path=str(tmp_path / "r2.csv"))
+    assert results2["fr"]["converged"] == 1
+    assert results2["fr"].get("duplicate", 0) == 0
+
+    csv_rows2 = _csv_rows(tmp_path / "r2.csv")
+    assert csv_rows2[0]["action"] == "converged"
+
+    # No new quarantine line: the release call never happened again.
+    q_lines_after_second = q_path.read_text().splitlines()
+    assert q_lines_after_second == q_lines_after_first
