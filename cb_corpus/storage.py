@@ -23,6 +23,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -44,6 +45,26 @@ _EXT_FOR_MIME = {
 
 def ext_for_mime(mime: str) -> str:
     return _EXT_FOR_MIME.get((mime or "").lower(), "bin")
+
+
+_MULTI_SLASH = re.compile(r"/{2,}")
+
+
+def normalize_url(url: str) -> str:
+    """Canonical form for the known-URL indexes: duplicate slashes in the
+    path collapsed to one (`a.eu//press` == `a.eu/press` — the one variant
+    class observed in production, ECB legacy rows, PR #11). The scheme
+    separator is preserved. Deliberately nothing else: trailing slashes,
+    http vs https, `www.`, query order and case can all change what a
+    server returns, so they stay significant (spec
+    2026-08-25-url-normalization-index-design). Pure and total: returns
+    its input shape for empty/scheme-less strings, never raises."""
+    if not url:
+        return url
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return _MULTI_SLASH.sub("/", url)
+    return scheme + sep + _MULTI_SLASH.sub("/", rest)
 
 
 # -- per-bank manifest IO (module-level so non-Storage callers can reuse) ------

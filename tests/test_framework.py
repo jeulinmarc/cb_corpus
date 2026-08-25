@@ -1653,3 +1653,22 @@ def test_cli_dispatches_subcommands(monkeypatch, capsys):
     assert cli.main(["discover", "--banks", "us"]) == 0
     assert cli.main(["repec", "--download"]) == 0
     assert cli.main(["bis-sitemap"]) == 0
+
+
+# ---- URL normalization (index-only; see 2026-08-25 spec) -------------
+def test_normalize_url_collapses_path_slashes_only():
+    from cb_corpus.storage import normalize_url
+    assert normalize_url("https://a.eu//press//x.pdf") == "https://a.eu/press/x.pdf"
+    assert normalize_url("https://a.eu/press/x.pdf") == "https://a.eu/press/x.pdf"
+    assert normalize_url("http://a.eu///b////c") == "http://a.eu/b/c"
+    # scheme separator untouched, idempotent, total on odd inputs
+    assert normalize_url("no-scheme//path") == "no-scheme/path"
+    assert normalize_url("") == ""
+    assert normalize_url(normalize_url("https://a.eu//x")) == "https://a.eu/x"
+
+
+def test_normalize_url_does_not_equalize_out_of_scope_variants():
+    from cb_corpus.storage import normalize_url
+    assert normalize_url("http://a.eu/x.pdf") != normalize_url("https://a.eu/x.pdf")
+    assert normalize_url("https://a.eu/x/") != normalize_url("https://a.eu/x")
+    assert normalize_url("https://www.a.eu/x") != normalize_url("https://a.eu/x")
