@@ -121,6 +121,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="apply the date fixes to the manifest (metadata only: "
                          "date/precision/source/handle/alt_urls; doc_id unchanged)")
 
+    cm = sub.add_parser("c2-migrate",
+                        help="One-shot enrichment of ecb C2 rows from the foedb DB "
+                             "(titles/dates/alt_urls). Dry-run by default.")
+    cm.add_argument("--write", action="store_true",
+                    help="apply the enrichment to the manifest (metadata only: "
+                         "title/date/precision/source/alt_urls; doc_id/pdf_url unchanged)")
+
     wd = sub.add_parser("wp-dates",
                         help="WP v3 phase 4: recover the publication DAY for legacy "
                              "month/year-precision D1/D2 rows via PDF /CreationDate + "
@@ -279,6 +286,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "wp-migrate":
         from .wp_migrate import run_wp_migrate
         run_wp_migrate(bank_codes=banks, csv_path=args.csv or None, write=args.write)
+        return 0
+
+    if args.cmd == "c2-migrate":
+        from .c2_migrate import run_c2_migrate
+        from .config import Config
+        from .http import Fetcher
+        cfg = Config()
+        run_c2_migrate(cfg, Fetcher(cfg), write=args.write)
         return 0
 
     if args.cmd == "wp-dates":
