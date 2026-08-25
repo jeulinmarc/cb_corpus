@@ -1106,3 +1106,77 @@ def test_bad_provenance_action(tmp_path, monkeypatch):
     assert list(iter_manifest_rows(cfg, "fr")) == []
     csv_rows = _csv_rows(tmp_path / "r.csv")
     assert csv_rows[0]["action"] == "bad-provenance"
+
+
+# ---------------------------------------------------------------------------
+# PR #13 final review, Minor 1 — stamps survive a mid-pass crash
+# ---------------------------------------------------------------------------
+
+def test_stamps_applied_even_if_pass_dies_mid_loop(tmp_path, monkeypatch):
+    """A SIGKILL/ENOSPC mid-pass would otherwise leave the first candidate's
+    stamp collected in memory but never persisted -- try/finally shrinks
+    that window to the entry actually being processed when the crash hits.
+    Two bank_site duplicate candidates; `Storage.reindex` (the probe call)
+    is monkeypatched to raise on the SECOND candidate's probe -- the pass
+    propagates that error, but the FIRST candidate's self-heal stamp must
+    already be persisted in the manifest."""
+    from cb_corpus.recover import run_recover_downloads
+    from cb_corpus import storage as storage_mod
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url_1 = "https://www.banque-france.fr/old-path/crash-1.pdf"
+    final_url_1 = "https://www.banque-france.fr/new-path/crash-1.pdf"
+    dead_url_2 = "https://www.banque-france.fr/old-path/crash-2.pdf"
+    final_url_2 = "https://www.banque-france.fr/new-path/crash-2.pdf"
+    _write_inventory(cfg, [
+        _entry(bank="fr", pdf_url=dead_url_1, title="Crash WP 1"),
+        _entry(bank="fr", pdf_url=dead_url_2, title="Crash WP 2"),
+    ])
+
+    # Pre-seed both rows already indexed under their LIVE final_urls -- what
+    # a prior bank_site recovery of each doc would have produced.
+    seed_storage = Storage(cfg, _NullFetcher())
+    seed_rec_1 = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Already here 1",
+                           pdf_url=final_url_1, date=date(2020, 1, 1),
+                           mime_type="application/pdf")
+    seed_rec_2 = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Already here 2",
+                           pdf_url=final_url_2, date=date(2020, 1, 1),
+                           mime_type="application/pdf")
+    seed_path_1 = tmp_path / "seed-crash-1.pdf"
+    seed_path_1.write_bytes(b"%PDF-1.4 " + b"c" * (25 * 1024))
+    seed_path_2 = tmp_path / "seed-crash-2.pdf"
+    seed_path_2.write_bytes(b"%PDF-1.4 " + b"d" * (25 * 1024))
+    assert seed_storage.reindex(seed_rec_1, seed_path_1) == "reindexed"
+    assert seed_storage.reindex(seed_rec_2, seed_path_2) == "reindexed"
+
+    local_pdf_1 = _make_local_pdf(tmp_path, "crash-1-local.pdf")
+    local_pdf_2 = _make_local_pdf(tmp_path, "crash-2-local.pdf")
+    cand_path = _write_candidates(tmp_path, [
+        {"dead_pdf_url": dead_url_1, "file_path": str(local_pdf_1),
+         "recovered_from": "bank_site", "final_url": final_url_1},
+        {"dead_pdf_url": dead_url_2, "file_path": str(local_pdf_2),
+         "recovered_from": "bank_site", "final_url": final_url_2},
+    ])
+    _stub_refresh_metadata(monkeypatch, title="Crash WP")
+
+    real_reindex = storage_mod.Storage.reindex
+    calls = {"n": 0}
+
+    def _flaky_reindex(self, rec, path, *, dry_run=False):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated crash mid-loop")
+        return real_reindex(self, rec, path, dry_run=dry_run)
+
+    monkeypatch.setattr(storage_mod.Storage, "reindex", _flaky_reindex)
+
+    with pytest.raises(RuntimeError, match="simulated crash mid-loop"):
+        run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                              candidates=str(cand_path), download=True,
+                              csv_path=str(tmp_path / "r.csv"))
+
+    # The first candidate's stamp must already be persisted despite the
+    # crash on the second candidate's probe.
+    rows = {r["pdf_url"]: r for r in iter_manifest_rows(cfg, "fr")}
+    assert dead_url_1 in rows[final_url_1]["alt_urls"]
+    assert dead_url_2 not in rows[final_url_2]["alt_urls"]
