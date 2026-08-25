@@ -875,6 +875,75 @@ def test_ecb_d3_known_legacy_row_filtered_before_any_fetch_through_discover_flow
     assert counts.get("saved", 0) == 1                     # only the new post was saved
 
 
+def test_discovery_slash_variant_of_indexed_row_skipped_before_fetch(tmp_path):
+    """Spec 'Consequence' (2026-08-25-url-normalization-index-design): a
+    discovery source that re-lists a KNOWN document under a slash-variant URL
+    is skipped before download by `_skip_known_url` -- no re-fetch, no
+    duplicate row, no alt_urls data amendment needed. Mirrors the test above,
+    but reversed: the manifest row is indexed under the CLEAN url and it's the
+    discovery source that carries the double-slash variant this time. Passes
+    already via Task 2's index-time normalize_url() -- pins the end-to-end
+    behavior regardless."""
+    clean_url = ("https://www.ecb.europa.eu/press/blog/date/2023/html/"
+                 "ecb.blog230824~362178a805.en.html")
+    row = {
+        "bank_code": "ecb", "doc_type": "D3", "title": "ECB D3 2023-08-24",
+        "pdf_url": clean_url, "source_url": "", "date": "2023-08-24",
+        "language": "en", "provenance": "bank_site", "mime_type": "text/html",
+        "sha256": "f8ee5df6f1402ceee7af11b4e8e9706638c8b213bfe844b1e265c6b4160e7b86",
+        "local_path": "data/raw/ecb/D3/2023/f0d212497f8b1289.html",
+        "doc_id": "f0d212497f8b1289", "year": 2023,
+    }
+    cfg = Config(data_dir=tmp_path)
+    cfg.manifest_dir.mkdir(parents=True, exist_ok=True)
+    cfg.manifest_file("ecb").write_text(json.dumps(row, ensure_ascii=False) + "\n")
+
+    # The live listing re-lists this same post under a double-slash variant of
+    # its URL (a discovery-source hiccup), alongside one genuinely new post.
+    variant_url = ("https://www.ecb.europa.eu/press//blog/date/2023/html/"
+                   "ecb.blog230824~362178a805.en.html")
+    blog_html = """<html><body><div class="box">
+      <a class="content-box" href="/press//blog/date/2023/html/ecb.blog230824~362178a805.en.html">
+        <h5>24 August 2023</h5><h3>Already-known post (slash variant)</h3>
+      </a>
+    </div><div class="box">
+      <a class="content-box" href="/press/blog/date/2026/html/ecb.blog20260301~abc123def0.en.html">
+        <h5>1 March 2026</h5><h3>Genuinely new post</h3>
+      </a>
+    </div></body></html>"""
+
+    class SpyFetcher:
+        """Records every URL asked for; get_bytes fails loudly on the known
+        post so a regression (re-fetching it) fails the test instead of
+        silently succeeding."""
+        def __init__(self):
+            self.get_bytes_calls: list[str] = []
+
+        def get_text(self, url):
+            assert url == BLOG_INDEX
+            return blog_html
+
+        def get_bytes(self, url):
+            self.get_bytes_calls.append(url)
+            if url in (clean_url, variant_url):
+                raise AssertionError(f"fetched already-known D3 URL: {url}")
+            return (b"<html>new post</html>", "text/html")
+
+    fetcher = SpyFetcher()
+    storage = Storage(cfg, fetcher)
+    adapter = ECBAdapter(get_bank("ecb"), fetcher)
+    adapter._skip_known_url = storage.is_known_url   # what pipeline.run() sets
+
+    recs = list(adapter.discover(DocType.D3))
+    yielded_urls = [r.pdf_url for r in recs]
+    assert variant_url not in yielded_urls   # filtered by discover(), not by save()
+    assert any("20260301" in u for u in yielded_urls)   # the new post still comes through
+
+    counts = storage.save_many(recs)
+    assert variant_url not in fetcher.get_bytes_calls   # never asked for
+    assert counts.get("saved", 0) == 1                  # only the new post was saved
+
+
 # ---- ECB C2 interviews (interim wiring: primary include + per-year Wayback fallback) ----
 _ECB_INTER_2024_FIXTURE = (
     Path(__file__).parent / "fixtures" / "ecb_inter_2024_include.html").read_text()
@@ -1653,3 +1722,63 @@ def test_cli_dispatches_subcommands(monkeypatch, capsys):
     assert cli.main(["discover", "--banks", "us"]) == 0
     assert cli.main(["repec", "--download"]) == 0
     assert cli.main(["bis-sitemap"]) == 0
+
+
+# ---- URL normalization (index-only; see 2026-08-25 spec) -------------
+def test_normalize_url_collapses_path_slashes_only():
+    from cb_corpus.storage import normalize_url
+    assert normalize_url("https://a.eu//press//x.pdf") == "https://a.eu/press/x.pdf"
+    assert normalize_url("https://a.eu/press/x.pdf") == "https://a.eu/press/x.pdf"
+    assert normalize_url("http://a.eu///b////c") == "http://a.eu/b/c"
+    # scheme separator untouched, idempotent, total on odd inputs
+    assert normalize_url("no-scheme//path") == "no-scheme/path"
+    assert normalize_url("") == ""
+    assert normalize_url(normalize_url("https://a.eu//x")) == "https://a.eu/x"
+
+
+def test_normalize_url_does_not_equalize_out_of_scope_variants():
+    from cb_corpus.storage import normalize_url
+    assert normalize_url("http://a.eu/x.pdf") != normalize_url("https://a.eu/x.pdf")
+    assert normalize_url("https://a.eu/x/") != normalize_url("https://a.eu/x")
+    assert normalize_url("https://www.a.eu/x") != normalize_url("https://a.eu/x")
+
+
+def test_is_known_url_matches_slash_variants_both_directions(tmp_path):
+    """A row indexed under a double-slash URL is known under the clean form,
+    and vice versa: a clean-indexed row matches a double-slash query. Locks
+    Task 2's write+read normalization from both directions."""
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (f"%PDF-1.4 {url}".encode(), "application/pdf")
+
+    rec_a = DocRecord(bank_code="e", doc_type=DocType.D1, title="A",
+                      pdf_url="https://e.eu//press//a.pdf", date=date(2024, 1, 1))
+    assert st.save(rec_a) == "saved"
+    assert st.is_known_url("https://e.eu/press/a.pdf")
+
+    rec_b = DocRecord(bank_code="e", doc_type=DocType.D1, title="B",
+                      pdf_url="https://e.eu/press/b.pdf", date=date(2024, 1, 1))
+    assert st.save(rec_b) == "saved"
+    assert st.is_known_url("https://e.eu//press/b.pdf")
+
+
+def test_known_url_variants_cover_alt_urls_reload_and_source_urls(tmp_path):
+    """A double-slash alt_urls entry matches the clean form after a fresh
+    Storage() over the same data dir (exercises _load_existing), and
+    is_known_source_url normalizes the same way as is_known_url."""
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (b"%PDF-1.4 body", "application/pdf")
+
+    rec = DocRecord(bank_code="e", doc_type=DocType.D1, title="A",
+                    pdf_url="https://e.eu/press/preferred.pdf",
+                    alt_urls=["https://e.eu//press//alt.pdf"],
+                    source_url="https://e.eu//press//index.html",
+                    date=date(2024, 1, 1))
+    assert st.save(rec) == "saved"
+
+    # Fresh Storage over the same data dir -> _load_existing re-populates
+    # the indexes from the persisted manifest row.
+    st2 = Storage(cfg)
+    assert st2.is_known_url("https://e.eu/press/alt.pdf")           # alt_urls, normalized on reload
+    assert st2.is_known_source_url("https://e.eu/press/index.html")  # source_url, normalized
