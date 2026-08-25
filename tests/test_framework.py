@@ -1672,3 +1672,44 @@ def test_normalize_url_does_not_equalize_out_of_scope_variants():
     assert normalize_url("http://a.eu/x.pdf") != normalize_url("https://a.eu/x.pdf")
     assert normalize_url("https://a.eu/x/") != normalize_url("https://a.eu/x")
     assert normalize_url("https://www.a.eu/x") != normalize_url("https://a.eu/x")
+
+
+def test_is_known_url_matches_slash_variants_both_directions(tmp_path):
+    """A row indexed under a double-slash URL is known under the clean form,
+    and vice versa: a clean-indexed row matches a double-slash query. Locks
+    Task 2's write+read normalization from both directions."""
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (f"%PDF-1.4 {url}".encode(), "application/pdf")
+
+    rec_a = DocRecord(bank_code="e", doc_type=DocType.D1, title="A",
+                      pdf_url="https://e.eu//press//a.pdf", date=date(2024, 1, 1))
+    assert st.save(rec_a) == "saved"
+    assert st.is_known_url("https://e.eu/press/a.pdf")
+
+    rec_b = DocRecord(bank_code="e", doc_type=DocType.D1, title="B",
+                      pdf_url="https://e.eu/press/b.pdf", date=date(2024, 1, 1))
+    assert st.save(rec_b) == "saved"
+    assert st.is_known_url("https://e.eu//press/b.pdf")
+
+
+def test_known_url_variants_cover_alt_urls_reload_and_source_urls(tmp_path):
+    """A double-slash alt_urls entry matches the clean form after a fresh
+    Storage() over the same data dir (exercises _load_existing), and
+    is_known_source_url normalizes the same way as is_known_url."""
+    cfg = Config(data_dir=tmp_path)
+    st = Storage(cfg)
+    st.fetcher.get_bytes = lambda url: (b"%PDF-1.4 body", "application/pdf")
+
+    rec = DocRecord(bank_code="e", doc_type=DocType.D1, title="A",
+                    pdf_url="https://e.eu/press/preferred.pdf",
+                    alt_urls=["https://e.eu//press//alt.pdf"],
+                    source_url="https://e.eu//press//index.html",
+                    date=date(2024, 1, 1))
+    assert st.save(rec) == "saved"
+
+    # Fresh Storage over the same data dir -> _load_existing re-populates
+    # the indexes from the persisted manifest row.
+    st2 = Storage(cfg)
+    assert st2.is_known_url("https://e.eu/press/alt.pdf")           # alt_urls, normalized on reload
+    assert st2.is_known_source_url("https://e.eu/press/index.html")  # source_url, normalized

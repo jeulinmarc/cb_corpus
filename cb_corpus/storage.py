@@ -311,7 +311,7 @@ class Storage:
                 self._hash_docid[rec["sha256"]] = rec["doc_id"]
             url = rec.get("pdf_url")
             if url:
-                self._urls.add(url)
+                self._urls.add(normalize_url(url))
             # Persisted alt_urls (WP v3): the same paper may have been registered
             # under an alternate URL (a native scraper URL stamped onto a row first
             # ingested via RePEc, or an EconStor/SSRN fallback). Index them so
@@ -319,14 +319,16 @@ class Storage:
             # scraper from re-downloading a paper it finds under a different URL.
             for alt in rec.get("alt_urls") or []:
                 if alt:
-                    self._urls.add(alt)
+                    self._urls.add(normalize_url(alt))
             src = rec.get("source_url")
             if src:
-                self._source_urls.add(src)
+                self._source_urls.add(normalize_url(src))
 
     def is_known_url(self, url: str) -> bool:
-        """True if a record with this pdf_url is already in the manifest."""
-        return url in self._urls
+        """True if a record with this pdf_url is already in the manifest
+        (index-side normalized, see normalize_url — duplicate-slash variants
+        of a known URL count as known too)."""
+        return normalize_url(url) in self._urls
 
     def is_known_source_url(self, url: str) -> bool:
         """True if a record with this source_url is already in the manifest.
@@ -334,8 +336,9 @@ class Storage:
         Own index, deliberately separate from is_known_url(): source pages
         (e.g. IDEAS paper pages) identify a listing entry BEFORE its PDF is
         known — used by incremental catalog walks to skip the per-item fetch.
+        Index-side normalized like is_known_url().
         """
-        return url in self._source_urls
+        return normalize_url(url) in self._source_urls
 
     def iter_manifest(self, bank_code: Optional[str] = None) -> Iterator[dict]:
         """All manifest rows across per-bank files, or just one bank's."""
@@ -452,9 +455,9 @@ class Storage:
             # then never be downloaded. (This is exactly how a 155-row
             # placeholder pollution happened once.)
             self._ids.add(rec.doc_id)
-            self._urls.add(rec.pdf_url)
+            self._urls.add(normalize_url(rec.pdf_url))
             if rec.source_url:
-                self._source_urls.add(rec.source_url)
+                self._source_urls.add(normalize_url(rec.source_url))
             return "dry-run:indexed"
 
         # Try the preferred URL, then any fallback copies (EconStor/SSRN/cached)
@@ -519,9 +522,9 @@ class Storage:
         rec.local_path = str(path)
         self._ids.add(rec.doc_id)
         self._hash_docid[digest] = rec.doc_id
-        self._urls.add(rec.pdf_url)
+        self._urls.add(normalize_url(rec.pdf_url))
         if rec.source_url:
-            self._source_urls.add(rec.source_url)
+            self._source_urls.add(normalize_url(rec.source_url))
         self._append(rec)
         self.quarantine.record_success(rec.pdf_url)
         return "saved"
@@ -558,9 +561,9 @@ class Storage:
         rec.local_path = str(path)
         self._ids.add(rec.doc_id)
         self._hash_docid[digest] = rec.doc_id
-        self._urls.add(rec.pdf_url)
+        self._urls.add(normalize_url(rec.pdf_url))
         if rec.source_url:
-            self._source_urls.add(rec.source_url)
+            self._source_urls.add(normalize_url(rec.source_url))
         self._append(rec)
         # An externally-recovered doc registered here (no fetch at all) must
         # release its quarantine too — otherwise the nightly sync would keep
