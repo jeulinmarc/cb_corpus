@@ -28,8 +28,9 @@ so it is never relabelled ``recoverable`` (which would just re-download the
 same duplicate PDF every run). A ``duplicate`` verdict also SELF-HEALS: the
 dead URL (and, in ``--candidates`` mode, the candidate's own verified
 ``final_url``) is stamped onto the matched row's ``alt_urls`` and its
-quarantine is released (one ``Storage.stamp_alt_urls`` call, applied once at
-the end of the pass -- never during a dry-run), so the same dead URL is
+quarantine is released (one ``Storage.stamp_alt_urls`` call in a ``finally``
+-- applied even if the pass dies mid-loop, never during a dry-run), so the
+same dead URL is
 recognised as already known on every future pass instead of being
 rediscovered as ``duplicate`` forever. The matched row's doc_id is recorded
 per-entry in the CSV's ``canonical_doc_id`` column (empty for every other
@@ -48,7 +49,12 @@ follows the provenance rules per ``recovered_from`` (decision 2). Because the
 bytes already exist locally, this mode registers them via
 ``Storage.reindex`` (copy to ``Storage.target_path`` + index, sha256 dedup)
 instead of ``Storage.save`` (no network fetch) -- same storage discipline,
-never bypassed.
+never bypassed. Like the CDX-walk pass, ``--candidates`` also short-circuits
+on ``_is_converged`` before any file validation or download: re-running the same
+candidates file after a prior pass already self-healed it (stamped the dead
+URL onto the canonical row) reports ``converged``, not ``duplicate`` -- "the
+corpus already has it" is a different truth than "nothing left to recover",
+and both modes now share the same vocabulary for it.
 """
 from __future__ import annotations
 
@@ -279,17 +285,28 @@ def _duplicate_doc_id(status: str) -> Optional[str]:
     return None
 
 
-def _apply_stamps(storage: Storage, stamps: dict[str, set[str]]) -> None:
+def _add_stamp(stamps: dict[str, list[str]], doc_id: str, *urls: str) -> None:
+    """Ordered, deduped stamp collection: dead URL first (provenance
+    history), then any live alternative. Order is part of the contract --
+    a set here made alt_urls append order vary across runs (hash
+    randomization), churning autocommitted manifest diffs for nothing."""
+    bucket = stamps.setdefault(doc_id, [])
+    for url in urls:
+        if url and url not in bucket:
+            bucket.append(url)
+
+
+def _apply_stamps(storage: Storage, stamps: dict[str, list[str]]) -> None:
     """Apply the alt_url stamps collected during a pass (see
     `run_recover_downloads`/`_run_candidates_pass`) in ONE
-    `Storage.stamp_alt_urls` call, and print the one-line audit summary.
-    A no-op (no print, no rewrite) when nothing was collected -- callers
-    only build `stamps` at all when `download` is True, so this never runs
-    during a dry-run."""
+    `Storage.stamp_alt_urls` call, and print the honest (urls, rows)
+    accounting. A no-op (no print, no rewrite) when nothing was collected --
+    callers only build `stamps` at all when `download` is True, so this
+    never runs during a dry-run."""
     if not stamps:
         return
-    n = storage.stamp_alt_urls(stamps)
-    print(f"[recover] stamped {n} alt_url(s) on {len(stamps)} row(s)",
+    urls_stamped, rows_modified = storage.stamp_alt_urls(stamps)
+    print(f"[recover] stamped {urls_stamped} alt_url(s) on {rows_modified} row(s)",
           file=sys.stderr, flush=True)
 
 
@@ -311,214 +328,233 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
 
     results: dict[str, dict] = {}
     csv_rows: list[dict] = []
-    # doc_id -> URLs to stamp onto its alt_urls, applied ONCE at the end
-    # (never during dry-run -- only ever populated inside `if download:`
+    # doc_id -> ordered URLs to stamp onto its alt_urls, applied ONCE at the
+    # end (never during dry-run -- only ever populated inside `if download:`
     # branches below).
-    stamps: dict[str, set[str]] = {}
+    stamps: dict[str, list[str]] = {}
 
     def _bump(bank: str, action: str) -> dict:
         summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
         summary[action] = summary.get(action, 0) + 1
         return summary
 
-    for cand in _read_candidates(candidates_path):
-        dead_url = cand.get("dead_pdf_url") or ""
-        entry = by_url.get(dead_url)
+    try:
+        for cand in _read_candidates(candidates_path):
+            dead_url = cand.get("dead_pdf_url") or ""
+            entry = by_url.get(dead_url)
 
-        if entry is None:
-            _bump("_unknown", "unknown-entry")
-            csv_rows.append({"bank": "_unknown", "pdf_url": dead_url,
-                             "action": "unknown-entry", "snapshot_ts": "",
-                             "title": cand.get("title") or ""})
-            continue
+            if entry is None:
+                _bump("_unknown", "unknown-entry")
+                csv_rows.append({"bank": "_unknown", "pdf_url": dead_url,
+                                 "action": "unknown-entry", "snapshot_ts": "",
+                                 "title": cand.get("title") or ""})
+                continue
 
-        bank = entry.get("bank_code") or "_unknown"
-        fallback_title = entry.get("title") or cand.get("title") or ""
+            bank = entry.get("bank_code") or "_unknown"
+            fallback_title = entry.get("title") or cand.get("title") or ""
 
-        if codes is not None and bank not in codes:
-            _bump(bank, "filtered")
-            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "filtered",
-                             "snapshot_ts": "", "title": fallback_title})
-            continue
+            if codes is not None and bank not in codes:
+                _bump(bank, "filtered")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "filtered",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
 
-        file_path = Path(cand.get("file_path") or "")
-        if not _verify_local_pdf(file_path):
-            _bump(bank, "bad-file")
-            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-file",
-                             "snapshot_ts": "", "title": fallback_title})
-            continue
+            if _is_converged(storage, entry):
+                # The index already knows every URL of this entry (typically
+                # via a stamp from a previous pass): "the corpus already has
+                # it" is a different truth than "nothing left to recover"
+                # (duplicate), and the CDX pass already reports it as such --
+                # keep the two modes' vocabulary consistent (PR #13 final
+                # review, prior Minor 1). No stamping, no quarantine call.
+                _bump(bank, "converged")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "converged",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
 
-        doc_type = None
-        try:
-            doc_type = by_code(entry.get("doc_type") or "")
-        except KeyError:
-            pass
-        if doc_type is None:
-            _bump(bank, "bad-doc-type")
-            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-doc-type",
-                             "snapshot_ts": "", "title": fallback_title})
-            continue
+            file_path = Path(cand.get("file_path") or "")
+            if not _verify_local_pdf(file_path):
+                _bump(bank, "bad-file")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-file",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
 
-        final_url = cand.get("final_url") or ""
-        if not final_url:
-            # An empty/missing final_url would otherwise create a degenerate
-            # pdf_url (e.g. bank_site's pdf_url = final_url = "") shared by
-            # every such candidate -- reject it honestly, before it ever
-            # reaches provenance mapping, rather than let it become an alias
-            # for a doc_id that isn't really this document's identity.
-            _bump(bank, "bad-candidate")
-            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
-                             "snapshot_ts": "", "title": fallback_title})
-            continue
-        if final_url == dead_url:
-            # final_url resolving back to the exact dead URL carries no
-            # honest byte-origin trail -- this is exactly the failure mode
-            # that once produced a "wayback" manifest row whose alt_urls[0]
-            # silently equalled its own dead pdf_url (final-review finding
-            # 1: no real snapshot behind it at all). Reject before
-            # provenance mapping ever sees it, for every recovered_from.
-            _bump(bank, "bad-candidate")
-            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
-                             "snapshot_ts": "", "title": fallback_title})
-            continue
-        recovered_from = cand.get("recovered_from") or ""
-        if recovered_from == "wayback" and urlparse(final_url).hostname != "web.archive.org":
-            # A candidate claiming a wayback recovery whose final_url isn't
-            # actually hosted on web.archive.org is not honestly a snapshot
-            # -- same finding, the other half of it (a plausible-looking but
-            # non-archive.org URL rather than the dead URL itself).
-            _bump(bank, "bad-candidate")
-            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
-                             "snapshot_ts": "", "title": fallback_title})
-            continue
-        provenance_result = _candidate_provenance(dead_url, final_url, recovered_from)
-        if provenance_result is None:
-            _bump(bank, "bad-provenance")
-            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-provenance",
-                             "snapshot_ts": "", "title": fallback_title})
-            continue
-        pdf_url, provenance, alt_urls = provenance_result
-
-        # Refresh title/date from the IDEAS source page exactly as the
-        # inventory-driven path does; a candidate-supplied title (if any) is
-        # a better fallback than the (possibly stale) audit-entry title when
-        # the IDEAS refresh itself fails.
-        entry_for_refresh = dict(entry)
-        if cand.get("title"):
-            entry_for_refresh["title"] = cand["title"]
-        title, rec_date, date_precision, date_source, _cands = _refresh_metadata(
-            fetcher, entry_for_refresh)
-
-        if provenance == "wayback" and not date_source:
-            # No repec date recovered -- honestly attribute whatever date
-            # metadata we do have (possibly none) to the wayback hunt itself,
-            # never leaving the DocRecord default ("bank_site") standing in
-            # for a document that was NOT found on the bank's own site.
-            date_source = "wayback"
-
-        rec = DocRecord(
-            bank_code=bank, doc_type=doc_type, title=title,
-            pdf_url=pdf_url, alt_urls=alt_urls,
-            source_url=entry.get("source_url") or "",
-            date=rec_date, provenance=provenance,
-            mime_type="application/pdf",
-        )
-        if date_precision:
-            rec.date_precision = date_precision
-        if date_source:
-            rec.date_source = date_source
-
-        _bump(bank, "recoverable")
-        action = "recoverable"
-        canonical_doc_id = ""
-
-        # dest == storage.target_path(rec) is DERIVED FROM doc_id, so for an
-        # already-indexed doc_id it is the SAME PATH as that doc's real
-        # local_path. Probe with a dry-run BEFORE copying anything -- in
-        # BOTH modes (MINOR 7: mode parity), not just --download: if this
-        # doc_id is already indexed there is nothing left to recover, dry-run
-        # or not, so "recoverable" would be a lie either way. In --download
-        # mode it's also a safety guard -- copying then unlinking on
-        # "skip:already-indexed" would DELETE the real canonical file,
-        # leaving a dangling manifest row (the exact bug this guards).
-        probe = storage.reindex(rec, file_path, dry_run=True)
-        if probe == "skip:already-indexed":
-            _bump(bank, "duplicate")
-            action = "duplicate"
-            canonical_doc_id = rec.doc_id
-            # Self-healing, but ONLY on a real run: the dry-run contract
-            # (mode parity above) must never stamp/release quarantine/write
-            # the manifest. For wayback/mirror provenance rec.pdf_url IS the
-            # dead URL already (this row's own identity), so the stamp is a
-            # no-op for alt_urls there -- but for bank_site rec.pdf_url is
-            # the NEW final_url, so dead_url is genuinely different and DOES
-            # land in alt_urls (the flagship self-heal case this PR exists
-            # for). Either way the quarantine release still matters.
-            if download:
-                stamps.setdefault(rec.doc_id, set()).add(dead_url)
-                storage.quarantine.record_success(dead_url)
-        elif download:
-            dest = storage.target_path(rec)
-            status = "error"
+            doc_type = None
             try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(file_path, dest)
-                status = storage.reindex(rec, dest)
-            except Exception as exc:  # noqa: BLE001 - audited below, never aborts the pass
-                try:
-                    storage._record_download_error(rec, exc, "recover-downloads-candidates")
-                except Exception:
-                    pass
-            if status == "reindexed":
-                _bump(bank, "recovered")
-                action = "recovered"
-                # MINOR 5: tombstone the OLD dead URL's quarantine too.
-                # reindex() above already released quarantine on rec.pdf_url
-                # -- for wayback/mirror that IS dead_url (this call is then a
-                # harmless no-op), but for bank_site rec.pdf_url is the NEW
-                # final_url, so without this the OLD dead_url would stay
-                # quarantined forever even though the corpus now has the doc
-                # under its new address.
-                storage.quarantine.record_success(dead_url)
-            elif status.startswith("skip:duplicate-content"):
-                # Bytes hash-matched a DIFFERENT doc_id's content -- dest is
-                # this (not-yet-indexed) doc_id's own path, so the copy just
-                # made is safe orphan bytes, never the other doc's canonical
-                # file. Remove it. `startswith` (not `==`) because the status
-                # now carries the matched doc_id as a `:<id>` suffix (e.g.
-                # "skip:duplicate-content:<doc_id>"); the bare legacy string
-                # with no suffix is tolerated too.
-                try:
-                    dest.unlink()
-                except OSError:
-                    pass
+                doc_type = by_code(entry.get("doc_type") or "")
+            except KeyError:
+                pass
+            if doc_type is None:
+                _bump(bank, "bad-doc-type")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-doc-type",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
+
+            final_url = cand.get("final_url") or ""
+            if not final_url:
+                # An empty/missing final_url would otherwise create a degenerate
+                # pdf_url (e.g. bank_site's pdf_url = final_url = "") shared by
+                # every such candidate -- reject it honestly, before it ever
+                # reaches provenance mapping, rather than let it become an alias
+                # for a doc_id that isn't really this document's identity.
+                _bump(bank, "bad-candidate")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
+            if final_url == dead_url:
+                # final_url resolving back to the exact dead URL carries no
+                # honest byte-origin trail -- this is exactly the failure mode
+                # that once produced a "wayback" manifest row whose alt_urls[0]
+                # silently equalled its own dead pdf_url (final-review finding
+                # 1: no real snapshot behind it at all). Reject before
+                # provenance mapping ever sees it, for every recovered_from.
+                _bump(bank, "bad-candidate")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
+            recovered_from = cand.get("recovered_from") or ""
+            if recovered_from == "wayback" and urlparse(final_url).hostname != "web.archive.org":
+                # A candidate claiming a wayback recovery whose final_url isn't
+                # actually hosted on web.archive.org is not honestly a snapshot
+                # -- same finding, the other half of it (a plausible-looking but
+                # non-archive.org URL rather than the dead URL itself).
+                _bump(bank, "bad-candidate")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-candidate",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
+            provenance_result = _candidate_provenance(dead_url, final_url, recovered_from)
+            if provenance_result is None:
+                _bump(bank, "bad-provenance")
+                csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": "bad-provenance",
+                                 "snapshot_ts": "", "title": fallback_title})
+                continue
+            pdf_url, provenance, alt_urls = provenance_result
+
+            # Refresh title/date from the IDEAS source page exactly as the
+            # inventory-driven path does; a candidate-supplied title (if any) is
+            # a better fallback than the (possibly stale) audit-entry title when
+            # the IDEAS refresh itself fails.
+            entry_for_refresh = dict(entry)
+            if cand.get("title"):
+                entry_for_refresh["title"] = cand["title"]
+            title, rec_date, date_precision, date_source, _cands = _refresh_metadata(
+                fetcher, entry_for_refresh)
+
+            if provenance == "wayback" and not date_source:
+                # No repec date recovered -- honestly attribute whatever date
+                # metadata we do have (possibly none) to the wayback hunt itself,
+                # never leaving the DocRecord default ("bank_site") standing in
+                # for a document that was NOT found on the bank's own site.
+                date_source = "wayback"
+
+            rec = DocRecord(
+                bank_code=bank, doc_type=doc_type, title=title,
+                pdf_url=pdf_url, alt_urls=alt_urls,
+                source_url=entry.get("source_url") or "",
+                date=rec_date, provenance=provenance,
+                mime_type="application/pdf",
+            )
+            if date_precision:
+                rec.date_precision = date_precision
+            if date_source:
+                rec.date_source = date_source
+
+            _bump(bank, "recoverable")
+            action = "recoverable"
+            canonical_doc_id = ""
+
+            # dest == storage.target_path(rec) is DERIVED FROM doc_id, so for an
+            # already-indexed doc_id it is the SAME PATH as that doc's real
+            # local_path. Probe with a dry-run BEFORE copying anything -- in
+            # BOTH modes (MINOR 7: mode parity), not just --download: if this
+            # doc_id is already indexed there is nothing left to recover, dry-run
+            # or not, so "recoverable" would be a lie either way. In --download
+            # mode it's also a safety guard -- copying then unlinking on
+            # "skip:already-indexed" would DELETE the real canonical file,
+            # leaving a dangling manifest row (the exact bug this guards).
+            probe = storage.reindex(rec, file_path, dry_run=True)
+            if probe == "skip:already-indexed":
                 _bump(bank, "duplicate")
                 action = "duplicate"
-                matched_id = _duplicate_doc_id(status)
-                if matched_id:
-                    # Both the dead URL AND this candidate's own final_url
-                    # (its verified snapshot/mirror/live copy) are stamped
-                    # onto the matched row -- final_url was never dead, so
-                    # only dead_url's quarantine is released.
-                    canonical_doc_id = matched_id
-                    stamps.setdefault(matched_id, set()).update({dead_url, final_url})
+                canonical_doc_id = rec.doc_id
+                # Self-healing, but ONLY on a real run: the dry-run contract
+                # (mode parity above) must never stamp/release quarantine/write
+                # the manifest. For wayback/mirror provenance rec.pdf_url IS the
+                # dead URL already (this row's own identity), so the stamp is a
+                # no-op for alt_urls there -- but for bank_site rec.pdf_url is
+                # the NEW final_url, so dead_url is genuinely different and DOES
+                # land in alt_urls (the flagship self-heal case this PR exists
+                # for). Either way the quarantine release still matters.
+                if download:
+                    _add_stamp(stamps, rec.doc_id, dead_url)
                     storage.quarantine.record_success(dead_url)
-            elif status.startswith("skip:"):
-                # Any other non-"reindexed" status (e.g. skip:missing-file,
-                # or skip:already-indexed from a same-run race with an
-                # earlier candidate line for the same doc_id): leave the
-                # file alone -- never guess it's safe to delete -- and
-                # report the status verbatim.
-                summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
-                summary[status] = summary.get(status, 0) + 1
-                action = status
-            # status == "error": action stays "recoverable" (audited above).
+            elif download:
+                dest = storage.target_path(rec)
+                status = "error"
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file_path, dest)
+                    status = storage.reindex(rec, dest)
+                except Exception as exc:  # noqa: BLE001 - audited below, never aborts the pass
+                    try:
+                        storage._record_download_error(rec, exc, "recover-downloads-candidates")
+                    except Exception:
+                        pass
+                if status == "reindexed":
+                    _bump(bank, "recovered")
+                    action = "recovered"
+                    # MINOR 5: tombstone the OLD dead URL's quarantine too.
+                    # reindex() above already released quarantine on rec.pdf_url
+                    # -- for wayback/mirror that IS dead_url (this call is then a
+                    # harmless no-op), but for bank_site rec.pdf_url is the NEW
+                    # final_url, so without this the OLD dead_url would stay
+                    # quarantined forever even though the corpus now has the doc
+                    # under its new address.
+                    storage.quarantine.record_success(dead_url)
+                elif status.startswith("skip:duplicate-content"):
+                    # Bytes hash-matched a DIFFERENT doc_id's content -- dest is
+                    # this (not-yet-indexed) doc_id's own path, so the copy just
+                    # made is safe orphan bytes, never the other doc's canonical
+                    # file. Remove it. `startswith` (not `==`) because the status
+                    # now carries the matched doc_id as a `:<id>` suffix (e.g.
+                    # "skip:duplicate-content:<doc_id>"); the bare legacy string
+                    # with no suffix is tolerated too.
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
+                    _bump(bank, "duplicate")
+                    action = "duplicate"
+                    matched_id = _duplicate_doc_id(status)
+                    if matched_id:
+                        # Both the dead URL AND this candidate's own final_url
+                        # (its verified snapshot/mirror/live copy) are stamped
+                        # onto the matched row -- final_url was never dead, so
+                        # only dead_url's quarantine is released.
+                        canonical_doc_id = matched_id
+                        _add_stamp(stamps, matched_id, dead_url, final_url)
+                        storage.quarantine.record_success(dead_url)
+                elif status.startswith("skip:"):
+                    # Any other non-"reindexed" status (e.g. skip:missing-file,
+                    # or skip:already-indexed from a same-run race with an
+                    # earlier candidate line for the same doc_id): leave the
+                    # file alone -- never guess it's safe to delete -- and
+                    # report the status verbatim.
+                    summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
+                    summary[status] = summary.get(status, 0) + 1
+                    action = status
+                # status == "error": action stays "recoverable" (audited above).
 
-        csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": action,
-                         "snapshot_ts": "", "title": title,
-                         "canonical_doc_id": canonical_doc_id})
+            csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": action,
+                             "snapshot_ts": "", "title": title,
+                             "canonical_doc_id": canonical_doc_id})
 
-    _apply_stamps(storage, stamps)
+    finally:
+        # Quarantine releases are durable per-entry inside the loop, while
+        # stamps applied only after it -- a mid-pass crash (SIGKILL aside)
+        # would leave released-but-unstamped dead URLs that the nightly
+        # sync resumes hammering. finally shrinks that window to the
+        # entry being processed (PR #13 final review, Minor 1).
+        _apply_stamps(storage, stamps)
     return results, csv_rows
 
 
@@ -545,7 +581,11 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     cannot silently block them. Every ``duplicate`` verdict self-heals (see
     the module docstring): its dead URL is stamped onto the matched row's
     ``alt_urls`` and its quarantine released, in ONE ``Storage.stamp_alt_urls``
-    call applied at the end of the pass -- never during a dry-run. A CSV
+    call collected across the pass and applied from a ``finally`` block --
+    at the end of the pass on the normal path, but also on a mid-pass crash
+    (PR #13 final review, Minor 1), so a crash never loses stamps already
+    collected for entries processed before it hit -- never during a
+    dry-run. A CSV
     report (``{bank, pdf_url, action, snapshot_ts, title, canonical_doc_id}``)
     is written in both modes so a dry-run's classification is never lost, and
     a CSV line never claims an action that didn't happen (a failed
@@ -586,118 +626,126 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     entries = _read_inventory(cfg, bank_codes)
     results: dict[str, dict] = {}
     csv_rows: list[dict] = []
-    # doc_id -> URLs to stamp onto its alt_urls, applied ONCE at the end
-    # (never during dry-run -- this whole CDX-walk pass only ever attempts a
-    # save, and so can only classify a duplicate, inside `if download:`).
-    stamps: dict[str, set[str]] = {}
+    # doc_id -> ordered URLs to stamp onto its alt_urls, applied ONCE at the
+    # end (never during dry-run -- this whole CDX-walk pass only ever
+    # attempts a save, and so can only classify a duplicate, inside
+    # `if download:`).
+    stamps: dict[str, list[str]] = {}
 
-    for entry in entries:
-        bank = entry.get("bank_code") or "_unknown"
-        summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
-        pdf_url = entry.get("pdf_url") or ""
+    try:
+        for entry in entries:
+            bank = entry.get("bank_code") or "_unknown"
+            summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
+            pdf_url = entry.get("pdf_url") or ""
 
-        if _is_converged(storage, entry):
-            summary["converged"] += 1
-            csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": "converged",
-                             "snapshot_ts": "", "title": entry.get("title") or ""})
-            continue
+            if _is_converged(storage, entry):
+                summary["converged"] += 1
+                csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": "converged",
+                                 "snapshot_ts": "", "title": entry.get("title") or ""})
+                continue
 
-        title, rec_date, date_precision, date_source, cands = _refresh_metadata(fetcher, entry)
-        alt_candidates = list(dict.fromkeys([*cands, *(entry.get("alt_urls") or [])]))
-        ts, snapshot_of = _find_snapshot(fetcher, pdf_url, alt_candidates)
+            title, rec_date, date_precision, date_source, cands = _refresh_metadata(fetcher, entry)
+            alt_candidates = list(dict.fromkeys([*cands, *(entry.get("alt_urls") or [])]))
+            ts, snapshot_of = _find_snapshot(fetcher, pdf_url, alt_candidates)
 
-        if ts is None:
-            summary["unrecoverable"] += 1
-            csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": "unrecoverable",
-                             "snapshot_ts": "", "title": title})
-            continue
+            if ts is None:
+                summary["unrecoverable"] += 1
+                csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": "unrecoverable",
+                                 "snapshot_ts": "", "title": title})
+                continue
 
-        summary["recoverable"] += 1
-        action = "recoverable"
-        canonical_doc_id = ""
+            summary["recoverable"] += 1
+            action = "recoverable"
+            canonical_doc_id = ""
 
-        if download:
-            doc_type = None
-            try:
-                doc_type = by_code(entry.get("doc_type") or "")
-            except KeyError:
-                pass
-            if doc_type is not None:
-                snapshot_url = raw_url(snapshot_of, ts)
-                rec_alts = list(dict.fromkeys(
-                    [snapshot_url, *(u for u in alt_candidates if u != pdf_url)]))
-                rec = DocRecord(
-                    bank_code=bank, doc_type=doc_type, title=title,
-                    pdf_url=pdf_url, alt_urls=rec_alts,
-                    source_url=entry.get("source_url") or "",
-                    date=rec_date, provenance="wayback",
-                    mime_type="application/pdf",
-                )
-                if date_precision:
-                    rec.date_precision = date_precision
-                if date_source:
-                    rec.date_source = date_source
+            if download:
+                doc_type = None
                 try:
-                    # bypass_quarantine=True: this whole inventory comes FROM
-                    # download_errors.jsonl, the same file that feeds the
-                    # quarantine counter, so by the time recovery runs its own
-                    # targets are typically already quarantined -- without the
-                    # bypass, save() would short-circuit to "skip:quarantined"
-                    # before ever trying the Wayback snapshot alt_url, and that
-                    # skip would silently fall into the "duplicate" bucket below
-                    # (a lie: nothing was actually deduplicated).
-                    status = storage.save(rec, bypass_quarantine=True)
-                except Exception as exc:  # noqa: BLE001 - audited below, never aborts the pass
-                    status = "error"
+                    doc_type = by_code(entry.get("doc_type") or "")
+                except KeyError:
+                    pass
+                if doc_type is not None:
+                    snapshot_url = raw_url(snapshot_of, ts)
+                    rec_alts = list(dict.fromkeys(
+                        [snapshot_url, *(u for u in alt_candidates if u != pdf_url)]))
+                    rec = DocRecord(
+                        bank_code=bank, doc_type=doc_type, title=title,
+                        pdf_url=pdf_url, alt_urls=rec_alts,
+                        source_url=entry.get("source_url") or "",
+                        date=rec_date, provenance="wayback",
+                        mime_type="application/pdf",
+                    )
+                    if date_precision:
+                        rec.date_precision = date_precision
+                    if date_source:
+                        rec.date_source = date_source
                     try:
-                        storage._record_download_error(rec, exc, "recover-downloads")
-                    except Exception:
-                        pass
-                if status == "saved":
-                    summary["recovered"] += 1
-                    action = "recovered"
-                elif status == "skip:already-indexed":
-                    # The doc_id was already indexed -- always bare, the
-                    # matched doc_id is rec.doc_id itself. Nothing left to
-                    # recover; self-heal by stamping the dead URL onto its
-                    # OWN row (a no-op for alt_urls, since pdf_url is that
-                    # dead URL already) and releasing its quarantine, so a
-                    # future nightly sync doesn't see it as still quarantined.
-                    summary["duplicate"] += 1
-                    action = "duplicate"
-                    canonical_doc_id = rec.doc_id
-                    stamps.setdefault(rec.doc_id, set()).add(pdf_url)
-                    storage.quarantine.record_success(pdf_url)
-                elif status.startswith("skip:duplicate-content"):
-                    # Bytes hash-matched a DIFFERENT existing doc_id, carried
-                    # as the status suffix (a bare legacy status with no
-                    # suffix is tolerated -- no doc_id to stamp, never
-                    # crashes). Either way there is nothing left to recover
-                    # here. Reporting this as "recoverable" would be a lie
-                    # (nothing recoverable remains) and would keep
-                    # re-downloading the full PDF every run just to discover
-                    # the same duplicate again -- self-heal instead: stamp
-                    # the dead URL onto the row it actually matched.
-                    summary["duplicate"] += 1
-                    action = "duplicate"
-                    matched_id = _duplicate_doc_id(status)
-                    if matched_id:
-                        canonical_doc_id = matched_id
-                        stamps.setdefault(matched_id, set()).add(pdf_url)
+                        # bypass_quarantine=True: this whole inventory comes FROM
+                        # download_errors.jsonl, the same file that feeds the
+                        # quarantine counter, so by the time recovery runs its own
+                        # targets are typically already quarantined -- without the
+                        # bypass, save() would short-circuit to "skip:quarantined"
+                        # before ever trying the Wayback snapshot alt_url, and that
+                        # skip would silently fall into the "duplicate" bucket below
+                        # (a lie: nothing was actually deduplicated).
+                        status = storage.save(rec, bypass_quarantine=True)
+                    except Exception as exc:  # noqa: BLE001 - audited below, never aborts the pass
+                        status = "error"
+                        try:
+                            storage._record_download_error(rec, exc, "recover-downloads")
+                        except Exception:
+                            pass
+                    if status == "saved":
+                        summary["recovered"] += 1
+                        action = "recovered"
+                    elif status == "skip:already-indexed":
+                        # The doc_id was already indexed -- always bare, the
+                        # matched doc_id is rec.doc_id itself. Nothing left to
+                        # recover; self-heal by stamping the dead URL onto its
+                        # OWN row (a no-op for alt_urls, since pdf_url is that
+                        # dead URL already) and releasing its quarantine, so a
+                        # future nightly sync doesn't see it as still quarantined.
+                        summary["duplicate"] += 1
+                        action = "duplicate"
+                        canonical_doc_id = rec.doc_id
+                        _add_stamp(stamps, rec.doc_id, pdf_url)
                         storage.quarantine.record_success(pdf_url)
-                elif status.startswith("skip:"):
-                    # Any OTHER skip:* (e.g. a future status we don't special-
-                    # case here) is reported VERBATIM, never mislabeled as
-                    # "duplicate" -- an honest description of what save() said,
-                    # even if unanticipated.
-                    summary[status] = summary.get(status, 0) + 1
-                    action = status
+                    elif status.startswith("skip:duplicate-content"):
+                        # Bytes hash-matched a DIFFERENT existing doc_id, carried
+                        # as the status suffix (a bare legacy status with no
+                        # suffix is tolerated -- no doc_id to stamp, never
+                        # crashes). Either way there is nothing left to recover
+                        # here. Reporting this as "recoverable" would be a lie
+                        # (nothing recoverable remains) and would keep
+                        # re-downloading the full PDF every run just to discover
+                        # the same duplicate again -- self-heal instead: stamp
+                        # the dead URL onto the row it actually matched.
+                        summary["duplicate"] += 1
+                        action = "duplicate"
+                        matched_id = _duplicate_doc_id(status)
+                        if matched_id:
+                            canonical_doc_id = matched_id
+                            _add_stamp(stamps, matched_id, pdf_url)
+                            storage.quarantine.record_success(pdf_url)
+                    elif status.startswith("skip:"):
+                        # Any OTHER skip:* (e.g. a future status we don't special-
+                        # case here) is reported VERBATIM, never mislabeled as
+                        # "duplicate" -- an honest description of what save() said,
+                        # even if unanticipated.
+                        summary[status] = summary.get(status, 0) + 1
+                        action = status
 
-        csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": action,
-                         "snapshot_ts": ts, "title": title,
-                         "canonical_doc_id": canonical_doc_id})
+            csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": action,
+                             "snapshot_ts": ts, "title": title,
+                             "canonical_doc_id": canonical_doc_id})
 
-    _apply_stamps(storage, stamps)
+    finally:
+        # Quarantine releases are durable per-entry inside the loop, while
+        # stamps applied only after it -- a mid-pass crash (SIGKILL aside)
+        # would leave released-but-unstamped dead URLs that the nightly
+        # sync resumes hammering. finally shrinks that window to the
+        # entry being processed (PR #13 final review, Minor 1).
+        _apply_stamps(storage, stamps)
 
     out = csv_path or str(cfg.reports_dir / "recover_downloads.csv")
     Path(out).parent.mkdir(parents=True, exist_ok=True)

@@ -14,6 +14,8 @@ import csv
 import json
 from datetime import date
 
+import pytest
+
 from cb_corpus.config import Config
 from cb_corpus.storage import Storage, iter_manifest_rows
 
@@ -641,3 +643,78 @@ def test_download_skip_status_is_reported_as_duplicate_not_recoverable(tmp_path,
     assert results2["fr"].get("duplicate", 0) == 0
     csv_rows2 = _csv_rows(tmp_path / "r2.csv")
     assert csv_rows2[0]["action"] == "converged"
+
+
+# ---------------------------------------------------------------------------
+# PR #13 final review, Minor 1 -- CDX-walk crash-survival (mirrors
+# test_stamps_applied_even_if_pass_dies_mid_loop in test_recover_candidates.py)
+# ---------------------------------------------------------------------------
+
+def test_stamps_applied_even_if_cdx_pass_dies_mid_loop(tmp_path, monkeypatch):
+    """A SIGKILL/ENOSPC mid-pass would otherwise leave the first entry's
+    self-heal stamp collected in memory but never persisted -- the
+    try/finally around the CDX-walk loop (recover.py:625-738) shrinks that
+    window to the entry actually being processed when the crash hits, same
+    as the --candidates pass's try/finally already covers.
+
+    Note on the injection point: unlike --candidates' `Storage.reindex`
+    probe, `storage.save()` in THIS loop is deliberately wrapped in its own
+    `try/except Exception` (recover.py:672-687, "audited below, never aborts
+    the pass") -- a raise from `storage.save` is swallowed into
+    status="error" and never escapes the entry, so it cannot exercise a
+    genuine mid-loop crash here. `Storage.is_known_url` (called once per
+    entry, unguarded, via `_is_converged` at the very top of the loop body)
+    is the equivalent unguarded per-entry call for this pass, so that is
+    what is monkeypatched to raise on the second entry. `Storage.save` is
+    separately monkeypatched (not to raise) so the first entry takes the
+    real self-heal/duplicate path and its stamp is actually collected before
+    the crash."""
+    from cb_corpus.recover import run_recover_downloads
+    from cb_corpus.models import DocRecord
+    from cb_corpus.taxonomy import DocType
+    from cb_corpus import storage as storage_mod
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url_1 = "https://www.banque-france.fr/dt-crash-1.pdf"
+    dead_url_2 = "https://www.banque-france.fr/dt-crash-2.pdf"
+    canonical_url_1 = "https://www.banque-france.fr/existing-crash-1.pdf"
+
+    # Pre-seed the row that entry 1's dead URL will be self-heal-stamped onto.
+    seed_storage = Storage(cfg, _StubFetcher(
+        bytes_ok={"existing-crash-1.pdf": (b"%PDF-1.4 crash-1", "application/pdf")}))
+    seed_rec_1 = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Existing crash 1",
+                          pdf_url=canonical_url_1, date=date(2020, 1, 1),
+                          mime_type="application/pdf")
+    assert seed_storage.save(seed_rec_1) == "saved"
+
+    _write_inventory(cfg, [
+        _entry(bank="fr", pdf_url=dead_url_1, title="Crash WP 1"),
+        _entry(bank="fr", pdf_url=dead_url_2, title="Crash WP 2"),
+    ])
+    fetcher = _StubFetcher(cdx_hits={
+        "dt-crash-1.pdf": "20240101000000",
+        "dt-crash-2.pdf": "20240101000000",
+    })
+
+    monkeypatch.setattr(storage_mod.Storage, "save",
+                        lambda self, rec, **kw: f"skip:duplicate-content:{seed_rec_1.doc_id}")
+
+    real_is_known_url = storage_mod.Storage.is_known_url
+    calls = {"n": 0}
+
+    def _flaky_is_known_url(self, url):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated crash mid-loop")
+        return real_is_known_url(self, url)
+
+    monkeypatch.setattr(storage_mod.Storage, "is_known_url", _flaky_is_known_url)
+
+    with pytest.raises(RuntimeError, match="simulated crash mid-loop"):
+        run_recover_downloads(bank_codes=["fr"], download=True, config=cfg,
+                              fetcher=fetcher, csv_path=str(tmp_path / "r.csv"))
+
+    # The first entry's self-heal stamp must already be persisted despite the
+    # crash while resolving the second entry's `_is_converged` check.
+    rows = {r["pdf_url"]: r for r in iter_manifest_rows(cfg, "fr")}
+    assert dead_url_1 in rows[canonical_url_1]["alt_urls"]
