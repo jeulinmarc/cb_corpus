@@ -424,11 +424,14 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
                 # quarantined forever even though the corpus now has the doc
                 # under its new address.
                 storage.quarantine.record_success(dead_url)
-            elif status == "skip:duplicate-content":
-                # Bytes hash-matched a DIFFERENT doc_id's content -- dest
-                # is this (not-yet-indexed) doc_id's own path, so the
-                # copy just made is safe orphan bytes, never the other
-                # doc's canonical file. Remove it.
+            elif status.startswith("skip:duplicate-content"):
+                # Bytes hash-matched a DIFFERENT doc_id's content -- dest is
+                # this (not-yet-indexed) doc_id's own path, so the copy just
+                # made is safe orphan bytes, never the other doc's canonical
+                # file. Remove it. `startswith` (not `==`) because the status
+                # now carries the matched doc_id as a `:<id>` suffix (e.g.
+                # "skip:duplicate-content:<doc_id>"); the bare legacy string
+                # with no suffix is tolerated too.
                 try:
                     dest.unlink()
                 except OSError:
@@ -576,9 +579,11 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                 if status == "saved":
                     summary["recovered"] += 1
                     action = "recovered"
-                elif status in ("skip:already-indexed", "skip:duplicate-content"):
-                    # Bytes hash-matched an existing doc (skip:duplicate-content)
-                    # or the doc_id was already indexed (skip:already-indexed):
+                elif status == "skip:already-indexed" or status.startswith("skip:duplicate-content"):
+                    # Bytes hash-matched an existing doc (skip:duplicate-content,
+                    # possibly carrying the matched doc_id as a `:<id>` suffix)
+                    # or the doc_id was already indexed (skip:already-indexed,
+                    # always bare -- the matched doc_id is rec.doc_id itself):
                     # either way there is nothing left to recover here. Reporting
                     # this as "recoverable" would be a lie (nothing recoverable
                     # remains) and would keep re-downloading the full PDF every

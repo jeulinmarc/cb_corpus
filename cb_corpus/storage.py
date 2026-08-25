@@ -262,7 +262,11 @@ class Storage:
         # writes must only ever happen from THIS serialized loop (never
         # parallel workers) — see quarantine.py's _append docstring.
         self.quarantine = Quarantine(self.cfg)
-        self._hashes: set[str] = set()
+        # sha256 -> doc_id of the row that owns that content, not just a
+        # membership set: a same-bytes save under a different doc_id needs to
+        # report WHICH existing doc_id matched (`skip:duplicate-content:<id>`)
+        # so a caller (recover.py) can stamp the dead URL onto the right row.
+        self._hash_docid: dict[str, str] = {}
         self._ids: set[str] = set()
         self._urls: set[str] = set()
         self._source_urls: set[str] = set()
@@ -283,7 +287,7 @@ class Storage:
         for rec in self.iter_manifest():
             self._ids.add(rec["doc_id"])
             if rec.get("sha256"):
-                self._hashes.add(rec["sha256"])
+                self._hash_docid[rec["sha256"]] = rec["doc_id"]
             url = rec.get("pdf_url")
             if url:
                 self._urls.add(url)
@@ -342,7 +346,7 @@ class Storage:
         indexes so a long-lived Storage stays consistent with disk.
         """
         n = write_per_bank(self.cfg, rows)
-        self._ids.clear(); self._hashes.clear(); self._urls.clear()
+        self._ids.clear(); self._hash_docid.clear(); self._urls.clear()
         self._source_urls.clear()
         self._load_existing()
         return n
@@ -404,8 +408,8 @@ class Storage:
         if mime:
             rec.mime_type = mime
         digest = hashlib.sha256(content).hexdigest()
-        if digest in self._hashes:
-            return "skip:duplicate-content"
+        if digest in self._hash_docid:
+            return f"skip:duplicate-content:{self._hash_docid[digest]}"
 
         is_html = mime.startswith("text/html") or mime.startswith("application/xhtml")
         if is_html:
@@ -448,7 +452,7 @@ class Storage:
         rec.sha256 = digest
         rec.local_path = str(path)
         self._ids.add(rec.doc_id)
-        self._hashes.add(digest)
+        self._hash_docid[digest] = rec.doc_id
         self._urls.add(rec.pdf_url)
         if rec.source_url:
             self._source_urls.add(rec.source_url)
@@ -477,8 +481,8 @@ class Storage:
 
         content = path.read_bytes()
         digest = hashlib.sha256(content).hexdigest()
-        if digest in self._hashes:
-            return "skip:duplicate-content"
+        if digest in self._hash_docid:
+            return f"skip:duplicate-content:{self._hash_docid[digest]}"
 
         ext = path.suffix.lower().lstrip(".")
         rec.mime_type = {"pdf": "application/pdf", "html": "text/html"}.get(ext, rec.mime_type)
@@ -487,7 +491,7 @@ class Storage:
         rec.sha256 = digest
         rec.local_path = str(path)
         self._ids.add(rec.doc_id)
-        self._hashes.add(digest)
+        self._hash_docid[digest] = rec.doc_id
         self._urls.add(rec.pdf_url)
         if rec.source_url:
             self._source_urls.add(rec.source_url)
