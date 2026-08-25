@@ -427,6 +427,66 @@ def test_candidates_probe_duplicate_dry_run_does_not_release_quarantine(tmp_path
     assert len(list(iter_manifest_rows(cfg, "fr"))) == 1
 
 
+def test_bank_site_probe_duplicate_stamps_dead_url_on_alt_urls(tmp_path, monkeypatch):
+    """The flagship self-heal scenario for `bank_site` provenance: the probe
+    (`storage.reindex(..., dry_run=True)`) recognises the candidate's doc_id
+    as already indexed under its live final_url, so nothing is (re)downloaded
+    -- but unlike wayback/mirror (where rec.pdf_url == dead_url, making the
+    stamp inherently a no-op), here rec.pdf_url == final_url, so the
+    genuinely different dead_url must land in the pre-existing row's
+    alt_urls, its own quarantine must be released, and the CSV row must
+    carry the canonical (pre-seeded) doc_id."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/old-path/probe-bs.pdf"
+    final_url = "https://www.banque-france.fr/new-path/probe-bs.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Probe bank_site WP")])
+
+    # Pre-seed a row already indexed under the LIVE final_url -- exactly what
+    # a prior bank_site recovery of this same doc would have produced.
+    seed_storage = Storage(cfg, _NullFetcher())
+    seed_rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Already here",
+                        pdf_url=final_url, date=date(2020, 1, 1),
+                        mime_type="application/pdf")
+    seed_path = tmp_path / "seed-bs.pdf"
+    seed_path.write_bytes(b"%PDF-1.4 " + b"w" * (25 * 1024))
+    assert seed_storage.reindex(seed_rec, seed_path) == "reindexed"
+
+    q_path = cfg.data_dir / "download_quarantine.jsonl"
+    q_path.parent.mkdir(parents=True, exist_ok=True)
+    q_path.write_text(json.dumps({"url": dead_url, "nights": ["2026-08-19"],
+                                  "quarantined": False}) + "\n")
+
+    local_pdf = _make_local_pdf(tmp_path, "probe-bs-local.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "bank_site", "final_url": final_url,
+    }])
+    _stub_refresh_metadata(monkeypatch, title="Probe bank_site WP")
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=True,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["duplicate"] == 1
+
+    # (a) dead_url lands in the canonical row's alt_urls; pdf_url unchanged.
+    rows = list(iter_manifest_rows(cfg, "fr"))
+    assert len(rows) == 1
+    assert rows[0]["doc_id"] == seed_rec.doc_id
+    assert rows[0]["pdf_url"] == final_url
+    assert dead_url in rows[0]["alt_urls"]
+
+    # (b) the dead URL's quarantine is released.
+    q_lines = q_path.read_text().splitlines()
+    assert json.loads(q_lines[-1]) == {"url": dead_url, "released": True}
+
+    # (c) the CSV row carries the canonical doc_id.
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "duplicate"
+    assert csv_rows[0]["canonical_doc_id"] == seed_rec.doc_id
+
+
 # ---------------------------------------------------------------------------
 # --seed-quarantine
 # ---------------------------------------------------------------------------

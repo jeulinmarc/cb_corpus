@@ -448,9 +448,12 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
             canonical_doc_id = rec.doc_id
             # Self-healing, but ONLY on a real run: the dry-run contract
             # (mode parity above) must never stamp/release quarantine/write
-            # the manifest. rec.pdf_url IS the dead URL for wayback/mirror
-            # provenance already (this row's own identity), so the stamp is
-            # inherently a no-op for alt_urls -- the release still matters.
+            # the manifest. For wayback/mirror provenance rec.pdf_url IS the
+            # dead URL already (this row's own identity), so the stamp is a
+            # no-op for alt_urls there -- but for bank_site rec.pdf_url is
+            # the NEW final_url, so dead_url is genuinely different and DOES
+            # land in alt_urls (the flagship self-heal case this PR exists
+            # for). Either way the quarantine release still matters.
             if download:
                 stamps.setdefault(rec.doc_id, set()).add(dead_url)
                 storage.quarantine.record_success(dead_url)
