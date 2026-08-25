@@ -25,7 +25,15 @@ finds a snapshot but ``Storage.save`` reports ``skip:*`` (the bytes
 hash-match a doc already in the corpus, or the doc_id was already indexed),
 the entry is reported ``duplicate`` -- there is nothing left to recover,
 so it is never relabelled ``recoverable`` (which would just re-download the
-same duplicate PDF every run).
+same duplicate PDF every run). A ``duplicate`` verdict also SELF-HEALS: the
+dead URL (and, in ``--candidates`` mode, the candidate's own verified
+``final_url``) is stamped onto the matched row's ``alt_urls`` and its
+quarantine is released (one ``Storage.stamp_alt_urls`` call, applied once at
+the end of the pass -- never during a dry-run), so the same dead URL is
+recognised as already known on every future pass instead of being
+rediscovered as ``duplicate`` forever. The matched row's doc_id is recorded
+per-entry in the CSV's ``canonical_doc_id`` column (empty for every other
+action) -- an audit trail so an operator can spot a wrong pairing.
 
 ``--candidates <path>`` switches to a SEPARATE, candidates-only mode (no CDX
 walk at all): each JSONL line is an EXTERNALLY-recovered file (hunted by hand
@@ -63,7 +71,12 @@ from .storage import Storage
 from .taxonomy import by_code
 
 _ACTIONS = ("recoverable", "recovered", "duplicate", "unrecoverable", "converged")
-_CSV_FIELDS = ("bank", "pdf_url", "action", "snapshot_ts", "title")
+_CSV_FIELDS = ("bank", "pdf_url", "action", "snapshot_ts", "title", "canonical_doc_id")
+
+# `Storage.save`/`Storage.reindex` prefix for a same-bytes match; the matched
+# doc_id, when known, follows as a `:<doc_id>` suffix (e.g.
+# "skip:duplicate-content:<doc_id>"). See `_duplicate_doc_id`.
+_DUPLICATE_CONTENT_PREFIX = "skip:duplicate-content"
 
 # --candidates local-file verification: reject anything too small to
 # plausibly be a real working paper (a truncated download, an HTML error
@@ -254,6 +267,32 @@ def _candidate_provenance(dead_url: str, final_url: str,
     return None
 
 
+def _duplicate_doc_id(status: str) -> Optional[str]:
+    """The matched doc_id embedded in a `skip:duplicate-content:<doc_id>`
+    status, or ``None`` when there is no suffix to extract -- either a bare
+    legacy status (an old/stubbed caller that never adopted the suffix) or a
+    status that isn't a duplicate-content skip at all. ``None`` means
+    "nothing to stamp for this row"; callers must never guess a doc_id, and
+    must never crash on the bare form."""
+    if status.startswith(_DUPLICATE_CONTENT_PREFIX + ":"):
+        return status[len(_DUPLICATE_CONTENT_PREFIX) + 1:] or None
+    return None
+
+
+def _apply_stamps(storage: Storage, stamps: dict[str, set[str]]) -> None:
+    """Apply the alt_url stamps collected during a pass (see
+    `run_recover_downloads`/`_run_candidates_pass`) in ONE
+    `Storage.stamp_alt_urls` call, and print the one-line audit summary.
+    A no-op (no print, no rewrite) when nothing was collected -- callers
+    only build `stamps` at all when `download` is True, so this never runs
+    during a dry-run."""
+    if not stamps:
+        return
+    n = storage.stamp_alt_urls(stamps)
+    print(f"[recover] stamped {n} alt_url(s) on {len(stamps)} row(s)",
+          file=sys.stderr, flush=True)
+
+
 def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
                          candidates_path: str, bank_codes: Optional[Iterable[str]],
                          download: bool) -> tuple[dict[str, dict], list[dict]]:
@@ -272,6 +311,10 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
 
     results: dict[str, dict] = {}
     csv_rows: list[dict] = []
+    # doc_id -> URLs to stamp onto its alt_urls, applied ONCE at the end
+    # (never during dry-run -- only ever populated inside `if download:`
+    # branches below).
+    stamps: dict[str, set[str]] = {}
 
     def _bump(bank: str, action: str) -> dict:
         summary = results.setdefault(bank, {a: 0 for a in _ACTIONS})
@@ -387,6 +430,7 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
 
         _bump(bank, "recoverable")
         action = "recoverable"
+        canonical_doc_id = ""
 
         # dest == storage.target_path(rec) is DERIVED FROM doc_id, so for an
         # already-indexed doc_id it is the SAME PATH as that doc's real
@@ -401,6 +445,15 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
         if probe == "skip:already-indexed":
             _bump(bank, "duplicate")
             action = "duplicate"
+            canonical_doc_id = rec.doc_id
+            # Self-healing, but ONLY on a real run: the dry-run contract
+            # (mode parity above) must never stamp/release quarantine/write
+            # the manifest. rec.pdf_url IS the dead URL for wayback/mirror
+            # provenance already (this row's own identity), so the stamp is
+            # inherently a no-op for alt_urls -- the release still matters.
+            if download:
+                stamps.setdefault(rec.doc_id, set()).add(dead_url)
+                storage.quarantine.record_success(dead_url)
         elif download:
             dest = storage.target_path(rec)
             status = "error"
@@ -438,6 +491,15 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
                     pass
                 _bump(bank, "duplicate")
                 action = "duplicate"
+                matched_id = _duplicate_doc_id(status)
+                if matched_id:
+                    # Both the dead URL AND this candidate's own final_url
+                    # (its verified snapshot/mirror/live copy) are stamped
+                    # onto the matched row -- final_url was never dead, so
+                    # only dead_url's quarantine is released.
+                    canonical_doc_id = matched_id
+                    stamps.setdefault(matched_id, set()).update({dead_url, final_url})
+                    storage.quarantine.record_success(dead_url)
             elif status.startswith("skip:"):
                 # Any other non-"reindexed" status (e.g. skip:missing-file,
                 # or skip:already-indexed from a same-run race with an
@@ -450,8 +512,10 @@ def _run_candidates_pass(cfg: Config, storage: Storage, fetcher: Fetcher,
             # status == "error": action stays "recoverable" (audited above).
 
         csv_rows.append({"bank": bank, "pdf_url": dead_url, "action": action,
-                         "snapshot_ts": "", "title": title})
+                         "snapshot_ts": "", "title": title,
+                         "canonical_doc_id": canonical_doc_id})
 
+    _apply_stamps(storage, stamps)
     return results, csv_rows
 
 
@@ -475,12 +539,17 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     status is reported verbatim as the CSV action, never mislabeled --
     recovery saves run with ``bypass_quarantine=True`` precisely so the
     quarantine gate (fed by the same ``download_errors.jsonl`` inventory)
-    cannot silently block them. A CSV report (``{bank, pdf_url, action,
-    snapshot_ts, title}``) is written in both modes so a dry-run's
-    classification is never lost, and a CSV line never claims an action that
-    didn't happen (a failed ``--download`` save stays ``recoverable``, not
-    ``recovered``; its failure lands in ``download_errors.jsonl`` like any
-    other, via the audit path).
+    cannot silently block them. Every ``duplicate`` verdict self-heals (see
+    the module docstring): its dead URL is stamped onto the matched row's
+    ``alt_urls`` and its quarantine released, in ONE ``Storage.stamp_alt_urls``
+    call applied at the end of the pass -- never during a dry-run. A CSV
+    report (``{bank, pdf_url, action, snapshot_ts, title, canonical_doc_id}``)
+    is written in both modes so a dry-run's classification is never lost, and
+    a CSV line never claims an action that didn't happen (a failed
+    ``--download`` save stays ``recoverable``, not ``recovered``; its failure
+    lands in ``download_errors.jsonl`` like any other, via the audit path).
+    ``canonical_doc_id`` is filled only for a ``duplicate`` row (the matched
+    row's doc_id), empty otherwise.
 
     ``candidates`` switches to the ``--candidates`` mode (see the module
     docstring): the CDX walk below is skipped ENTIRELY, replaced by
@@ -514,6 +583,10 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
     entries = _read_inventory(cfg, bank_codes)
     results: dict[str, dict] = {}
     csv_rows: list[dict] = []
+    # doc_id -> URLs to stamp onto its alt_urls, applied ONCE at the end
+    # (never during dry-run -- this whole CDX-walk pass only ever attempts a
+    # save, and so can only classify a duplicate, inside `if download:`).
+    stamps: dict[str, set[str]] = {}
 
     for entry in entries:
         bank = entry.get("bank_code") or "_unknown"
@@ -538,6 +611,7 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
 
         summary["recoverable"] += 1
         action = "recoverable"
+        canonical_doc_id = ""
 
         if download:
             doc_type = None
@@ -579,17 +653,35 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                 if status == "saved":
                     summary["recovered"] += 1
                     action = "recovered"
-                elif status == "skip:already-indexed" or status.startswith("skip:duplicate-content"):
-                    # Bytes hash-matched an existing doc (skip:duplicate-content,
-                    # possibly carrying the matched doc_id as a `:<id>` suffix)
-                    # or the doc_id was already indexed (skip:already-indexed,
-                    # always bare -- the matched doc_id is rec.doc_id itself):
-                    # either way there is nothing left to recover here. Reporting
-                    # this as "recoverable" would be a lie (nothing recoverable
-                    # remains) and would keep re-downloading the full PDF every
-                    # run just to discover the same duplicate again.
+                elif status == "skip:already-indexed":
+                    # The doc_id was already indexed -- always bare, the
+                    # matched doc_id is rec.doc_id itself. Nothing left to
+                    # recover; self-heal by stamping the dead URL onto its
+                    # OWN row (a no-op for alt_urls, since pdf_url is that
+                    # dead URL already) and releasing its quarantine, so a
+                    # future nightly sync doesn't see it as still quarantined.
                     summary["duplicate"] += 1
                     action = "duplicate"
+                    canonical_doc_id = rec.doc_id
+                    stamps.setdefault(rec.doc_id, set()).add(pdf_url)
+                    storage.quarantine.record_success(pdf_url)
+                elif status.startswith("skip:duplicate-content"):
+                    # Bytes hash-matched a DIFFERENT existing doc_id, carried
+                    # as the status suffix (a bare legacy status with no
+                    # suffix is tolerated -- no doc_id to stamp, never
+                    # crashes). Either way there is nothing left to recover
+                    # here. Reporting this as "recoverable" would be a lie
+                    # (nothing recoverable remains) and would keep
+                    # re-downloading the full PDF every run just to discover
+                    # the same duplicate again -- self-heal instead: stamp
+                    # the dead URL onto the row it actually matched.
+                    summary["duplicate"] += 1
+                    action = "duplicate"
+                    matched_id = _duplicate_doc_id(status)
+                    if matched_id:
+                        canonical_doc_id = matched_id
+                        stamps.setdefault(matched_id, set()).add(pdf_url)
+                        storage.quarantine.record_success(pdf_url)
                 elif status.startswith("skip:"):
                     # Any OTHER skip:* (e.g. a future status we don't special-
                     # case here) is reported VERBATIM, never mislabeled as
@@ -599,7 +691,10 @@ def run_recover_downloads(bank_codes: Optional[Iterable[str]] = None,
                     action = status
 
         csv_rows.append({"bank": bank, "pdf_url": pdf_url, "action": action,
-                         "snapshot_ts": ts, "title": title})
+                         "snapshot_ts": ts, "title": title,
+                         "canonical_doc_id": canonical_doc_id})
+
+    _apply_stamps(storage, stamps)
 
     out = csv_path or str(cfg.reports_dir / "recover_downloads.csv")
     Path(out).parent.mkdir(parents=True, exist_ok=True)

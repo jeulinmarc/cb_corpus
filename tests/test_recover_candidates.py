@@ -277,7 +277,12 @@ def test_unknown_dead_url_is_unknown_entry(tmp_path, monkeypatch):
 # duplicate-content dedup + orphan-file removal
 # ---------------------------------------------------------------------------
 
-def test_duplicate_content_is_deduped_and_orphan_file_removed(tmp_path, monkeypatch):
+def test_duplicate_content_is_deduped_and_orphan_file_removed(tmp_path, monkeypatch, capsys):
+    """Self-healing (the actual point of this fix): the dead alias URL AND
+    the candidate's own final_url (its Wayback snapshot) are both stamped
+    onto the canonical (seeded) row's alt_urls, and the dead URL's
+    quarantine is released -- so a future recover pass over this same dead
+    URL sees it as already known."""
     from cb_corpus.recover import run_recover_downloads
 
     cfg = Config(data_dir=tmp_path)
@@ -293,12 +298,18 @@ def test_duplicate_content_is_deduped_and_orphan_file_removed(tmp_path, monkeypa
     assert seed_storage.reindex(seed_rec, seed_path) == "reindexed"
 
     dead_url = "https://www.banque-france.fr/dt-alias.pdf"
+    final_url = "https://web.archive.org/alias"
     _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Alias copy")])
+    q_path = cfg.data_dir / "download_quarantine.jsonl"
+    q_path.parent.mkdir(parents=True, exist_ok=True)
+    q_path.write_text(json.dumps({"url": dead_url,
+                                  "nights": ["2026-08-19", "2026-08-20"],
+                                  "quarantined": False}) + "\n")
     local_pdf = tmp_path / "alias.pdf"
     local_pdf.write_bytes(dup_bytes)
     cand_path = _write_candidates(tmp_path, [{
         "dead_pdf_url": dead_url, "file_path": str(local_pdf),
-        "recovered_from": "wayback", "final_url": "https://web.archive.org/alias",
+        "recovered_from": "wayback", "final_url": final_url,
     }])
     _stub_refresh_metadata(monkeypatch, title="Alias copy")
 
@@ -312,6 +323,7 @@ def test_duplicate_content_is_deduped_and_orphan_file_removed(tmp_path, monkeypa
     assert len(rows) == 1   # only the pre-seeded row -- nothing new appended
     csv_rows = _csv_rows(tmp_path / "r.csv")
     assert csv_rows[0]["action"] == "duplicate"
+    assert csv_rows[0]["canonical_doc_id"] == seed_rec.doc_id
 
     # No orphan bytes: the copy made into the corpus layout for the alias
     # doc_id must have been removed again since it was never indexed.
@@ -319,6 +331,17 @@ def test_duplicate_content_is_deduped_and_orphan_file_removed(tmp_path, monkeypa
                     pdf_url=dead_url, mime_type="application/pdf")
     storage = Storage(cfg, _NullFetcher())
     assert not storage.target_path(rec).exists()
+
+    # Both the dead URL and its Wayback snapshot are stamped onto the
+    # canonical row (order not asserted -- a set internally).
+    assert rows[0]["doc_id"] == seed_rec.doc_id
+    assert set(rows[0]["alt_urls"]) == {dead_url, final_url}
+
+    q_lines = q_path.read_text().splitlines()
+    assert json.loads(q_lines[-1]) == {"url": dead_url, "released": True}
+
+    stderr = capsys.readouterr().err
+    assert "[recover] stamped 2 alt_url(s) on 1 row(s)" in stderr
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +375,56 @@ def test_dry_run_writes_nothing(tmp_path, monkeypatch):
 
     csv_rows = _csv_rows(tmp_path / "r.csv")
     assert csv_rows[0]["action"] == "recoverable"
+
+
+def test_candidates_probe_duplicate_dry_run_does_not_release_quarantine(tmp_path, monkeypatch):
+    """The probe (`storage.reindex(..., dry_run=True)`) runs in BOTH modes
+    (mode parity, see `_run_candidates_pass`'s docstring), so a pure dry-run
+    (no `--download`) can still classify a candidate as 'duplicate' -- but
+    the dry-run contract must still hold: no quarantine release, no manifest
+    write, ever."""
+    from cb_corpus.recover import run_recover_downloads
+
+    cfg = Config(data_dir=tmp_path)
+    dead_url = "https://www.banque-france.fr/probe-dup.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=dead_url, title="Probe dup WP")])
+
+    # Pre-seed a row already indexed under the EXACT identity the candidate's
+    # own doc_id resolves to (wayback provenance keeps pdf_url == dead_url)
+    # -- makes the dry-run probe honestly report "skip:already-indexed".
+    seed_storage = Storage(cfg, _NullFetcher())
+    seed_rec = DocRecord(bank_code="fr", doc_type=DocType.D1, title="Already here",
+                        pdf_url=dead_url, date=date(2020, 1, 1),
+                        mime_type="application/pdf")
+    seed_path = tmp_path / "seed.pdf"
+    seed_path.write_bytes(b"%PDF-1.4 " + b"z" * (25 * 1024))
+    assert seed_storage.reindex(seed_rec, seed_path) == "reindexed"
+
+    q_path = cfg.data_dir / "download_quarantine.jsonl"
+    q_path.parent.mkdir(parents=True, exist_ok=True)
+    q_path.write_text(json.dumps({"url": dead_url, "nights": ["2026-08-19"],
+                                  "quarantined": False}) + "\n")
+
+    local_pdf = _make_local_pdf(tmp_path, "probe-dup-local.pdf")
+    cand_path = _write_candidates(tmp_path, [{
+        "dead_pdf_url": dead_url, "file_path": str(local_pdf),
+        "recovered_from": "wayback", "final_url": "https://web.archive.org/probe-dup",
+    }])
+    _stub_refresh_metadata(monkeypatch, title="Probe dup WP")
+
+    results = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
+                                    candidates=str(cand_path), download=False,
+                                    csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["duplicate"] == 1
+
+    # No quarantine release: still exactly the one seeded line, no
+    # "released" tombstone appended.
+    q_lines = q_path.read_text().splitlines()
+    assert len(q_lines) == 1
+    assert json.loads(q_lines[0]).get("released") is not True
+
+    # No manifest write beyond the pre-seeded row.
+    assert len(list(iter_manifest_rows(cfg, "fr"))) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +481,13 @@ def test_rerunning_same_candidates_file_twice_does_not_delete_corpus_file(tmp_pa
     retry) after the corpus already converged on these docs. dest ==
     storage.target_path(rec) for the SAME doc_id as the already-indexed row
     -- the second run must recognise that via a dry-run probe BEFORE copying
-    anything, never copy2-then-unlink the real corpus file."""
+    anything, never copy2-then-unlink the real corpus file.
+
+    Also covers the probe-based `skip:already-indexed` duplicate path's
+    self-healing: the dead URL IS this row's own pdf_url already (wayback
+    provenance), so stamping is inherently a no-op for alt_urls -- what's
+    actually observable is the quarantine release and the canonical_doc_id
+    audit trail."""
     from cb_corpus.recover import run_recover_downloads
 
     cfg = Config(data_dir=tmp_path)
@@ -430,6 +509,18 @@ def test_rerunning_same_candidates_file_twice_does_not_delete_corpus_file(tmp_pa
     assert len(rows) == 1
     local_path = Path(rows[0]["local_path"])
     assert local_path.is_file()
+    canonical_id = rows[0]["doc_id"]
+
+    # Simulate the nightly sync having independently re-quarantined the dead
+    # URL since the first run (record_success already released it once, but
+    # a later failing streak restarts the count from zero) -- makes the
+    # second run's release actually observable.
+    q_path = cfg.data_dir / "download_quarantine.jsonl"
+    with q_path.open("a") as fh:
+        fh.write(json.dumps({"url": dead_url,
+                             "nights": ["2026-08-19", "2026-08-20", "2026-08-21",
+                                       "2026-08-22", "2026-08-23"],
+                             "quarantined": True}) + "\n")
 
     # Re-run the exact same candidates file against the now-converged corpus.
     results2 = run_recover_downloads(config=cfg, fetcher=_NullFetcher(),
@@ -446,6 +537,10 @@ def test_rerunning_same_candidates_file_twice_does_not_delete_corpus_file(tmp_pa
 
     csv_rows = _csv_rows(tmp_path / "r2.csv")
     assert csv_rows[0]["action"] == "duplicate"
+    assert csv_rows[0]["canonical_doc_id"] == canonical_id
+
+    q_lines = q_path.read_text().splitlines()
+    assert json.loads(q_lines[-1]) == {"url": dead_url, "released": True}
 
 
 def test_duplicated_candidate_line_within_one_run_is_deduped_without_deleting_file(tmp_path, monkeypatch):
@@ -477,6 +572,7 @@ def test_duplicated_candidate_line_within_one_run_is_deduped_without_deleting_fi
 
     csv_rows = _csv_rows(tmp_path / "r.csv")
     assert [r["action"] for r in csv_rows] == ["recovered", "duplicate"]
+    assert csv_rows[1]["canonical_doc_id"] == rows[0]["doc_id"]
 
 
 # ---------------------------------------------------------------------------

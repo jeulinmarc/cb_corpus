@@ -279,7 +279,8 @@ def test_csv_columns_shape(tmp_path):
     run_recover_downloads(config=cfg, fetcher=_StubFetcher(), csv_path=str(tmp_path / "r.csv"))
     with open(tmp_path / "r.csv", newline="") as fh:
         header = next(csv.reader(fh))
-    assert header == ["bank", "pdf_url", "action", "snapshot_ts", "title"]
+    assert header == ["bank", "pdf_url", "action", "snapshot_ts", "title",
+                      "canonical_doc_id"]
 
 
 def test_counts_dict_has_all_five_action_keys(tmp_path):
@@ -470,13 +471,21 @@ def test_download_skip_already_indexed_status_is_reported_as_duplicate(tmp_path,
     `_is_converged` short-circuit before ever reaching save() (doc_id is
     derived from pdf_url, so a known doc_id implies a known pdf_url) -- so
     this is exercised directly against the exact-status branch, same as the
-    unknown-status test below."""
+    unknown-status test below.
+
+    Because the stubbed doc_id was never really indexed, stamping it back
+    onto "its own" row is inherently a no-op (the dead URL IS that row's
+    pdf_url) -- what's actually observable here is the quarantine release
+    and the canonical_doc_id audit trail in the CSV."""
     from cb_corpus.recover import run_recover_downloads
+    from cb_corpus.models import DocRecord
+    from cb_corpus.taxonomy import DocType
     from cb_corpus import storage as storage_mod
 
     cfg = Config(data_dir=tmp_path)
     pdf_url = "https://www.banque-france.fr/wp2500.pdf"
     _write_inventory(cfg, [_entry(bank="fr", pdf_url=pdf_url, title="WP 2500")])
+    _seed_quarantine_state(cfg, pdf_url, ["2026-08-19", "2026-08-20"])
     fetcher = _StubFetcher(cdx_hits={"wp2500.pdf": "20240601000000"})
 
     monkeypatch.setattr(storage_mod.Storage, "save",
@@ -488,6 +497,40 @@ def test_download_skip_already_indexed_status_is_reported_as_duplicate(tmp_path,
     assert results["fr"]["recovered"] == 0
     csv_rows = _csv_rows(tmp_path / "r.csv")
     assert csv_rows[0]["action"] == "duplicate"
+    expected_doc_id = DocRecord(bank_code="fr", doc_type=DocType.D1, title="WP 2500",
+                                pdf_url=pdf_url).doc_id
+    assert csv_rows[0]["canonical_doc_id"] == expected_doc_id
+
+    q_lines = (cfg.data_dir / "download_quarantine.jsonl").read_text().splitlines()
+    assert json.loads(q_lines[-1]) == {"url": pdf_url, "released": True}
+
+
+def test_download_legacy_bare_duplicate_status_never_crashes_and_does_not_stamp(tmp_path, monkeypatch):
+    """A `skip:duplicate-content` status with NO doc_id suffix (a stubbed
+    save(), or some future/legacy caller that never adopted the suffix) must
+    be tolerated: still classified 'duplicate' honestly, but with nothing to
+    stamp (no doc_id to stamp onto) -- never a crash, never a guess."""
+    from cb_corpus.recover import run_recover_downloads
+    from cb_corpus import storage as storage_mod
+
+    cfg = Config(data_dir=tmp_path)
+    pdf_url = "https://www.banque-france.fr/wp2600.pdf"
+    _write_inventory(cfg, [_entry(bank="fr", pdf_url=pdf_url, title="WP 2600")])
+    fetcher = _StubFetcher(cdx_hits={"wp2600.pdf": "20240601000000"})
+
+    monkeypatch.setattr(storage_mod.Storage, "save",
+                        lambda self, rec, **kw: "skip:duplicate-content")
+
+    results = run_recover_downloads(bank_codes=["fr"], download=True, config=cfg,
+                                    fetcher=fetcher, csv_path=str(tmp_path / "r.csv"))
+    assert results["fr"]["duplicate"] == 1
+    csv_rows = _csv_rows(tmp_path / "r.csv")
+    assert csv_rows[0]["action"] == "duplicate"
+    assert csv_rows[0]["canonical_doc_id"] == ""
+    # No manifest row exists at all (save() was stubbed, never really wrote
+    # anything) -- confirms stamp_alt_urls was never even attempted to run
+    # against a bogus target.
+    assert list(iter_manifest_rows(cfg, "fr")) == []
 
 
 def test_download_unknown_skip_status_is_reported_verbatim_never_mislabeled(tmp_path, monkeypatch):
@@ -529,14 +572,19 @@ def test_download_missing_doc_type_code_is_skipped_gracefully(tmp_path):
     assert results["fr"]["recovered"] == 0
 
 
-def test_download_skip_status_is_reported_as_duplicate_not_recoverable(tmp_path):
+def test_download_skip_status_is_reported_as_duplicate_not_recoverable(tmp_path, capsys):
     """`storage.save()` can come back `skip:duplicate-content` when the
     snapshot's bytes hash-match a document already in the corpus (a real,
     pre-seeded manifest row here) -- nothing is left to recover. Leaving the
     CSV action as 'recoverable' would be a lie (there is nothing recoverable
     left) and would make the entry re-download the full PDF every run just
     to rediscover the same duplicate. The honest action is 'duplicate',
-    counted separately from 'recovered'."""
+    counted separately from 'recovered'.
+
+    Self-healing (the actual point of this fix): the dead alias URL is
+    stamped onto the canonical (seeded) row's alt_urls and its quarantine is
+    released, so a re-run of the exact same inventory converges instead of
+    rediscovering the same 'duplicate' forever."""
     from cb_corpus.recover import run_recover_downloads
     from cb_corpus.models import DocRecord
     from cb_corpus.taxonomy import DocType
@@ -557,6 +605,8 @@ def test_download_skip_status_is_reported_as_duplicate_not_recoverable(tmp_path)
     # already saved above (official host still 403s; snapshot succeeds).
     pdf_url = "https://www.banque-france.fr/dt-alias.pdf"
     _write_inventory(cfg, [_entry(bank="fr", pdf_url=pdf_url, title="Alias copy")])
+    _seed_quarantine_state(cfg, pdf_url,
+                           ["2026-08-19", "2026-08-20", "2026-08-21", "2026-08-22", "2026-08-23"])
     fetcher = _StubFetcher(
         cdx_hits={"dt-alias.pdf": "20240101000000"},
         bytes_fail={"www.banque-france.fr"},
@@ -570,3 +620,24 @@ def test_download_skip_status_is_reported_as_duplicate_not_recoverable(tmp_path)
     assert len(rows) == 1   # only the seeded row -- nothing new appended
     csv_rows = _csv_rows(tmp_path / "r.csv")
     assert csv_rows[0]["action"] == "duplicate"
+    assert csv_rows[0]["canonical_doc_id"] == seed_rec.doc_id
+
+    # The dead alias URL is now stamped onto the canonical (seeded) row.
+    assert rows[0]["doc_id"] == seed_rec.doc_id
+    assert rows[0]["alt_urls"] == [pdf_url]
+
+    # Quarantine on the dead alias URL is released.
+    q_lines = (cfg.data_dir / "download_quarantine.jsonl").read_text().splitlines()
+    assert json.loads(q_lines[-1]) == {"url": pdf_url, "released": True}
+
+    stderr = capsys.readouterr().err
+    assert "[recover] stamped 1 alt_url(s) on 1 row(s)" in stderr
+
+    # A re-run of the SAME inventory must now converge -- is_known_url(alias)
+    # is true via the stamped alt_url -- never rediscover it as 'duplicate'.
+    results2 = run_recover_downloads(bank_codes=["fr"], download=True, config=cfg,
+                                     fetcher=fetcher, csv_path=str(tmp_path / "r2.csv"))
+    assert results2["fr"]["converged"] == 1
+    assert results2["fr"].get("duplicate", 0) == 0
+    csv_rows2 = _csv_rows(tmp_path / "r2.csv")
+    assert csv_rows2[0]["action"] == "converged"
