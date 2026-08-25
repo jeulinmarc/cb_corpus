@@ -26,7 +26,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, Mapping, Optional
 
 from .config import Config
 from .http import Fetcher
@@ -350,6 +350,51 @@ class Storage:
         self._source_urls.clear()
         self._load_existing()
         return n
+
+    def stamp_alt_urls(self, stamps: Mapping[str, Iterable[str]]) -> int:
+        """Add URLs to the `alt_urls` of already-indexed rows, by doc_id.
+
+        `stamps`: doc_id -> URLs to add (recover.py's duplicate-path
+        self-healing: a dead URL whose content/doc_id matched an existing
+        row gets stamped onto THAT row so `_skip_known_url`/`_is_converged`
+        recognise it forever). For each row whose doc_id appears in
+        `stamps`, every URL that is neither the row's own `pdf_url` nor
+        already present in its `alt_urls` is appended -- this only ADDS
+        alt_urls, never touches `pdf_url`/`doc_id` (dedup identity is never
+        rewritten). Unknown doc_ids are silently ignored (defensive; the
+        caller logs totals, this method doesn't need to explain a no-match).
+
+        Only the bank file(s) that actually changed are rewritten, in ONE
+        `rewrite_manifest` call covering all of them together (never a
+        rewrite per row). Returns the number of URLs actually stamped; 0
+        means nothing changed and no rewrite happened at all.
+        """
+        if not stamps:
+            return 0
+        by_bank: dict[str, list[dict]] = {}
+        touched_banks: set[str] = set()
+        stamped = 0
+        for row in self.iter_manifest():
+            bank = row.get("bank_code") or "_unknown"
+            by_bank.setdefault(bank, []).append(row)
+            urls = stamps.get(row.get("doc_id"))
+            if not urls:
+                continue
+            pdf_url = row.get("pdf_url")
+            alt_urls = list(row.get("alt_urls") or [])
+            for url in urls:
+                if not url or url == pdf_url or url in alt_urls:
+                    continue
+                alt_urls.append(url)
+                stamped += 1
+            if alt_urls != (row.get("alt_urls") or []):
+                row["alt_urls"] = alt_urls
+                touched_banks.add(bank)
+        if stamped == 0:
+            return 0
+        rows_to_write = [r for bank in touched_banks for r in by_bank[bank]]
+        self.rewrite_manifest(rows_to_write)
+        return stamped
 
     # -- paths -----------------------------------------------------------
     def target_path(self, rec: DocRecord) -> Path:
