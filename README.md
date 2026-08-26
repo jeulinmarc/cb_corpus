@@ -61,8 +61,8 @@ no machine-translated or model-generated text.
 - **Completeness matrix** (`completeness.py`) → expected-vs-downloaded per (bank × type × year):
   `ok / partial / missing / unknown`.
 - **Fetcher** (`http.py`) → per-host rate limit (0.5s default) + retries with exponential
-  backoff. Deliberately **not** robots-gated; set a real contact address in
-  `config.py::Config.user_agent`.
+  backoff. Deliberately **not** robots-gated; set your own contact via the
+  `CRAWLER_CONTACT` env var (defaults to this repo's URL).
 - **Reproducible rebuild** (`pipeline.py`) → idempotent re-runs; `run(..., max_rounds=N)`
   re-crawls until a clean round (no new docs, no errors); discovery failures are logged to
   `data/discovery_errors.jsonl` (no silent drops).
@@ -117,8 +117,10 @@ run(dry_run=False, max_rounds=3)    # native A/B/E/F per bank (converges)
 
 ## Before a real run
 
-1. **Set a contact in `config.py::Config.user_agent`.** It's how central-bank webmasters reach
-   you — part of being a polite crawler. Throughput is bounded by politeness
+1. **Set your contact: `export CRAWLER_CONTACT="you@example.com"`.** It goes into the
+   User-Agent of every request — it's how central-bank webmasters reach *you* (not the
+   project) about *your* crawls; part of being a polite crawler. Without it, the UA points
+   to this repository. Throughput is bounded by politeness
    (`min_delay_seconds`, default ~2 s/domain); the rate limit is **per-host**, so banks on
    different domains crawl in parallel.
 2. **Validate on a small window first.** Parsers were written to each site's documented markup,
