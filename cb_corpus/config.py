@@ -1,14 +1,27 @@
 """Runtime configuration."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
+
+# Crawler contact advertised in the User-Agent of every request. The default
+# points to the public repo (standard bot practice) so that a stranger running
+# this code never crawls the banks under the maintainer's personal identity —
+# operators identify THEMSELVES via the CRAWLER_CONTACT env var (an email or
+# URL webmasters can actually reach them at).
+_DEFAULT_CONTACT = "https://github.com/MyOpenFund/central-bank-corpus"
+
+
+def _user_agent() -> str:
+    contact = os.environ.get("CRAWLER_CONTACT", "").strip() or _DEFAULT_CONTACT
+    return f"central-bank-corpus/0.2 (+{contact})"
 
 
 @dataclass
 class Config:
     data_dir: Path = Path("./data")
-    user_agent: str = "cb-corpus/0.2 (+jeulinmarc@gmail.com)"
+    user_agent: str = field(default_factory=_user_agent)
     # Minimal anti-ban throttle per host (NOT politeness — kept low on purpose).
     min_delay_seconds: float = 0.5
     timeout: float = 30.0          # per-request connect/read (inactivity) timeout

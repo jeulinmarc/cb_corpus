@@ -37,7 +37,7 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name == 'push' }}
           tags: |
-            ghcr.io/jeulinmarc/cb_corpus:latest
-            ghcr.io/jeulinmarc/cb_corpus:${{ github.sha }}
+            ghcr.io/myopenfund/central-bank-corpus:latest
+            ghcr.io/myopenfund/central-bank-corpus:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

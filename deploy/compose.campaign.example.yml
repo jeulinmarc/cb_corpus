@@ -3,7 +3,7 @@
 # The container waits for the lock if a sync is running, then stops at the end.
 services:
   cb-campaign:
-    image: ghcr.io/jeulinmarc/cb_corpus:latest
+    image: ghcr.io/myopenfund/central-bank-corpus:latest
     restart: "no"
     user: "PUID:PGID"
     stop_grace_period: 60s     # SIGTERM grace before SIGKILL — a mid-write kill

@@ -1,7 +1,12 @@
-# cb_corpus
+# central-bank-corpus
 
 Builder for a corpus of **official central-bank documents** — first-hand sources only,
-for downstream RAG / analysis.
+for downstream RAG / analysis. Part of [MyOpenFund](https://github.com/MyOpenFund).
+
+**39,400+ documents** from **61 of the 63 BIS member central banks** — policy decisions,
+minutes, speeches, working papers, reports, statistics — with day-precision dates where the
+bank publishes them, honest provenance on every row, and a self-healing nightly pipeline
+(dead-URL quarantine, publication-cadence watchdog, automated recovery).
 
 **Scope:** document families A–F (see `taxonomy.py`). **Targets:** the 63 BIS member central banks.
 **Rule:** official primary sources only — every document comes from the issuing bank's own
@@ -56,8 +61,8 @@ no machine-translated or model-generated text.
 - **Completeness matrix** (`completeness.py`) → expected-vs-downloaded per (bank × type × year):
   `ok / partial / missing / unknown`.
 - **Fetcher** (`http.py`) → per-host rate limit (0.5s default) + retries with exponential
-  backoff. Deliberately **not** robots-gated; set a real contact address in
-  `config.py::Config.user_agent`.
+  backoff. Deliberately **not** robots-gated; set your own contact via the
+  `CRAWLER_CONTACT` env var (defaults to this repo's URL).
 - **Reproducible rebuild** (`pipeline.py`) → idempotent re-runs; `run(..., max_rounds=N)`
   re-crawls until a clean round (no new docs, no errors); discovery failures are logged to
   `data/discovery_errors.jsonl` (no silent drops).
@@ -66,7 +71,7 @@ no machine-translated or model-generated text.
 
 ```bash
 pip install -r requirements.txt
-python3.13 -m pytest tests/ -q          # 119 tests
+python3.13 -m pytest tests/ -q          # 398 tests
 ```
 > Use **`python3.13`** — that interpreter has the dependencies in this environment
 > (`python3` resolves to 3.14 without them).
@@ -112,8 +117,10 @@ run(dry_run=False, max_rounds=3)    # native A/B/E/F per bank (converges)
 
 ## Before a real run
 
-1. **Set a contact in `config.py::Config.user_agent`.** It's how central-bank webmasters reach
-   you — part of being a polite crawler. Throughput is bounded by politeness
+1. **Set your contact: `export CRAWLER_CONTACT="you@example.com"`.** It goes into the
+   User-Agent of every request — it's how central-bank webmasters reach *you* (not the
+   project) about *your* crawls; part of being a polite crawler. Without it, the UA points
+   to this repository. Throughput is bounded by politeness
    (`min_delay_seconds`, default ~2 s/domain); the rate limit is **per-host**, so banks on
    different domains crawl in parallel.
 2. **Validate on a small window first.** Parsers were written to each site's documented markup,
@@ -188,7 +195,8 @@ cb_corpus/
     base.py          BankAdapter ABC + registry + GenericAdapter + _fetch_text
     fed.py / ecb.py / rba.py  worked native examples (us / ecb / au)
     declarative.py + generic_sitemap.py + listing_crawler.py  TOML-driven adapters
-tests/               85 tests (taxonomy, registry, parsers, dedup, matrix, reliability)
+tests/               398 tests (taxonomy, registry, parsers, dedup, matrix, reliability,
+                     quarantine, recovery, cadence)
 ```
 
 ## Notes
@@ -199,3 +207,10 @@ tests/               85 tests (taxonomy, registry, parsers, dedup, matrix, relia
 - Respect each site's terms — BIS content is noncommercial-use.
 - The corpus is **~99 % complete** against each source's authoritative catalogue (BIS speeches,
   IDEAS working-paper series, bank publication calendars).
+
+## License
+
+- **Code**: [MIT](LICENSE).
+- **Data** (the manifest files under `data/` — metadata and links only; the documents
+  themselves stay on their issuing banks' servers and keep their own terms):
+  [CC BY 4.0](DATA_LICENSE) — attribute "MyOpenFund central-bank-corpus".

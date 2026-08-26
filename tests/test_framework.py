@@ -1638,3 +1638,17 @@ def test_known_url_variants_cover_alt_urls_reload_and_source_urls(tmp_path):
     st2 = Storage(cfg)
     assert st2.is_known_url("https://e.eu/press/alt.pdf")           # alt_urls, normalized on reload
     assert st2.is_known_source_url("https://e.eu/press/index.html")  # source_url, normalized
+
+
+def test_user_agent_contact_env_driven(monkeypatch):
+    """The crawler contact must identify the OPERATOR, never default to a
+    personal address: without CRAWLER_CONTACT the UA points at the public
+    repo; with it, the operator's own contact is advertised."""
+    from cb_corpus.config import Config
+    monkeypatch.delenv("CRAWLER_CONTACT", raising=False)
+    assert Config().user_agent == \
+        "central-bank-corpus/0.2 (+https://github.com/MyOpenFund/central-bank-corpus)"
+    monkeypatch.setenv("CRAWLER_CONTACT", "ops@example.org")
+    assert Config().user_agent == "central-bank-corpus/0.2 (+ops@example.org)"
+    monkeypatch.setenv("CRAWLER_CONTACT", "   ")   # blank -> falls back, never "(+)"
+    assert "myopenfund" in Config().user_agent.lower()

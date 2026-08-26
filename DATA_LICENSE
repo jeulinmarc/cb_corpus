@@ -1,0 +1,24 @@
+# Data license — CC BY 4.0
+
+The data files in this repository — the per-bank manifest files under `data/`
+(`data/manifest/*.jsonl`, `data/wp_dates_index.jsonl`, and the other committed
+`data/*.jsonl` state files) — are licensed under the
+Creative Commons Attribution 4.0 International license (CC BY 4.0).
+
+Full license text: https://creativecommons.org/licenses/by/4.0/legalcode
+Human-readable summary: https://creativecommons.org/licenses/by/4.0/
+
+Attribution: "MyOpenFund central-bank-corpus
+(https://github.com/MyOpenFund/central-bank-corpus)".
+
+## Scope note
+
+These files contain **metadata only**: titles, publication dates, document
+classifications, provenance records, and links (URLs) to documents published by
+the central banks themselves. The documents behind those links are **not** part
+of this repository and are **not** covered by this license — they remain on
+their issuing institutions' servers under those institutions' own terms
+(e.g. BIS content is noncommercial-use).
+
+The source code of this repository is separately licensed under the MIT
+license — see [LICENSE](LICENSE).
