@@ -5,7 +5,7 @@ set -euo pipefail
 
 JOB="${1:-run}"
 DATA_DIR="${CB_DATA_DIR:-/app/data}"
-REPO_URL="${STATE_REPO_URL:-git@github.com:jeulinmarc/cb_corpus.git}"
+REPO_URL="${STATE_REPO_URL:-git@github.com:MyOpenFund/central-bank-corpus.git}"
 BRANCH="${STATE_BRANCH:-master}"
 KEY="${GIT_SSH_KEY:-/run/secrets/deploy_key}"
 

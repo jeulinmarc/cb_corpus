@@ -3,7 +3,7 @@
 # NEVER commit the filled-in version: the repo is public.
 services:
   cb-refresh:
-    image: ghcr.io/jeulinmarc/cb_corpus:latest
+    image: ghcr.io/myopenfund/central-bank-corpus:latest
     restart: unless-stopped
     user: "PUID:PGID"          # UID:GID of the dataset owner (discover-ids stack)
     stop_grace_period: 60s     # SIGTERM grace before SIGKILL — a mid-write kill
