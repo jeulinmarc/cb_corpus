@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import subprocess
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -379,12 +380,11 @@ def run_cadence_watch(cfg: Config, *, write: bool = False,
               file=sys.stderr, flush=True)
         # Push ntfy notification on NEW overdue series
         if new_count > 0 and (ntfy_url := os.getenv("NTFY_URL")):
-            import subprocess
             try:
                 subprocess.run(
                     ["curl", "-fsS", "-m", "10", "-H", f"Title: cb_corpus cadence {new_count} new overdue",
                      "-d", f"{new_count} new overdue series", ntfy_url],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True
                 )
             except Exception:
                 print("cadence: NTFY FAILED (notification not delivered)", file=sys.stderr, flush=True)
