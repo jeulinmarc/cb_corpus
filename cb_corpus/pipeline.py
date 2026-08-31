@@ -433,7 +433,11 @@ def run_repec(bank_codes: Optional[Iterable[str]] = None,
                         # sweeps keep full pagination for completeness, they just
                         # stop re-fetching pages of papers already owned.
                         skip_url=storage.is_known_source_url,
-                        stop_on_known=incremental),
+                        stop_on_known=incremental,
+                        # Threaded down to _series_paper_pages: a listing-page
+                        # fetch failure is recorded as truncation, never a
+                        # silent "last page reached" (see repec.py).
+                        stats=report.source(code)),
                     dry_run=dry_run, label=f"repec:{code}")
             except Exception as exc:  # noqa: BLE001 — per-bank recoverable
                 report.source(code).record_fetch_error(
@@ -467,20 +471,28 @@ def run_wayback_recovery(bank_code: str, url_prefix: str, doc_type: DocType,
 
 
 def run_repec_wayback_recovery(bank_code: str, dry_run: bool = False,
-                               config: Optional[Config] = None) -> dict[str, int]:
+                               config: Optional[Config] = None,
+                               report: Optional[RunReport] = None) -> dict[str, int]:
     """Recover RePEc working papers whose official PDF is dead, via the Wayback
     Machine, keying on each paper's EXACT url (for opaque-path sources like the
     Riksbank). Re-discovers the bank, skips papers already saved, and for the
     missing ones adds the archived snapshot as a fallback Storage downloads.
     Dates/titles come from IDEAS; provenance is set to "wayback".
+
+    With `report` given, a `SourceStats` (keyed `repec-wb:<bank_code>`) is
+    threaded down into the re-discovery walk so a listing-page fetch failure
+    is recorded as truncation, exactly like `run_repec` — this re-discovery
+    is IDEAS pagination too, so it must not go silent just because it has no
+    `report` wired by default (`report=None` preserves that prior silence).
     """
     from .sources.repec import RePEcDiscovery
     from .sources.wayback import wayback_for_url
     cfg, fetcher, storage = _make_storage(config)
     rep = RePEcDiscovery(fetcher)
+    stats = report.source(f"repec-wb:{bank_code}") if report is not None else None
 
     def _recs() -> Iterator[DocRecord]:
-        for rec in rep.discover_bank(bank_code):
+        for rec in rep.discover_bank(bank_code, stats=stats):
             # Skip by URL (not doc_id): already-saved papers — incl. ones recovered
             # earlier with a different date precision — share the same pdf_url, so
             # this avoids both re-pinging Wayback and creating date-mismatch dupes.
