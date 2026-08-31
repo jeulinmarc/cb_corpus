@@ -76,7 +76,7 @@ def _discover_and_save_bank(code: str, fetcher: Fetcher, storage: Storage,
         s = report.source(code)
         s.record_saved_counts(counts)
         for e in adapter.errors:
-            s.record_fetch_error(str(e))
+            s.record_fetch_error(f"{e.get('context', '?')}: {e.get('error', str(e))}" if isinstance(e, dict) else str(e))
     return counts, adapter.errors
 
 
