@@ -8,8 +8,9 @@ fetch failure must never look like a completed listing.
 Doctrine: a run that did no useful work must never exit 0.
   0 = clean (nothing-new counts as clean iff zero errors)
   1 = fatal
-  3 = degraded (truncation, or a source that only failed, or zero total work
-      alongside fetch errors) — recovered transient errors do NOT degrade.
+  3 = degraded = any truncation, OR zero useful work (zero new documents)
+      while errors occurred (save errors and/or fetch errors) —
+      recovered transient errors alongside actual new documents do NOT degrade.
 """
 from __future__ import annotations
 
@@ -82,15 +83,14 @@ class RunReport:
         self.finished_at = _now()
         self._fatal = fatal
         srcs = self._sources.values()
-        total_seen = sum(s.docs_seen for s in srcs)
         total_new = sum(s.docs_new for s in srcs)
+        total_failed = sum(s.docs_failed for s in srcs)
         any_fetch_errors = any(s.fetch_errors for s in srcs)
         if fatal is not None:
             self.outcome, self.exit_code = "failed", 1
         elif (
             any(s.truncated for s in srcs)
-            or any(s.docs_failed > 0 and s.docs_new == 0 and s.docs_seen == 0 for s in srcs)
-            or (total_seen == 0 and total_new == 0 and any_fetch_errors)
+            or (total_new == 0 and (total_failed > 0 or any_fetch_errors))
         ):
             self.outcome, self.exit_code = "degraded", 3
         else:

@@ -35,6 +35,30 @@ def test_zero_work_with_errors_degrades():
     assert r.finish() == 3
 
 
+def test_error_only_source_degrades():
+    """Reviewer repro: a source with only save errors and zero new docs must
+    not exit clean — docs_seen including the error count previously masked
+    this as 'work was done'."""
+    r = RunReport("central-bank-corpus", "discover")
+    r.source("x").record_saved_counts({"error": 5})
+    assert r.finish() == 3
+    assert r.to_dict()["outcome"] == "degraded"
+
+
+def test_partial_success_does_not_degrade():
+    r = RunReport("central-bank-corpus", "discover")
+    r.source("us").record_saved_counts({"saved": 3, "error": 2})
+    assert r.finish() == 0
+    assert r.to_dict()["outcome"] == "ok"
+
+
+def test_nothing_new_one_save_error_degrades():
+    r = RunReport("central-bank-corpus", "discover")
+    r.source("us").record_saved_counts({"error": 1})
+    assert r.finish() == 3
+    assert r.to_dict()["outcome"] == "degraded"
+
+
 def test_fatal_wins():
     r = RunReport("central-bank-corpus", "discover")
     assert r.finish(fatal="boom") == 1
