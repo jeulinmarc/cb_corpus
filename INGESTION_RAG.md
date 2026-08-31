@@ -48,7 +48,7 @@ import fitz  # PyMuPDF — fast and robust for PDF text extraction
 from cb_corpus.banks import get_bank
 from cb_corpus.taxonomy import by_code
 
-ROOT = Path("/Users/marc/Desktop/All CODING/GENERALI/cb_corpus")
+ROOT = Path("/path/to/cb_corpus")
 MANIFEST = ROOT / "data" / "manifest.jsonl"
 
 def iter_docs():
