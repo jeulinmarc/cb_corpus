@@ -230,5 +230,16 @@ else
   if [ -n "$JOB_SUMMARY" ]; then log "$JOB_SUMMARY"; fi
   log "FAILED rc=$rc"
   echo "$(ts) FAILED [$JOB] rc=$rc" > "$STATUS"
+  # Push notification on failure/degraded — configured entirely via env
+  # (NTFY_URL like https://ntfy.example/topic). Absent env = silently skip,
+  # so the repo works unchanged for third parties.
+  if [ -n "${NTFY_URL:-}" ]; then
+    summary="$(tail -n 1 "$DATA_DIR/runs.jsonl" 2>/dev/null | head -c 500)"
+    curl -fsS -m 10 \
+      -H "Title: cb_corpus ${JOB} failed (rc=${rc})" \
+      -d "${summary:-no run-report available}" \
+      "$NTFY_URL" >/dev/null 2>&1 \
+      || log "NTFY FAILED (notification not delivered)"
+  fi
   exit "$rc"
 fi
