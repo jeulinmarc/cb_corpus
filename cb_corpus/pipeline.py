@@ -160,13 +160,12 @@ def run_bis_sitemap(since: Optional[date] = None,
     """
     cfg, fetcher, storage = _make_storage(config)
     bis = BISSpeechIndex(fetcher)
-    # NOTE: BISSpeechIndex.discover doesn't take a `stats` param yet (B3 wires
-    # that so mid-sitemap fetch failures are visible as `truncated`); until
-    # then this source's report only reflects the final save_many counts.
+    stats = report.source("bis-sitemap") if report is not None else None
     recs: Iterator[DocRecord] = bis.discover(
         since=since, until=until, only_banks=only_banks,
         max_per_year=max_per_year,
         skip_url=storage.is_known_url,
+        stats=stats,
     )
     counts = storage.save_many(recs, dry_run=dry_run, label="bis-sitemap")
     if report is not None:

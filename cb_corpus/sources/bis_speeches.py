@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 from ..banks import bank_for_bis_institution
 from ..http import Fetcher
 from ..models import DocRecord
+from ..runreport import SourceStats
 from ..taxonomy import DocType
 
 BIS_BASE = "https://www.bis.org"
@@ -161,6 +162,7 @@ class BISSpeechIndex:
                  only_banks: Optional[set[str]] = None,
                  max_per_year: Optional[int] = None,
                  skip_url: Optional[Callable[[str], bool]] = None,
+                 stats: Optional[SourceStats] = None,
                  ) -> Iterator[DocRecord]:
         """Yield C1 DocRecords by walking yearly sitemaps.
 
@@ -170,12 +172,33 @@ class BISSpeechIndex:
         `skip_url(url)` short-circuits BEFORE the per-speech detail fetch — used
         by the pipeline to skip speeches already in the manifest, so re-runs
         don't waste 30k HTML fetches.
+
+        `stats`, when given, isolates fetch failures instead of aborting the
+        whole discovery: a dead sitemap index or a dead per-year sitemap is
+        recorded via `record_fetch_error(..., truncated=True)` and the walk
+        moves on (index failure ends discovery with nothing to walk; a year
+        failure just skips that year and continues with the next one); a dead
+        detail-page fetch is recorded (not truncated) in place of today's bare
+        skip. Without `stats`, all three failure modes raise as before (kept
+        for library / backward-compatible callers).
         """
         start_year = since.year if since else 1996
         end_year = until.year if until else date.today().year
-        years = [y for y, _ in self.list_years() if start_year <= y <= end_year]
+        try:
+            years = [y for y, _ in self.list_years() if start_year <= y <= end_year]
+        except Exception as exc:
+            if stats is None:
+                raise
+            stats.record_fetch_error(f"sitemap index: {exc}", truncated=True)
+            return
         for year in years:
-            metas = self.speeches_for_year(year)
+            try:
+                metas = self.speeches_for_year(year)
+            except Exception as exc:
+                if stats is None:
+                    raise
+                stats.record_fetch_error(f"year {year} sitemap: {exc}", truncated=True)
+                continue
             if max_per_year:
                 metas = metas[:max_per_year]
             for meta in metas:
@@ -189,7 +212,9 @@ class BISSpeechIndex:
                     continue
                 try:
                     html = self.fetcher.get_text(meta.detail_url)
-                except Exception:
+                except Exception as exc:
+                    if stats is not None:
+                        stats.record_fetch_error(f"detail {meta.detail_url}: {exc}")
                     continue
                 title, desc = parse_detail(html)
                 institution = _guess_institution(desc) or _guess_institution(title)
