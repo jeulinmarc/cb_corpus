@@ -106,6 +106,48 @@ def test_enumerate_series_stats_none_preserves_silent_break():
 
 
 # ---------------------------------------------------------------------------
+# I4: the two PRODUCTION callers of enumerate_series (run_repec_check,
+# run_repec_reconcile via _walk_entries) used to pass stats=None -- a
+# truncated IDEAS listing was silently absorbed into "fewer papers than
+# expected", indistinguishable from a genuinely short series. Both now build
+# a local SourceStats per series and print a WARNING to stderr when
+# stats.truncated, so these audit commands are no longer silent about it
+# (they still never write to a report file -- see their docstrings).
+# ---------------------------------------------------------------------------
+
+def _boe_page_html(ids):
+    """A real gb-series (boe:boeewp, SERIES["gb"] in sources/repec.py) IDEAS
+    listing page, mirroring test_repec_reconcile.py::_series_html."""
+    links = "".join(
+        f'<li><a href="/p/boe/boeewp/{i}.html">Paper {i}</a></li>' for i in ids
+    )
+    return f"<html><body><ul>{links}</ul></body></html>"
+
+
+def test_run_repec_check_prints_truncation_warning(tmp_path, monkeypatch, capsys):
+    from cb_corpus.config import Config
+    from cb_corpus import repec_check as RC
+
+    fetcher = FakeFetcher({1: _boe_page_html(["20250001"]), 2: ConnectionError("boom")})
+    monkeypatch.setattr(RC, "Fetcher", lambda cfg: fetcher)
+    cfg = Config(data_dir=tmp_path / "data")
+    RC.run_repec_check(bank_codes=["gb"], config=cfg)
+    err = capsys.readouterr().err
+    assert "WARNING: IDEAS listing truncated for boe:boeewp" in err
+
+
+def test_run_repec_reconcile_prints_truncation_warning(tmp_path, capsys):
+    from cb_corpus.config import Config
+    from cb_corpus.repec_check import run_repec_reconcile
+
+    fetcher = FakeFetcher({1: _boe_page_html(["20250001"]), 2: ConnectionError("boom")})
+    cfg = Config(data_dir=tmp_path / "data")
+    run_repec_reconcile(bank_codes=["gb"], config=cfg, fetcher=fetcher)
+    err = capsys.readouterr().err
+    assert "WARNING: IDEAS listing truncated for boe:boeewp" in err
+
+
+# ---------------------------------------------------------------------------
 # Site 1: sources/repec.py::RePEcDiscovery._series_paper_pages (via discover_bank,
 # the production shape -- driven through the class exactly like real callers do)
 # ---------------------------------------------------------------------------

@@ -22,6 +22,9 @@ fi
 case "$*" in
   *"${PY_FAIL_MATCH:-@@none@@}"*) exit 1 ;;
 esac
+case "$*" in
+  *"${PY_DEGRADE_MATCH:-@@none@@}"*) exit 3 ;;
+esac
 if [ -n "${PY_CONC_DIR:-}" ]; then
   (
     flock 8
@@ -39,6 +42,16 @@ fi
 exit "${PY_EXIT:-0}"
 EOF
 chmod +x "$STUB/python"
+
+# `curl` stub: traces every invocation (title header + body), exit code
+# controllable via CURL_EXIT -- used to verify notify_fail() (I3).
+cat > "$STUB/curl" <<'EOF'
+#!/bin/bash
+echo "CURLARGS:$*" >> "${CURL_LOG:-/dev/null}"
+exit "${CURL_EXIT:-0}"
+EOF
+chmod +x "$STUB/curl"
+
 export PATH="$STUB:$PATH"
 export CB_APP_DIR=/app
 
@@ -185,7 +198,10 @@ grep -q "PYARGS:-m cb_corpus discover --banks aa --rounds 1 --native-only --down
 grep -q "\[sync\] OK 3/3" "$D/reports/nas_runs.log" || fail "OK 3/3 missing (footer leaked into totals)"
 unset DISCOVER_BANKS DISCOVER_TYPES
 
-# T7 — native partial failure: PARTIAL, exit 0, autocommit runs.
+# T7 — native partial failure: per the silent-failure doctrine this is
+# degraded-but-completed (rc=3), NOT a clean success -- it must exit 3, land
+# on the FAILED/notify path (rc != 0), and skip autocommit (only the rc=0
+# branch autocommits). The PARTIAL summary text is still logged first.
 newdir; export AUTOCOMMIT=1 AC_LOG="$D/ac.log"
 cat > "$D/ac.sh" <<'EOF'
 #!/bin/bash
@@ -193,11 +209,34 @@ echo "AC:$1" >> "$AC_LOG"
 EOF
 chmod +x "$D/ac.sh"; export AUTOCOMMIT_BIN="$D/ac.sh"
 export DISCOVER_BANKS="aa,bb,cc" PY_FAIL_MATCH="--banks bb"
-/app/deploy/run-job.sh sync || fail "native partial failure must exit 0"
+set +e; /app/deploy/run-job.sh sync; rc=$?; set -e
+[ "$rc" = "3" ] || fail "native partial failure must exit 3 (rc=$rc)"
 grep -q "\[sync\] PARTIAL 2/3 FAILED: bb" "$D/reports/nas_runs.log" || fail "PARTIAL summary missing"
-grep -q "PARTIAL 2/3 FAILED: bb \[sync\]" "$D/reports/last_run_status" || fail "PARTIAL status missing"
-grep -q "AC:sync" "$AC_LOG" || fail "autocommit not called on PARTIAL"
+grep -q "\[sync\] FAILED rc=3" "$D/reports/nas_runs.log" || fail "FAILED rc=3 heartbeat missing"
+grep -q "FAILED \[sync\] rc=3" "$D/reports/last_run_status" || fail "FAILED rc=3 status missing"
+if [ -f "$AC_LOG" ]; then fail "autocommit must NOT run on a degraded (rc=3) sync"; fi
 unset PY_FAIL_MATCH AUTOCOMMIT_BIN DISCOVER_BANKS; export AUTOCOMMIT=0
+
+# T7b — a degraded (rc=3) catalog phase must not abort the remaining phases:
+# bis-sitemap degrades, but repec AND native discover still run, and the
+# overall sync still reports rc=3 (worst-outcome-wins), not the fatal path.
+newdir; export DISCOVER_BANKS="us" PY_DEGRADE_MATCH="bis-sitemap"
+set +e; /app/deploy/run-job.sh sync; rc=$?; set -e
+[ "$rc" = "3" ] || fail "degraded catalog phase must still exit 3 overall (rc=$rc)"
+grep -q "PYARGS:-m cb_corpus repec --download" "$PY_LOG" \
+  || fail "repec must still run after a degraded bis-sitemap phase"
+grep -q "PYARGS:-m cb_corpus discover --banks us" "$PY_LOG" \
+  || fail "native discover must still run after a degraded bis-sitemap phase"
+grep -q "FAILED \[sync\] rc=3" "$D/reports/last_run_status" || fail "degraded-catalog status != rc=3"
+unset PY_DEGRADE_MATCH DISCOVER_BANKS
+
+# T7c — a degraded (rc=3) repec phase must not abort native discover either.
+newdir; export DISCOVER_BANKS="us" PY_DEGRADE_MATCH="cb_corpus repec"
+set +e; /app/deploy/run-job.sh sync; rc=$?; set -e
+[ "$rc" = "3" ] || fail "degraded repec phase must still exit 3 overall (rc=$rc)"
+grep -q "PYARGS:-m cb_corpus discover --banks us" "$PY_LOG" \
+  || fail "native discover must still run after a degraded repec phase"
+unset PY_DEGRADE_MATCH DISCOVER_BANKS
 
 # T8 — all native banks failed: FAILED, non-zero exit.
 newdir; export DISCOVER_BANKS="aa,bb" PY_FAIL_MATCH="cb_corpus discover"
@@ -336,3 +375,36 @@ grep -q "FAILED \[cadence\] rc=1" "$D/reports/last_run_status" || fail "cadence 
 unset PY_EXIT
 
 echo "RUN_JOB_CADENCE_OK"
+
+# T18 — notify_fail() (I3): NTFY_URL set, a FAILED run posts a notification
+# with the job/rc in the title. Absent NTFY_URL, no curl call at all (T2/T5/
+# T8/etc. above already run with NTFY_URL unset and never touch curl).
+newdir; export DISCOVER_BANKS="us" PY_FAIL_MATCH="bis-sitemap"
+export NTFY_URL="https://ntfy.example/topic" CURL_LOG="$D/curl.log"
+if /app/deploy/run-job.sh sync; then fail "T18 setup: sync should still fail"; fi
+grep -q "CURLARGS:.*Title: cb_corpus sync failed (rc=1)" "$CURL_LOG" \
+  || fail "notify_fail not called on FAILED sync with NTFY_URL set"
+unset PY_FAIL_MATCH DISCOVER_BANKS NTFY_URL CURL_LOG
+
+# T19 — notify_fail() (I3) on the REFUSED path (empty volume): same factored
+# function, called BEFORE the generic FAILED branch even runs (REFUSED exits
+# 3 directly, bypassing run_job entirely).
+D=$(mktemp -d); export CB_DATA_DIR="$D" PY_LOG="$D/py.log" DISCOVER_BANKS="us"
+export NTFY_URL="https://ntfy.example/topic" CURL_LOG="$D/curl.log"
+set +e; /app/deploy/run-job.sh sync; rc=$?; set -e
+[ "$rc" = "3" ] || fail "T19 setup: REFUSED must still exit 3"
+grep -q "CURLARGS:.*Title: cb_corpus sync refused (rc=3)" "$CURL_LOG" \
+  || fail "notify_fail not called on the REFUSED path with NTFY_URL set"
+unset NTFY_URL CURL_LOG DISCOVER_BANKS
+
+# T20 — a curl failure inside notify_fail is logged, never fatal: the job's
+# own exit code is unaffected.
+newdir; export DISCOVER_BANKS="us" PY_FAIL_MATCH="bis-sitemap"
+export NTFY_URL="https://ntfy.example/topic" CURL_EXIT=1
+set +e; /app/deploy/run-job.sh sync; rc=$?; set -e
+[ "$rc" = "1" ] || fail "curl failure inside notify_fail must not change the job's own rc (got $rc)"
+grep -q "NTFY FAILED (notification not delivered)" "$D/reports/nas_runs.log" \
+  || fail "NTFY FAILED not logged when curl fails"
+unset PY_FAIL_MATCH DISCOVER_BANKS NTFY_URL CURL_EXIT
+
+echo "RUN_JOB_NOTIFY_OK"

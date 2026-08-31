@@ -139,7 +139,13 @@ def run_repec_check(bank_codes: Optional[Iterable[str]] = None,
         for handle, doc_type in SERIES[bank]:
             arch, series = handle.split(":")
             leftovers: list[tuple[str, str, str]] = []
-            for pid, title in enumerate_series(fetcher, handle):
+            stats = SourceStats(f"repec_check:{bank}")
+            entries = enumerate_series(fetcher, handle, stats=stats)
+            if stats.truncated:
+                sample = stats.error_samples[-1] if stats.error_samples else ""
+                print(f"WARNING: IDEAS listing truncated for {handle}: {sample}",
+                     file=sys.stderr)
+            for pid, title in entries:
                 summary["repec_total"] += 1
                 full_handle = f"RePEc:{arch}:{series}:{pid}"
                 covered = full_handle in handles
@@ -261,7 +267,13 @@ def _walk_entries(bank: str, fetcher: Fetcher, idx: dict, bank_home: str):
 
     for handle, doc_type in SERIES[bank]:
         arch, series = handle.split(":")
-        for pid, title in enumerate_series(fetcher, handle):
+        stats = SourceStats(f"repec_reconcile:{bank}")
+        entries = enumerate_series(fetcher, handle, stats=stats)
+        if stats.truncated:
+            sample = stats.error_samples[-1] if stats.error_samples else ""
+            print(f"WARNING: IDEAS listing truncated for {handle}: {sample}",
+                 file=sys.stderr)
+        for pid, title in entries:
             ideas_url = f"{IDEAS}/p/{arch}/{series}/{pid}.html"
             full_handle = f"RePEc:{arch}:{series}:{pid}"
             handle_rows = by_handle.get(full_handle) or []

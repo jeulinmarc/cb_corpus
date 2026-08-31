@@ -91,10 +91,16 @@ def run(bank_codes: Optional[Iterable[str]] = None,
     """Crawl + (optionally) download. dry_run=True only indexes URLs.
 
     With ``max_rounds > 1`` the crawl repeats until a round downloads nothing
-    new AND reports no errors (download + discovery), or the cap is reached.
-    Because saving is idempotent (dedup on doc_id + sha256), re-running only
-    fills gaps left by transient failures — this is what makes a full rebuild
-    converge to completeness instead of silently stopping one blip short.
+    new AND reports no errors (download + discovery) AND no bank crashed, or
+    the cap is reached. Because saving is idempotent (dedup on doc_id +
+    sha256), re-running only fills gaps left by transient failures — this is
+    what makes a full rebuild converge to completeness instead of silently
+    stopping one blip short.
+
+    Note: when ``report`` is given, its per-source stats ACCUMULATE across
+    every round (a history of everything seen this run), not just the final
+    round's outcome — a bank that crashed in round 1 and succeeded in round 2
+    still shows round 1's crash in the report, by design (it happened).
 
     Returns {bank_code: {status: count}} for the last round. Any unresolved
     discovery failures are written to ``data/discovery_errors.jsonl``.
@@ -107,7 +113,7 @@ def run(bank_codes: Optional[Iterable[str]] = None,
     round_no = 0
     last_disc_errors: list[dict] = []
     for round_no in range(1, rounds + 1):
-        round_saved = round_errors = 0
+        round_saved = round_errors = round_crashes = 0
         last_disc_errors = []
         for code in codes:
             if report is not None:
@@ -118,8 +124,13 @@ def run(bank_codes: Optional[Iterable[str]] = None,
                 except Exception as exc:  # noqa: BLE001 — per-bank recoverable
                     report.source(code).record_fetch_error(
                         f"adapter crashed: {exc}", truncated=True)
+                    round_crashes += 1
                     continue
             else:
+                # report is None: a crash here is NOT caught -- it propagates
+                # out of run() entirely, so there is no round to keep clean
+                # or retry; only the report-gated branch above needs the
+                # crash counter.
                 counts, errs = _discover_and_save_bank(
                     code, fetcher, storage, scope, since, dry_run,
                     native_only, report)
@@ -130,11 +141,13 @@ def run(bank_codes: Optional[Iterable[str]] = None,
         _record_discovery_errors(cfg, last_disc_errors)
         if rounds > 1:
             print(f"[round {round_no}/{rounds}] saved={round_saved} "
-                  f"errors={round_errors} discovery_failures={len(last_disc_errors)}",
+                  f"errors={round_errors} discovery_failures={len(last_disc_errors)} "
+                  f"crashes={round_crashes}",
                   file=sys.stderr, flush=True)
         if dry_run:
             break
-        if round_saved == 0 and round_errors == 0 and not last_disc_errors:
+        if (round_saved == 0 and round_errors == 0 and round_crashes == 0
+                and not last_disc_errors):
             break
 
     if last_disc_errors or (not dry_run and round_errors):

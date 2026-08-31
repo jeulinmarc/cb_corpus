@@ -35,6 +35,21 @@ cd "$APP_DIR" || exit 1   # the crawler writes to ./data (relative)
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "$(ts) [$JOB] $*" >> "$LOG"; }
 
+# Push notification on failure/degraded — configured entirely via env
+# (NTFY_URL like https://ntfy.example/topic). Absent env = silently skip, so
+# the repo works unchanged for third parties. A curl failure is logged, not
+# fatal: the caller (run_job failure branch, REFUSED path) has already
+# decided its own exit code before calling this.
+notify_fail() {
+  local title="$1" body="$2"
+  [ -n "${NTFY_URL:-}" ] || return 0
+  curl -fsS -m 10 \
+    -H "Title: ${title}" \
+    -d "${body}" \
+    "$NTFY_URL" >/dev/null 2>&1 \
+    || log "NTFY FAILED (notification not delivered)"
+}
+
 # Anti-overwrite guard: a volume without manifests means a missing seed or a
 # wrong dataset path. We refuse to crawl (and thus to commit a partial state
 # over the real one). CB_ALLOW_EMPTY_DATA=1 for a deliberate bootstrap.
@@ -42,6 +57,8 @@ if [ "${CB_ALLOW_EMPTY_DATA:-0}" != "1" ]; then
   if ! ls "$DATA_DIR"/manifest/*.jsonl >/dev/null 2>&1; then
     log "REFUSED (volume without manifests — missing seed? CB_ALLOW_EMPTY_DATA=1 to force)"
     echo "$(ts) REFUSED [$JOB]" > "$STATUS"
+    notify_fail "cb_corpus ${JOB} refused (rc=3)" \
+      "REFUSED: volume without manifests (missing seed? CB_ALLOW_EMPTY_DATA=1 to force)"
     exit 3
   fi
 fi
@@ -132,8 +149,11 @@ run_discover() {
     JOB_SUMMARY="OK $ok/$total"
     return 0
   elif [ "$ok" -gt 0 ]; then
+    # Per the silent-failure doctrine, some banks failed/degraded -> the
+    # overall run is degraded-but-completed (rc=3), never a clean 0. The
+    # PARTIAL summary text is unchanged; only the exit code reflects reality.
     JOB_SUMMARY="PARTIAL $ok/$total FAILED: $failed"
-    return 0
+    return 3
   else
     JOB_SUMMARY="FAILED 0/$total banks: $failed"
     return 1
@@ -150,6 +170,12 @@ run_sync() {
   # resolve to Sunday's dir and clobber the Sunday full-sweep logs.
   export DISCOVER_LOG_DIR="$DATA_DIR/reports/discover/$(date +%Y-%m-%d)"
   mkdir -p "$DISCOVER_LOG_DIR"   # created up front: the catalog phases tee here too.
+  # Sync-wide degraded flag: rc 3 (degraded-but-completed) from any phase
+  # must NOT abort the remaining phases -- every phase still runs, and the
+  # worst outcome wins (0 clean < 3 degraded). Only rc 1 (fatal) or rc 2
+  # (usage) aborts the sync immediately, same as before.
+  local degraded=0
+  local rc
   # Phase 1+2: shared catalogs, read once for all banks (the whole point:
   # per-bank discover no longer re-walks them — see the 2026-07-15 spec).
   # Tee'd to disk (catalogs.log) so a Dockge Update mid-run can no longer
@@ -160,20 +186,32 @@ run_sync() {
     y0=$(date -u -d "-${SYNC_WINDOW_DAYS} days" +%Y)
     y1=$(date -u +%Y)
     python -m cb_corpus bis-sitemap --years "${y0}-${y1}" --download 2>&1 \
-      | tee -a "$DISCOVER_LOG_DIR/catalogs.log" || return $?
+      | tee -a "$DISCOVER_LOG_DIR/catalogs.log"
+    rc=$?
+    if [ "$rc" -eq 3 ]; then degraded=3; elif [ "$rc" -ne 0 ]; then return "$rc"; fi
     log "bis-sitemap OK"
     python -m cb_corpus repec --incremental --download 2>&1 \
-      | tee -a "$DISCOVER_LOG_DIR/catalogs.log" || return $?
+      | tee -a "$DISCOVER_LOG_DIR/catalogs.log"
+    rc=$?
+    if [ "$rc" -eq 3 ]; then degraded=3; elif [ "$rc" -ne 0 ]; then return "$rc"; fi
   else
     python -m cb_corpus bis-sitemap --download 2>&1 \
-      | tee -a "$DISCOVER_LOG_DIR/catalogs.log" || return $?
+      | tee -a "$DISCOVER_LOG_DIR/catalogs.log"
+    rc=$?
+    if [ "$rc" -eq 3 ]; then degraded=3; elif [ "$rc" -ne 0 ]; then return "$rc"; fi
     log "bis-sitemap OK"
     python -m cb_corpus repec --download 2>&1 \
-      | tee -a "$DISCOVER_LOG_DIR/catalogs.log" || return $?
+      | tee -a "$DISCOVER_LOG_DIR/catalogs.log"
+    rc=$?
+    if [ "$rc" -eq 3 ]; then degraded=3; elif [ "$rc" -ne 0 ]; then return "$rc"; fi
   fi
   log "catalogs OK"
   # Phase 3: native bank-site fan-out (unchanged mechanics from PR #3).
   run_discover
+  rc=$?
+  if [ "$rc" -eq 3 ]; then degraded=3; elif [ "$rc" -ne 0 ]; then return "$rc"; fi
+  [ "$degraded" -eq 0 ] || return 3
+  return 0
 }
 
 run_job() {
@@ -230,16 +268,7 @@ else
   if [ -n "$JOB_SUMMARY" ]; then log "$JOB_SUMMARY"; fi
   log "FAILED rc=$rc"
   echo "$(ts) FAILED [$JOB] rc=$rc" > "$STATUS"
-  # Push notification on failure/degraded — configured entirely via env
-  # (NTFY_URL like https://ntfy.example/topic). Absent env = silently skip,
-  # so the repo works unchanged for third parties.
-  if [ -n "${NTFY_URL:-}" ]; then
-    summary="$(tail -n 1 "$DATA_DIR/runs.jsonl" 2>/dev/null | head -c 500)"
-    curl -fsS -m 10 \
-      -H "Title: cb_corpus ${JOB} failed (rc=${rc})" \
-      -d "${summary:-no run-report available}" \
-      "$NTFY_URL" >/dev/null 2>&1 \
-      || log "NTFY FAILED (notification not delivered)"
-  fi
+  summary="$(tail -n 1 "$DATA_DIR/runs.jsonl" 2>/dev/null | head -c 500)"
+  notify_fail "cb_corpus ${JOB} failed (rc=${rc})" "${summary:-no run-report available}"
   exit "$rc"
 fi
