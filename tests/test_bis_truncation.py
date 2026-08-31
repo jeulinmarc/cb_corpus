@@ -7,8 +7,10 @@ class FakeFetcher:
 
     def __init__(self, responses):
         self.responses = responses  # url substring -> text | Exception
+        self.calls = []  # list of requested URLs
 
     def get_text(self, url):
+        self.calls.append(url)
         for key, val in self.responses.items():
             if key in url:
                 if isinstance(val, Exception):
@@ -37,6 +39,13 @@ def test_dead_year_is_isolated_and_recorded():
     assert stats.truncated is True
     assert stats.fetch_errors == 1
     assert "2010" in stats.error_samples[0]
+    # fix: prove the walk continued past the dead year
+    assert any("documents_2011" in u for u in fetcher.calls), \
+        f"2011 sitemap was not requested. calls: {fetcher.calls}"
+    documents_2010_idx = next(i for i, u in enumerate(fetcher.calls) if "documents_2010" in u)
+    documents_2011_idx = next(i for i, u in enumerate(fetcher.calls) if "documents_2011" in u)
+    assert documents_2010_idx < documents_2011_idx, \
+        f"2010 fetch at index {documents_2010_idx} should come before 2011 at {documents_2011_idx}"
 
 
 def test_dead_index_records_truncated_instead_of_raising():

@@ -168,8 +168,7 @@ def run_bis_sitemap(since: Optional[date] = None,
         stats=stats,
     )
     counts = storage.save_many(recs, dry_run=dry_run, label="bis-sitemap")
-    if report is not None:
-        report.source("bis-sitemap").record_saved_counts(counts)
+    if stats is not None: stats.record_saved_counts(counts)
     return counts
 
 
