@@ -30,6 +30,7 @@ from bs4 import BeautifulSoup
 from .banks import get_bank
 from .config import Config
 from .http import Fetcher
+from .runreport import SourceStats
 from .sources.repec import IDEAS, SERIES, _paper_meta, extract_pdf_candidates
 from .storage import Storage
 from .wp_migrate import (_KEY_FROM_HANDLE, _KEY_FROM_PDF, normalize_title,
@@ -59,9 +60,18 @@ def parse_series_listing(html: str, arch: str, series: str) -> list[tuple[str, s
     return list(best.items())
 
 
-def enumerate_series(fetcher: Fetcher, handle: str, max_pages: int = 80
+def enumerate_series(fetcher: Fetcher, handle: str, max_pages: int = 80,
+                     stats: Optional[SourceStats] = None
                      ) -> list[tuple[str, str]]:
-    """All (paper_id, title) for an IDEAS series, following pagination."""
+    """All (paper_id, title) for an IDEAS series, following pagination.
+
+    A listing-page fetch failure ends the walk (still correct — skipping a
+    page would lose ordering guarantees), but with `stats` given it is
+    recorded via `record_fetch_error(..., truncated=True)` first, so it is
+    never indistinguishable from a genuinely completed listing. `stats=None`
+    (the default) preserves the prior silent-break behavior for callers not
+    yet wired to a run-report.
+    """
     arch, series = handle.split(":")
     base = f"{IDEAS}/s/{arch}/{series}"
     seen: dict[str, str] = {}
@@ -69,7 +79,9 @@ def enumerate_series(fetcher: Fetcher, handle: str, max_pages: int = 80
         url = f"{base}.html" if page == 1 else f"{base}{page}.html"
         try:
             html = fetcher.get_text(url)
-        except Exception:
+        except Exception as exc:
+            if stats is not None:
+                stats.record_fetch_error(f"page {page}: {exc}", truncated=True)
             break
         rows = parse_series_listing(html, arch, series)
         new = [(pid, t) for pid, t in rows if pid not in seen]
@@ -127,7 +139,13 @@ def run_repec_check(bank_codes: Optional[Iterable[str]] = None,
         for handle, doc_type in SERIES[bank]:
             arch, series = handle.split(":")
             leftovers: list[tuple[str, str, str]] = []
-            for pid, title in enumerate_series(fetcher, handle):
+            stats = SourceStats(f"repec_check:{bank}")
+            entries = enumerate_series(fetcher, handle, stats=stats)
+            if stats.truncated:
+                sample = stats.error_samples[-1] if stats.error_samples else ""
+                print(f"WARNING: IDEAS listing truncated for {handle}: {sample}",
+                     file=sys.stderr)
+            for pid, title in entries:
                 summary["repec_total"] += 1
                 full_handle = f"RePEc:{arch}:{series}:{pid}"
                 covered = full_handle in handles
@@ -249,7 +267,13 @@ def _walk_entries(bank: str, fetcher: Fetcher, idx: dict, bank_home: str):
 
     for handle, doc_type in SERIES[bank]:
         arch, series = handle.split(":")
-        for pid, title in enumerate_series(fetcher, handle):
+        stats = SourceStats(f"repec_reconcile:{bank}")
+        entries = enumerate_series(fetcher, handle, stats=stats)
+        if stats.truncated:
+            sample = stats.error_samples[-1] if stats.error_samples else ""
+            print(f"WARNING: IDEAS listing truncated for {handle}: {sample}",
+                 file=sys.stderr)
+        for pid, title in entries:
             ideas_url = f"{IDEAS}/p/{arch}/{series}/{pid}.html"
             full_handle = f"RePEc:{arch}:{series}:{pid}"
             handle_rows = by_handle.get(full_handle) or []

@@ -71,10 +71,19 @@ no machine-translated or model-generated text.
 
 ```bash
 pip install -r requirements.txt
-python3.13 -m pytest tests/ -q          # 398 tests
+python3.13 -m pytest tests/ -q          # 425 tests
 ```
 > Use **`python3.13`** — that interpreter has the dependencies in this environment
 > (`python3` resolves to 3.14 without them).
+
+## Operations
+
+Every work command (`discover`, `bis-sitemap`, `repec`) appends a structured
+run-report line to `data/runs.jsonl` (run id, per-source counters, fetch
+errors, an explicit `truncated` flag) and exits honestly: `0` clean, `1`
+fatal, `3` degraded — a run that did no useful work never exits 0. The NAS
+wrapper pushes an ntfy notification on non-zero exits when `NTFY_URL` is set
+(absent = no-op).
 
 ## Use
 

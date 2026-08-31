@@ -10,14 +10,32 @@ from __future__ import annotations
 import argparse
 import os
 from datetime import date, datetime
+from pathlib import Path
 
 from .banks import BIS_63
 from .completeness import build_matrix, export_csv, summarize
+from .config import Config
 from .convert import convert_existing
 from .pipeline import (run, run_bis_sitemap, run_repec,
                        reindex_bis_from_disk, reindex_native_from_disk)
 from .retry_html import retry_failed
+from .runreport import RunReport
 from .taxonomy import FULL_SCOPE, by_code
+
+# Work commands that build a RunReport, feed it through the pipeline, and
+# ALWAYS write it (even on crash) before returning the doctrine exit code.
+# Non-work commands (list-banks, dry tables, migrations, ...) are unaffected.
+REPORTING_CMDS = {"discover", "bis-sitemap", "repec"}
+
+
+def _runs_path() -> Path:
+    """Where the run-report lands: CB_DATA_DIR override (tests), else
+    Config's own data_dir. Config itself doesn't honor an env var for
+    data_dir today, so CB_DATA_DIR is this CLI's own override, not a
+    pre-existing Config mechanism."""
+    base = os.environ.get("CB_DATA_DIR")
+    data_dir = Path(base) if base else Config().data_dir
+    return data_dir / "runs.jsonl"
 
 
 def _date(s: str) -> date:
@@ -219,33 +237,41 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{len(BIS_63)} banks")
         return 0
 
-    if args.cmd == "discover":
-        scope = _types(args.types)
-        results = run(bank_codes=banks, scope=scope, since=args.since,
-                      dry_run=not args.download, max_rounds=args.rounds,
-                      native_only=args.native_only)
-        for code, counts in results.items():
-            print(f"{code}: {counts}")
-        return 0
+    if args.cmd in REPORTING_CMDS:
+        report = RunReport("central-bank-corpus", args.cmd)
+        try:
+            if args.cmd == "discover":
+                scope = _types(args.types)
+                results = run(bank_codes=banks, scope=scope, since=args.since,
+                              dry_run=not args.download, max_rounds=args.rounds,
+                              native_only=args.native_only, report=report)
+                for code, counts in results.items():
+                    print(f"{code}: {counts}")
 
-    if args.cmd == "bis-sitemap":
-        years = _years(args.years) if args.years else None
-        since = date(min(years), 1, 1) if years else None
-        until = date(max(years), 12, 31) if years else None
-        only = set(banks) if banks else None
-        counts = run_bis_sitemap(
-            since=since, until=until, only_banks=only,
-            dry_run=not args.download, max_per_year=args.max_per_year,
-        )
-        print("bis-sitemap:", counts)
-        return 0
+            elif args.cmd == "bis-sitemap":
+                years = _years(args.years) if args.years else None
+                since = date(min(years), 1, 1) if years else None
+                until = date(max(years), 12, 31) if years else None
+                only = set(banks) if banks else None
+                counts = run_bis_sitemap(
+                    since=since, until=until, only_banks=only,
+                    dry_run=not args.download, max_per_year=args.max_per_year,
+                    report=report,
+                )
+                print("bis-sitemap:", counts)
 
-    if args.cmd == "repec":
-        results = run_repec(bank_codes=banks, dry_run=not args.download,
-                            incremental=args.incremental)
-        for code, counts in results.items():
-            print(f"{code}: {counts}")
-        return 0
+            elif args.cmd == "repec":
+                results = run_repec(bank_codes=banks, dry_run=not args.download,
+                                    incremental=args.incremental, report=report)
+                for code, counts in results.items():
+                    print(f"{code}: {counts}")
+        except Exception as exc:
+            rc = report.finish(fatal=f"{type(exc).__name__}: {exc}")
+            report.write(str(_runs_path()))
+            return rc
+        rc = report.finish()
+        report.write(str(_runs_path()))
+        return rc
 
     if args.cmd == "reindex-from-disk":
         years = _years(args.years) if args.years else None

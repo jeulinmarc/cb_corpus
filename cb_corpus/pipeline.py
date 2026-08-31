@@ -11,6 +11,7 @@ from .banks import BIS_63
 from .config import Config
 from .http import Fetcher
 from .models import DocRecord
+from .runreport import RunReport
 from .sources.bis_speeches import BISSpeechIndex, parse_detail
 from .sources.recovery import Source
 from .storage import Storage
@@ -53,20 +54,53 @@ def _record_discovery_errors(cfg: Config, errors: list[dict]) -> None:
             fh.write(json.dumps(e, ensure_ascii=False) + "\n")
 
 
+def _discover_and_save_bank(code: str, fetcher: Fetcher, storage: Storage,
+                            scope: tuple[DocType, ...], since: Optional[date],
+                            dry_run: bool, native_only: bool,
+                            report: Optional[RunReport]) -> tuple[dict[str, int], list[dict]]:
+    """One bank's discover_all -> save_many, optionally folding the outcome
+    into `report`'s per-source stats. Raises on adapter/storage failure —
+    callers decide whether that's fatal (report is None) or per-bank
+    recoverable (report is not None, caller wraps in try/except)."""
+    adapter = get_adapter(code, fetcher)
+    # Let native discovery skip documents already known by URL (incl.
+    # alt_urls registered by migrations/data fixes, e.g. WP v3's native-URL
+    # registration or the ECB D3 double-slash legacy rows) so a native-first
+    # bank doesn't re-download/re-fetch its back-catalogue. Every native
+    # branch reads this hook (see adapters/base.py `discover()`); C1 (shared
+    # BIS index) and non-native RePEc D1/D2 are unaffected.
+    adapter._skip_known_url = storage.is_known_url
+    recs = adapter.discover_all(scope=scope, since=since, native_only=native_only)
+    counts = storage.save_many(recs, dry_run=dry_run, label=code)
+    if report is not None:
+        s = report.source(code)
+        s.record_saved_counts(counts)
+        for e in adapter.errors:
+            s.record_fetch_error(f"{e.get('context', '?')}: {e.get('error', str(e))}" if isinstance(e, dict) else str(e))
+    return counts, adapter.errors
+
+
 def run(bank_codes: Optional[Iterable[str]] = None,
         scope: tuple[DocType, ...] = FULL_SCOPE,
         since: Optional[date] = None,
         dry_run: bool = True,
         config: Optional[Config] = None,
         max_rounds: int = 1,
-        native_only: bool = False) -> dict[str, dict[str, int]]:
+        native_only: bool = False,
+        report: Optional[RunReport] = None) -> dict[str, dict[str, int]]:
     """Crawl + (optionally) download. dry_run=True only indexes URLs.
 
     With ``max_rounds > 1`` the crawl repeats until a round downloads nothing
-    new AND reports no errors (download + discovery), or the cap is reached.
-    Because saving is idempotent (dedup on doc_id + sha256), re-running only
-    fills gaps left by transient failures — this is what makes a full rebuild
-    converge to completeness instead of silently stopping one blip short.
+    new AND reports no errors (download + discovery) AND no bank crashed, or
+    the cap is reached. Because saving is idempotent (dedup on doc_id +
+    sha256), re-running only fills gaps left by transient failures — this is
+    what makes a full rebuild converge to completeness instead of silently
+    stopping one blip short.
+
+    Note: when ``report`` is given, its per-source stats ACCUMULATE across
+    every round (a history of everything seen this run), not just the final
+    round's outcome — a bank that crashed in round 1 and succeeded in round 2
+    still shows round 1's crash in the report, by design (it happened).
 
     Returns {bank_code: {status: count}} for the last round. Any unresolved
     discovery failures are written to ``data/discovery_errors.jsonl``.
@@ -79,32 +113,41 @@ def run(bank_codes: Optional[Iterable[str]] = None,
     round_no = 0
     last_disc_errors: list[dict] = []
     for round_no in range(1, rounds + 1):
-        round_saved = round_errors = 0
+        round_saved = round_errors = round_crashes = 0
         last_disc_errors = []
         for code in codes:
-            adapter = get_adapter(code, fetcher)
-            # Let native discovery skip documents already known by URL (incl.
-            # alt_urls registered by migrations/data fixes, e.g. WP v3's native-URL
-            # registration or the ECB D3 double-slash legacy rows) so a native-first
-            # bank doesn't re-download/re-fetch its back-catalogue. Every native
-            # branch reads this hook (see adapters/base.py `discover()`); C1 (shared
-            # BIS index) and non-native RePEc D1/D2 are unaffected.
-            adapter._skip_known_url = storage.is_known_url
-            recs = adapter.discover_all(scope=scope, since=since,
-                                        native_only=native_only)
-            counts = storage.save_many(recs, dry_run=dry_run, label=code)
+            if report is not None:
+                try:
+                    counts, errs = _discover_and_save_bank(
+                        code, fetcher, storage, scope, since, dry_run,
+                        native_only, report)
+                except Exception as exc:  # noqa: BLE001 — per-bank recoverable
+                    report.source(code).record_fetch_error(
+                        f"adapter crashed: {exc}", truncated=True)
+                    round_crashes += 1
+                    continue
+            else:
+                # report is None: a crash here is NOT caught -- it propagates
+                # out of run() entirely, so there is no round to keep clean
+                # or retry; only the report-gated branch above needs the
+                # crash counter.
+                counts, errs = _discover_and_save_bank(
+                    code, fetcher, storage, scope, since, dry_run,
+                    native_only, report)
             results[code] = counts
             round_saved += counts.get("saved", 0)
             round_errors += counts.get("error", 0)
-            last_disc_errors.extend(adapter.errors)
+            last_disc_errors.extend(errs)
         _record_discovery_errors(cfg, last_disc_errors)
         if rounds > 1:
             print(f"[round {round_no}/{rounds}] saved={round_saved} "
-                  f"errors={round_errors} discovery_failures={len(last_disc_errors)}",
+                  f"errors={round_errors} discovery_failures={len(last_disc_errors)} "
+                  f"crashes={round_crashes}",
                   file=sys.stderr, flush=True)
         if dry_run:
             break
-        if round_saved == 0 and round_errors == 0 and not last_disc_errors:
+        if (round_saved == 0 and round_errors == 0 and round_crashes == 0
+                and not last_disc_errors):
             break
 
     if last_disc_errors or (not dry_run and round_errors):
@@ -120,7 +163,8 @@ def run_bis_sitemap(since: Optional[date] = None,
                     only_banks: Optional[set[str]] = None,
                     dry_run: bool = True,
                     config: Optional[Config] = None,
-                    max_per_year: Optional[int] = None) -> dict[str, int]:
+                    max_per_year: Optional[int] = None,
+                    report: Optional[RunReport] = None) -> dict[str, int]:
     """Discover C1 speeches from BIS yearly sitemaps and (optionally) download.
 
     Single-pass across all 63 banks at once — far faster than per-bank C1
@@ -129,12 +173,16 @@ def run_bis_sitemap(since: Optional[date] = None,
     """
     cfg, fetcher, storage = _make_storage(config)
     bis = BISSpeechIndex(fetcher)
+    stats = report.source("bis-sitemap") if report is not None else None
     recs: Iterator[DocRecord] = bis.discover(
         since=since, until=until, only_banks=only_banks,
         max_per_year=max_per_year,
         skip_url=storage.is_known_url,
+        stats=stats,
     )
-    return storage.save_many(recs, dry_run=dry_run, label="bis-sitemap")
+    counts = storage.save_many(recs, dry_run=dry_run, label="bis-sitemap")
+    if stats is not None: stats.record_saved_counts(counts)
+    return counts
 
 
 def _disk_missing_index(storage: Storage, raw,
@@ -363,7 +411,8 @@ def reindex_bis_from_disk(only_banks: Optional[set[str]] = None,
 def run_repec(bank_codes: Optional[Iterable[str]] = None,
               dry_run: bool = True,
               config: Optional[Config] = None,
-              incremental: bool = False) -> dict[str, dict[str, int]]:
+              incremental: bool = False,
+              report: Optional[RunReport] = None) -> dict[str, dict[str, int]]:
     """Discover + (optionally) download RePEc working papers (D1/D2) for every
     SERIES-wired bank, following IDEAS pagination so the full back-catalogue is
     captured (not just the ~200 newest per series).
@@ -385,18 +434,37 @@ def run_repec(bank_codes: Optional[Iterable[str]] = None,
     for code in codes:
         if code not in SERIES:
             continue
-        results[code] = storage.save_many(
-            rep.discover_bank(
-                code,
-                # Always skip by source_url: in RePEc the tested URL IS the
-                # record's own source_url (one paper page, one record), so
-                # this pre-fetch skip is collision-free by construction, in
-                # both modes. stop_on_known stays incremental-only: full
-                # sweeps keep full pagination for completeness, they just
-                # stop re-fetching pages of papers already owned.
-                skip_url=storage.is_known_source_url,
-                stop_on_known=incremental),
-            dry_run=dry_run, label=f"repec:{code}")
+        if report is not None:
+            try:
+                counts = storage.save_many(
+                    rep.discover_bank(
+                        code,
+                        # Always skip by source_url: in RePEc the tested URL IS the
+                        # record's own source_url (one paper page, one record), so
+                        # this pre-fetch skip is collision-free by construction, in
+                        # both modes. stop_on_known stays incremental-only: full
+                        # sweeps keep full pagination for completeness, they just
+                        # stop re-fetching pages of papers already owned.
+                        skip_url=storage.is_known_source_url,
+                        stop_on_known=incremental,
+                        # Threaded down to _series_paper_pages: a listing-page
+                        # fetch failure is recorded as truncation, never a
+                        # silent "last page reached" (see repec.py).
+                        stats=report.source(code)),
+                    dry_run=dry_run, label=f"repec:{code}")
+            except Exception as exc:  # noqa: BLE001 — per-bank recoverable
+                report.source(code).record_fetch_error(
+                    f"adapter crashed: {exc}", truncated=True)
+                continue
+            results[code] = counts
+            report.source(code).record_saved_counts(counts)
+        else:
+            results[code] = storage.save_many(
+                rep.discover_bank(
+                    code,
+                    skip_url=storage.is_known_source_url,
+                    stop_on_known=incremental),
+                dry_run=dry_run, label=f"repec:{code}")
     return results
 
 
@@ -416,20 +484,28 @@ def run_wayback_recovery(bank_code: str, url_prefix: str, doc_type: DocType,
 
 
 def run_repec_wayback_recovery(bank_code: str, dry_run: bool = False,
-                               config: Optional[Config] = None) -> dict[str, int]:
+                               config: Optional[Config] = None,
+                               report: Optional[RunReport] = None) -> dict[str, int]:
     """Recover RePEc working papers whose official PDF is dead, via the Wayback
     Machine, keying on each paper's EXACT url (for opaque-path sources like the
     Riksbank). Re-discovers the bank, skips papers already saved, and for the
     missing ones adds the archived snapshot as a fallback Storage downloads.
     Dates/titles come from IDEAS; provenance is set to "wayback".
+
+    With `report` given, a `SourceStats` (keyed `repec-wb:<bank_code>`) is
+    threaded down into the re-discovery walk so a listing-page fetch failure
+    is recorded as truncation, exactly like `run_repec` — this re-discovery
+    is IDEAS pagination too, so it must not go silent just because it has no
+    `report` wired by default (`report=None` preserves that prior silence).
     """
     from .sources.repec import RePEcDiscovery
     from .sources.wayback import wayback_for_url
     cfg, fetcher, storage = _make_storage(config)
     rep = RePEcDiscovery(fetcher)
+    stats = report.source(f"repec-wb:{bank_code}") if report is not None else None
 
     def _recs() -> Iterator[DocRecord]:
-        for rec in rep.discover_bank(bank_code):
+        for rec in rep.discover_bank(bank_code, stats=stats):
             # Skip by URL (not doc_id): already-saved papers — incl. ones recovered
             # earlier with a different date precision — share the same pdf_url, so
             # this avoids both re-pinging Wayback and creating date-mismatch dupes.

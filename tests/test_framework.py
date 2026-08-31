@@ -1514,6 +1514,48 @@ def test_pipeline_run_converges_and_records_errors(tmp_path, monkeypatch):
     assert (tmp_path / "discovery_errors.jsonl").exists()
 
 
+def test_pipeline_run_retries_through_an_all_bank_crash_round(tmp_path, monkeypatch):
+    """A round where EVERY bank's get_adapter/discover_all CRASHES is caught
+    per-bank (report-gated except path `continue`s), leaving round_saved==0,
+    round_errors==0 and last_disc_errors==[] -- indistinguishable from a
+    clean round unless crashes are tracked separately. Without that tracking
+    the retry loop would break after round 1 as if nothing was wrong,
+    defeating retries exactly on the global blips (e.g. a DNS outage) they
+    exist for. rounds=3: get_adapter must be called once per bank per round
+    (1 bank x 3 rounds == 3 calls), never stopping early."""
+    from cb_corpus import pipeline as pl
+    from cb_corpus.runreport import RunReport
+
+    calls = {"n": 0}
+
+    def crashing_get_adapter(code, fetcher):
+        calls["n"] += 1
+        raise RuntimeError("adapter construction blew up")
+
+    class FakeStorage:
+        def __init__(self, *a, **k):
+            pass
+
+        def is_known_url(self, url):
+            return False
+
+        def save_many(self, recs, dry_run=False, label=""):
+            list(recs)
+            return {"skip": 0}
+
+    monkeypatch.setattr(pl, "Fetcher", lambda cfg: object())
+    monkeypatch.setattr(pl, "Storage", FakeStorage)
+    monkeypatch.setattr(pl, "get_adapter", crashing_get_adapter)
+
+    cfg = Config(data_dir=tmp_path)
+    report = RunReport("central-bank-corpus", "discover")
+    pl.run(bank_codes=["x"], dry_run=False, config=cfg, max_rounds=3, report=report)
+    # Every round crashes -> never converges -> all 3 rounds run (the cap),
+    # not just 1 (which is what the pre-fix break-as-if-clean bug produced).
+    assert calls["n"] == 3
+    assert report.source("x").fetch_errors == 3
+
+
 def test_fetcher_retries_then_raises(monkeypatch):
     """Fetcher.get retries up to max_retries with backoff, then raises — the
     resilience contract the crawl depends on."""

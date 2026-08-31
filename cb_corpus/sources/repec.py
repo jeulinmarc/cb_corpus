@@ -24,6 +24,7 @@ from bs4 import BeautifulSoup
 from ..banks import get_bank
 from ..http import Fetcher, host_matches
 from ..models import DocRecord
+from ..runreport import SourceStats
 from ..taxonomy import DocType
 
 IDEAS = "https://ideas.repec.org"
@@ -134,13 +135,19 @@ class RePEcDiscovery:
         self.max_items = max_items_per_series
         self.max_pages = max_pages
 
-    def _series_paper_pages(self, handle: str) -> Iterator[list[str]]:
+    def _series_paper_pages(self, handle: str,
+                            stats: Optional[SourceStats] = None) -> Iterator[list[str]]:
         """Per-page paper-page URLs for a series, following IDEAS pagination.
 
         IDEAS caps a series listing at ~200 items per page; older papers live
         on numbered pages (`<handle>2.html`, ...). Pages are yielded newest
         first; the walk ends when a page yields nothing new (last page repeats
         / 404s) or the cap is hit.
+
+        A page-FETCH FAILURE (network error, 5xx, ...) also ends the walk, but
+        with `stats` given it is recorded as `record_fetch_error(..., truncated=True)`
+        first — this must never look like a clean "last page reached" in the
+        run-report; it is a truncated listing, not a completed one.
         """
         base = f"{IDEAS}/s/{handle.replace(':', '/')}"
         seen: set[str] = set()
@@ -148,7 +155,9 @@ class RePEcDiscovery:
             url = f"{base}.html" if page == 1 else f"{base}{page}.html"
             try:
                 html = self.fetcher.get_text(url)
-            except Exception:
+            except Exception as exc:
+                if stats is not None:
+                    stats.record_fetch_error(f"page {page}: {exc}", truncated=True)
                 break
             new = [u for u in parse_series_page(html) if u not in seen]
             if not new:
@@ -171,8 +180,13 @@ class RePEcDiscovery:
 
     def discover_bank(self, bank_code: str,
                       skip_url: Optional[Callable[[str], bool]] = None,
-                      stop_on_known: bool = False) -> Iterator[DocRecord]:
+                      stop_on_known: bool = False,
+                      stats: Optional[SourceStats] = None) -> Iterator[DocRecord]:
         """Yield D1/D2 records for a bank's wired series.
+
+        `stats`, when given, is forwarded to `_series_paper_pages` for every
+        series so a listing-page fetch failure is recorded as truncation
+        (see that method's docstring) rather than silently ending the walk.
 
         `skip_url(paper_page_url)` short-circuits BEFORE the per-paper fetch
         (mirror of the BIS hook). With `stop_on_known`, a listing page whose
@@ -201,7 +215,7 @@ class RePEcDiscovery:
         try:
             for handle, doc_type in SERIES.get(bank_code, []):
                 considered = 0
-                for page_urls in self._series_paper_pages(handle):
+                for page_urls in self._series_paper_pages(handle, stats=stats):
                     remaining = self.max_items - considered
                     if remaining <= 0:
                         break
