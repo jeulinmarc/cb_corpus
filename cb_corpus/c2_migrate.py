@@ -24,9 +24,9 @@ pure metadata correction with zero downloads.
 
 This is the dry-run-by-default report (stdout summary + CSV under
 data/reports/c2_migrate.csv). ``--write`` additionally applies the matched
-changes and atomically rewrites data/manifest/ecb.jsonl (the FULL ecb row
-set -- Storage.rewrite_manifest replaces a bank's file wholesale, so non-C2
-ecb rows are carried through unchanged).
+changes to data/manifest/ecb.jsonl via lock-protected keyed updates
+(Storage.rewrite_manifest -- non-C2 ecb rows and concurrent appends are
+untouched on disk).
 """
 from __future__ import annotations
 
@@ -231,16 +231,13 @@ def run_c2_migrate(cfg: Config, fetcher: Fetcher, write: bool = False) -> dict:
     if write:
         change_by_id = {c["doc_id"]: c for c in changes
                         if c["action"] in ("enriched", "title-diff-kept")}
-        applied = 0
-        new_rows = []
+        updates: dict[str, dict] = {}
         for row in all_ecb_rows:
             c = change_by_id.get(row.get("doc_id"))
             if c is not None:
                 apply_change(row, c)
-                applied += 1
-            new_rows.append(row)
-        n = storage.rewrite_manifest(new_rows)
-        print(f"C2-MIGRATED {applied} row(s) in place; ecb manifest now {n} row(s) total "
+                updates[row["doc_id"]] = row
+        n = storage.rewrite_manifest(updates)
+        print(f"C2-MIGRATED {n} row(s) in place "
               f"(doc_id/pdf_url/sha256/local_path untouched)", file=sys.stderr)
-        summary["applied"] = applied
     return summary

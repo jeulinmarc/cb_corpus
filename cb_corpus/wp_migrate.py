@@ -256,23 +256,17 @@ def run_wp_migrate(bank_codes: Optional[Iterable[str]] = None,
 
     if write and all_changes:
         change_by_id = {c["doc_id"]: c for c in all_changes}
-        before_ids: list[str] = []
-        new_rows: list[dict] = []
-        applied = 0
+        updates: dict[str, dict] = {}
         for row in storage.iter_manifest():
-            before_ids.append(row.get("doc_id"))
             c = change_by_id.get(row.get("doc_id"))
             if c is not None:
                 apply_change(row, c)
-                applied += 1
-            new_rows.append(row)
-        after_ids = [r.get("doc_id") for r in new_rows]
-        # Safety rails: never lose/gain rows; never change identity.
-        assert len(new_rows) == len(before_ids), "row count changed"
-        assert set(after_ids) == set(before_ids), "doc_id set changed"
-        assert applied == len(change_by_id), (
-            f"applied {applied} != {len(change_by_id)} matched (doc_id mismatch?)")
-        n = storage.rewrite_manifest(new_rows)
-        print(f"MIGRATED {applied} row(s) in place; manifest now {n} rows "
+                updates[row["doc_id"]] = row
+        # Safety rails: every change matched a row; every update landed.
+        assert len(updates) == len(change_by_id), (
+            f"matched {len(updates)} != {len(change_by_id)} changes (doc_id mismatch?)")
+        n = storage.rewrite_manifest(updates)
+        assert n == len(updates), f"replaced {n} != {len(updates)} updates"
+        print(f"MIGRATED {n} row(s) in place "
               f"(doc_id/sha256/local_path untouched)", file=sys.stderr)
     return results

@@ -199,9 +199,8 @@ def _build_indexes(storage: Storage, bank: str) -> dict:
     bank-specific number key, normalized title, and normalized pdf/alt URL
     (each -> list of rows), plus the set of source_urls already claimed and
     the bank's key_handle helper. Also returns the FULL row list verbatim
-    (required for a full-row-set ``rewrite_manifest`` write — see its
-    docstring: a bank's file is fully replaced by the rows passed to it, so
-    a write must never be given a filtered subset)."""
+    (kept verbatim so _apply_stamps can build its keyed updates from the same
+    rows the matching phase saw)."""
     by_handle: dict[str, list[dict]] = {}
     by_key: dict = {}
     by_title: dict[str, list[dict]] = {}
@@ -329,21 +328,21 @@ def _walk_entries(bank: str, fetcher: Fetcher, idx: dict, bank_home: str):
 
 
 def _apply_stamps(storage: Storage, all_rows: list[dict], stamps: dict[str, str]) -> None:
-    """Stamp ``source_url`` onto every row in ``all_rows`` whose doc_id is a
-    key of ``stamps``, then rewrite the bank's manifest with the FULL row
-    set. Shared by ``run_repec_reconcile`` (phase 1) and
-    ``run_reconcile_apply`` (phase 2, human-approved) so both write paths go
-    through the identical full-row-set ``storage.rewrite_manifest`` call --
-    see its docstring: a bank's file is fully replaced by the rows given
-    here, so ``all_rows`` must always be the bank's complete row set, never
-    a filtered subset. No-op (no rewrite at all) when ``stamps`` is empty."""
+    """Stamp ``source_url`` onto every row of ``all_rows`` whose doc_id is a
+    key of ``stamps``, then apply exactly those rows via the lock-protected
+    keyed-update path (``Storage.rewrite_manifest``). Shared by
+    ``run_repec_reconcile`` (phase 1) and ``run_reconcile_apply`` (phase 2,
+    human-approved). Rows outside ``stamps`` are untouched on disk, and rows
+    appended concurrently survive (issue #18). No-op when ``stamps`` is empty."""
     if not stamps:
         return
+    updates: dict[str, dict] = {}
     for row in all_rows:
         did = row.get("doc_id")
         if did in stamps:
             row["source_url"] = stamps[did]
-    storage.rewrite_manifest(all_rows)
+            updates[did] = row
+    storage.rewrite_manifest(updates)
 
 
 def run_repec_reconcile(bank_codes: Optional[Iterable[str]] = None,
