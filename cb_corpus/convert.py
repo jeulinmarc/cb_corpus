@@ -15,7 +15,7 @@ from typing import Optional
 
 from .config import Config
 from .htmlpdf import find_chrome, render_url_to_pdf
-from .storage import iter_manifest_rows, write_per_bank
+from .storage import iter_manifest_rows, _write_per_bank_unlocked
 
 
 def _ext_swap(path: Path, new_ext: str) -> Path:
@@ -54,7 +54,7 @@ def convert_existing(config: Optional[Config] = None,
                       file=sys.stderr, flush=True)
 
     if not dry_run:
-        write_per_bank(cfg, rewritten)
+        _write_per_bank_unlocked(cfg, rewritten)
     return counts
 
 

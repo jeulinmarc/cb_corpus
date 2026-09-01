@@ -23,7 +23,7 @@ from typing import Optional
 
 from .config import Config
 from .htmlpdf import find_chrome
-from .storage import iter_manifest_rows, write_per_bank
+from .storage import iter_manifest_rows, _write_per_bank_unlocked
 
 
 def _try_strategy(chrome: str, url: str, output: Path,
@@ -178,7 +178,7 @@ def retry_failed(config: Optional[Config] = None,
             row["mime_type"], row["local_path"], html_path = upd
             if html_path:
                 row["html_path"] = html_path
-    write_per_bank(cfg, fresh_rows)
+    _write_per_bank_unlocked(cfg, fresh_rows)
 
     # Write failed URLs to a file the user can pick up.
     if failures:

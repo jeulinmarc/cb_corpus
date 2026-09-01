@@ -20,7 +20,7 @@ from cb_corpus.cadence import (
 from cb_corpus.cli import main as cli_main
 from cb_corpus.config import Config
 from cb_corpus.models import DocRecord
-from cb_corpus.storage import write_per_bank
+from cb_corpus.storage import _write_per_bank_unlocked
 from cb_corpus.taxonomy import DocType
 
 
@@ -38,7 +38,7 @@ def _rec(bank_code, doc_type, d, **kw) -> DocRecord:
 
 
 def _write(cfg, recs) -> int:
-    return write_per_bank(cfg, [r.to_row() for r in recs])
+    return _write_per_bank_unlocked(cfg, [r.to_row() for r in recs])
 
 
 # -- the critical regression: lumpy quarterly bursts ----------------------

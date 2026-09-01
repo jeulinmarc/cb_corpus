@@ -29,7 +29,7 @@ from typing import Iterable, Optional
 from .config import Config
 from .http import Fetcher
 from .sources.wayback import first_capture
-from .storage import Storage, write_per_bank
+from .storage import Storage, _write_per_bank_unlocked
 from .wp_migrate import normalize_title, repec_handle_from_source_url
 
 _LEGACY_BANKS = ("ecb", "us", "jp", "gb", "de")
@@ -233,7 +233,7 @@ def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
                 row["date_source"] = c["date_source"]
                 applied += 1
             rows.append(row)
-        write_per_bank(cfg, rows)
+        _write_per_bank_unlocked(cfg, rows)
         print(f"wp-dates: applied {applied} day-precision date(s) to the manifest; "
               f"{new_count} new index entr(y/ies) appended to {index_path(cfg)}",
               file=sys.stderr)
