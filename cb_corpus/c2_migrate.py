@@ -210,9 +210,10 @@ def run_c2_migrate(cfg: Config, fetcher: Fetcher, write: bool = False) -> dict:
     Default (``write=False``) is a dry run: writes nothing to the manifest,
     prints a summary and a CSV of every ecb C2 row's disposition under
     data/reports/c2_migrate.csv. With ``write=True`` it additionally applies
-    the matched changes (title/date/alt_urls only) and atomically rewrites
-    data/manifest/ecb.jsonl with the FULL set of ecb rows (non-C2 rows pass
-    through byte-identical). Returns the summary dict.
+    the matched changes (title/date/alt_urls only) to data/manifest/ecb.jsonl
+    via lock-protected keyed updates (Storage.rewrite_manifest -- only the
+    changed rows are replaced; non-C2 ecb rows and concurrent appends are
+    untouched on disk). Returns the summary dict.
     """
     storage = Storage(cfg, fetcher)
     all_ecb_rows = list(storage.iter_manifest("ecb"))
