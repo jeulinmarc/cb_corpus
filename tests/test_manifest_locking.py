@@ -140,3 +140,78 @@ def test_rewrite_manifest_refreshes_indexes(tmp_path):
     upd = dict(rows[0]); upd["pdf_url"] = "https://example.org/NEW.pdf"
     assert st.rewrite_manifest({upd["doc_id"]: upd}) == 1
     assert st.is_known_url("https://example.org/NEW.pdf")
+
+
+# Appender subprocess: sidecar-locked append of one row (what Storage._append
+# does, minus DocRecord ceremony) — used to interleave with a rewrite.
+APPENDER = r"""
+import json, sys
+from pathlib import Path
+from cb_corpus.storage import _locked
+path = Path(sys.argv[1])
+with _locked(path):
+    with path.open("a") as fh:
+        fh.write(json.dumps({"doc_id": sys.argv[2], "bank_code": "xx",
+                             "pdf_url": "https://example.org/race.pdf"}) + "\n")
+"""
+
+
+def test_race_appended_row_survives_rewrite(tmp_path):
+    """THE issue #18 scenario: snapshot -> long 'expensive work' -> another
+    process appends -> write-back. The appended row must survive."""
+    from cb_corpus.storage import apply_row_updates
+    cfg, path, rows = _seed(tmp_path)
+    upd = dict(rows[0]); upd["title"] = "CONVERTED"        # snapshot-based work
+    subprocess.run([sys.executable, "-c", APPENDER, str(path), "race-row"],
+                   check=True)                              # append lands mid-run
+    apply_row_updates(cfg, {upd["doc_id"]: upd})            # write-back
+    ids = {json.loads(l)["doc_id"] for l in path.read_text().splitlines() if l.strip()}
+    assert "race-row" in ids, "concurrently appended row was erased (issue #18)"
+    assert upd["doc_id"] in ids
+
+
+def test_race_harness_detects_the_old_bug(tmp_path):
+    """Mutation-proof the harness: replay the OLD semantics (unlocked full
+    write from a stale snapshot) and assert the harness DOES see the loss.
+    If this stops failing-the-old-way, the race test above proves nothing."""
+    cfg, path, rows = _seed(tmp_path)
+    stale = [dict(r) for r in rows]                         # pre-append snapshot
+    subprocess.run([sys.executable, "-c", APPENDER, str(path), "race-row"],
+                   check=True)
+    tmp = path.with_suffix(".jsonl.tmp")                    # old write_per_bank body
+    with tmp.open("w") as fh:
+        for r in stale:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    import os as _os
+    _os.replace(tmp, path)
+    ids = {json.loads(l)["doc_id"] for l in path.read_text().splitlines() if l.strip()}
+    assert "race-row" not in ids, "old semantics unexpectedly kept the row"
+
+
+def test_rewrite_blocks_while_appender_holds_lock(tmp_path):
+    from cb_corpus.storage import apply_row_updates
+    cfg, path, rows = _seed(tmp_path)
+    upd = dict(rows[0]); upd["title"] = "LOCKED-OUT"
+    hold = 1.0
+    proc = _spawn_holder(path, hold)
+    t0 = time.monotonic()
+    apply_row_updates(cfg, {upd["doc_id"]: upd})
+    elapsed = time.monotonic() - t0
+    proc.wait()
+    assert elapsed >= hold * 0.8, f"rewrite did not wait for the lock ({elapsed:.2f}s)"
+
+
+def test_rewrite_with_torn_tail_under_lock(tmp_path):
+    """Adversarial fixture: bank file ends in a torn line. The rewrite must
+    not deadlock (no nested repair lock), must save the fragment, and must
+    drop the torn line while applying the update."""
+    from cb_corpus.storage import apply_row_updates
+    cfg, path, rows = _seed(tmp_path)
+    with path.open("a") as fh:
+        fh.write('{"doc_id": "torn-')                       # no newline, torn
+    upd = dict(rows[2]); upd["title"] = "OK"
+    n = apply_row_updates(cfg, {upd["doc_id"]: upd})
+    assert n == 1
+    lines = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    assert len(lines) == 3
+    assert path.with_name(path.name + ".torn").exists()
