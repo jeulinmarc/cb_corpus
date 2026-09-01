@@ -266,7 +266,10 @@ def run_wp_migrate(bank_codes: Optional[Iterable[str]] = None,
         assert len(updates) == len(change_by_id), (
             f"matched {len(updates)} != {len(change_by_id)} changes (doc_id mismatch?)")
         n = storage.rewrite_manifest(updates)
-        assert n == len(updates), f"replaced {n} != {len(updates)} updates"
+        assert n >= len(updates), (
+            f"replaced {n} < {len(updates)} updates (>= because a bank file "
+            f"with historical duplicate doc_id lines replaces/counts every "
+            f"matching line)")
         print(f"MIGRATED {n} row(s) in place "
               f"(doc_id/sha256/local_path untouched)", file=sys.stderr)
     return results
