@@ -23,7 +23,7 @@ from typing import Optional
 
 from .config import Config
 from .htmlpdf import find_chrome
-from .storage import iter_manifest_rows, write_per_bank
+from .storage import iter_manifest_rows, apply_row_updates
 
 
 def _try_strategy(chrome: str, url: str, output: Path,
@@ -169,16 +169,19 @@ def retry_failed(config: Optional[Config] = None,
         for td in tmpdirs:
             td.cleanup()
 
-    # Merge updates into a FRESH read of the manifest so concurrent writers
-    # (e.g. convert-html still running) don't get their updates overwritten.
-    fresh_rows = list(iter_manifest_rows(cfg))
-    for row in fresh_rows:
-        upd = updates.get(row.get("doc_id"))
-        if upd is not None:
-            row["mime_type"], row["local_path"], html_path = upd
-            if html_path:
-                row["html_path"] = html_path
-    write_per_bank(cfg, fresh_rows)
+    # Keyed, lock-protected write-back (storage.apply_row_updates): replaces
+    # the manual fresh-re-read merge this code used to do — that pattern
+    # narrowed the race window to milliseconds but never closed it (#18).
+    row_by_id = {r.get("doc_id"): r for r in rows}
+    row_updates: dict[str, dict] = {}
+    for did, (mime, local, html_path) in updates.items():
+        row = row_by_id[did]
+        row["mime_type"], row["local_path"] = mime, local
+        if html_path:
+            row["html_path"] = html_path
+        row_updates[did] = row
+    if row_updates:
+        apply_row_updates(cfg, row_updates)
 
     # Write failed URLs to a file the user can pick up.
     if failures:

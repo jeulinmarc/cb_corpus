@@ -19,6 +19,7 @@ content sha256.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -34,6 +35,28 @@ from .http import Fetcher
 from .htmlpdf import render_url_to_pdf
 from .models import DocRecord
 from .quarantine import Quarantine
+
+
+@contextlib.contextmanager
+def _locked(data_file: Path):
+    """Exclusive flock on the SIDECAR lock file of `data_file`.
+
+    The data file's inode changes on every rewrite (temp + os.replace), so a
+    flock on the data file itself cannot give mutual exclusion between
+    appenders and rewriters — an appender can hold a lock on the OLD inode
+    while a rewriter swaps in a new one, orphaning the appended bytes
+    (issue #18). The sidecar (`.<name>.lock`, created on demand, never
+    replaced or deleted) has a stable inode. Every manifest write path —
+    _append(), _repair_torn_tail(), apply_row_updates() — takes this lock.
+    """
+    lock = data_file.with_name("." + data_file.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 _EXT_FOR_MIME = {
@@ -79,13 +102,37 @@ def _manifest_files(cfg: Config, bank_code: Optional[str] = None) -> list[Path]:
     return [cfg.manifest_path] if cfg.manifest_path.exists() else []
 
 
-def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
+def _repair_torn_tail(f: Path, offset: int, *, expected_ino: int,
+                      expected_size: int) -> list[dict]:
     """A malformed FINAL line, as seen by the caller's UNLOCKED first read, is
     presumed to be a torn append (SIGKILL/ENOSPC mid-write). But `_append()`
     (another process, same or different bank writer) or a concurrent repair
     could have completed or extended that very tail since that unlocked read
-    — so before touching the file we take an exclusive flock and RE-READ the
-    tail (from `offset` to current EOF) under the lock:
+    — so before touching the file we take the bank's exclusive SIDECAR lock
+    (see _locked — a flock on the data file itself is unsound across
+    os.replace) and RE-READ the tail (from `offset` to current EOF) under the
+    lock.
+
+    Stale-offset guard: `offset` was computed against the file AS READ by the
+    caller, identified by `expected_ino`/`expected_size` (captured at that
+    unlocked read). A concurrent `apply_row_updates()` may have os.replace'd
+    the file in the meantime — new inode, shifted byte offsets — so a stale
+    `offset` can point MID-LINE into the new file, and truncating there would
+    destroy valid rows. Therefore, after acquiring the lock and opening the
+    file, we validate BEFORE any truncation decision:
+
+      - the open fd's inode must equal `expected_ino`. If not, the file was
+        rewritten by a locked rewriter, which already dropped/handled any
+        torn tail -> return [] WITHOUT touching the file (the caller keeps
+        the prefix rows it already read; the fresh state is seen on the next
+        read — same philosophy as the "race with an in-flight writer" case
+        below).
+      - `offset` must lie within both `expected_size` and the current size,
+        and (when > 0) sit on a line boundary: the byte at `offset-1` must
+        be a newline. If not, the offset is stale -> return [] without
+        touching the file.
+
+    When the guards pass, the under-lock tail re-read proceeds:
 
       - if every line in the freshly re-read tail now parses as valid JSON,
         the earlier "torn" observation was just a race with an in-flight
@@ -101,9 +148,9 @@ def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
     Order matters for the repair itself: the fragment is written FIRST, so a
     crash between the two steps never loses data — worst case the next run
     re-detects the same torn tail (torn_path.write_bytes is idempotent/
-    overwriting). Holding the lock for the whole re-read+repair also blocks a
-    concurrent `_append()` (which takes the same flock) from writing into the
-    file while we decide/truncate.
+    overwriting). Holding the sidecar lock for the whole re-read+repair also
+    blocks a concurrent `_append()` and apply_row_updates() (which take the
+    same lock) from writing into the file while we decide/truncate.
 
     The lock only serializes the truncate DECISION, not the writes that can
     land in the caller's earlier unlocked-read window: an `_append()` that
@@ -113,8 +160,16 @@ def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
     reconverge on the next run via stable-key dedup, not via this repair.
     """
     rows: list[dict] = []
-    with f.open("r+b") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+    with _locked(f), f.open("r+b") as fh:
+        st = os.fstat(fh.fileno())
+        if st.st_ino != expected_ino:
+            return rows            # file rewritten (os.replace) since our read
+        if offset > expected_size or offset > st.st_size:
+            return rows            # stale offset: beyond the file we can trust
+        if offset > 0:
+            fh.seek(offset - 1)
+            if fh.read(1) != b"\n":
+                return rows        # stale offset: not on a line boundary
         fh.seek(offset)
         tail = fh.read()
         local_offset = offset
@@ -154,7 +209,14 @@ def _iter_manifest_file(f: Path) -> Iterator[dict]:
     (`UnicodeDecodeError` — `json.loads` decodes `bytes` internally before
     parsing); both are torn-append symptoms and are handled identically.
     """
-    raw = f.read_bytes()
+    # Capture the file's identity (inode, size) on the very fd the bytes are
+    # read from: _repair_torn_tail uses it to detect that an os.replace by a
+    # locked rewriter landed between this unlocked read and the repair lock,
+    # in which case a byte offset computed here would be stale (see its
+    # stale-offset guard).
+    with f.open("rb") as _fh:
+        st = os.fstat(_fh.fileno())
+        raw = _fh.read()
     if not raw:
         return
     lines = raw.splitlines(keepends=True)
@@ -176,7 +238,9 @@ def _iter_manifest_file(f: Path) -> Iterator[dict]:
             rows.append(json.loads(stripped))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             if i == last_content_idx:
-                rows.extend(_repair_torn_tail(f, offset))
+                rows.extend(_repair_torn_tail(
+                    f, offset,
+                    expected_ino=st.st_ino, expected_size=st.st_size))
                 break
             raise ValueError(
                 f"corrupt manifest line (not the final line -> not a torn "
@@ -226,8 +290,12 @@ def migrate_legacy_layout(cfg: Config) -> int:
     return len(by_bank)
 
 
-def write_per_bank(cfg: Config, rows: Iterable[dict]) -> int:
-    """Atomically (re)write the per-bank files for every bank present in `rows`
+def _write_per_bank_unlocked(cfg: Config, rows: Iterable[dict]) -> int:
+    """UNLOCKED full-file writer — callers MUST either hold the sidecar lock
+    (apply_row_updates) or be single-writer by construction (migrate_legacy_layout,
+    test fixtures). Everything else goes through apply_row_updates.
+
+    Atomically (re)write the per-bank files for every bank present in `rows`
     (temp file + os.replace per bank). Returns the number of rows written."""
     migrate_legacy_layout(cfg)               # never let a legacy file shadow a write
     by_bank: dict[str, list[dict]] = {}
@@ -244,6 +312,100 @@ def write_per_bank(cfg: Config, rows: Iterable[dict]) -> int:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         os.replace(tmp, path)
     return n
+
+
+def _read_rows_for_rewrite(f: Path) -> list[tuple[str, Optional[str]]]:
+    """Fresh under-lock read for apply_row_updates: (raw_line, doc_id) pairs.
+
+    Raw lines (newline stripped) let untouched rows be rewritten
+    byte-identically — no parse/re-serialize round trip. MUST be called with
+    the bank's sidecar lock held; deliberately does NOT delegate to
+    _iter_manifest_file: its torn-tail repair takes the same sidecar lock,
+    and a second flock on another fd of the same process self-deadlocks.
+    A malformed FINAL line is a torn append: the fragment is saved to
+    `<file>.torn` and the line dropped — the caller's full rewrite replaces
+    the file, which IS the truncation. Exception: when the file contains
+    ONLY the torn line, no pairs remain, apply_row_updates skips the rewrite
+    (`if pairs:`) and the torn line stays on disk — the next reader's
+    torn-tail repair handles it. A malformed NON-final line raises
+    ValueError (real corruption, hard stop — same policy as
+    _iter_manifest_file).
+    """
+    out: list[tuple[str, Optional[str]]] = []
+    if not f.exists():
+        return out
+    raw = f.read_bytes()
+    lines = raw.splitlines(keepends=True)
+    last_content_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip():
+            last_content_idx = i
+    for i, ln in enumerate(lines):
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            if i == last_content_idx:
+                torn_path = f.with_name(f.name + ".torn")
+                torn_path.write_bytes(ln)
+                print(f"[storage] WARNING: torn manifest tail dropped during "
+                      f"rewrite: {f} (fragment saved to {torn_path})",
+                      file=sys.stderr, flush=True)
+                break
+            raise ValueError(
+                f"corrupt manifest line (not the final line -> not a torn "
+                f"append, hard stop): {f}:{i + 1}: {exc}") from exc
+        out.append((stripped.decode("utf-8"), row.get("doc_id")))
+    return out
+
+
+def apply_row_updates(cfg: Config, updates: Mapping[str, dict]) -> int:
+    """Lock-protected keyed rewrite of manifest rows (issue #18).
+
+    `updates`: doc_id -> full replacement row (row's `bank_code` selects the
+    bank file). Per bank, under the sidecar lock: re-read fresh, replace rows
+    whose doc_id is in `updates`, keep every other line VERBATIM — including
+    rows appended after the caller built its snapshot — then temp+os.replace.
+    Expensive work (renders, network) belongs BEFORE this call, outside the
+    lock. Deletions are not supported (no caller deletes; future deletes need
+    explicit tombstones). doc_ids not found on disk are skipped with a
+    warning. Banks are processed sequentially (one lock at a time); a crash
+    between banks leaves a partial, idempotent state. Returns the number of
+    rows replaced.
+    """
+    if not updates:
+        return 0
+    by_bank: dict[str, dict[str, dict]] = {}
+    for did, row in updates.items():
+        bank = row.get("bank_code") or "_unknown"
+        by_bank.setdefault(bank, {})[did] = row
+    migrate_legacy_layout(cfg)           # never let a legacy file shadow a write
+    replaced = 0
+    for bank in sorted(by_bank):
+        bank_updates = by_bank[bank]
+        path = cfg.manifest_file(bank)
+        seen: set[str] = set()
+        with _locked(path):
+            pairs = _read_rows_for_rewrite(path)
+            if pairs:
+                tmp = path.with_suffix(".jsonl.tmp")
+                with tmp.open("w") as fh:
+                    for raw, did in pairs:
+                        upd = bank_updates.get(did) if did else None
+                        if upd is not None:
+                            fh.write(json.dumps(upd, ensure_ascii=False) + "\n")
+                            seen.add(did)
+                            replaced += 1
+                        else:
+                            fh.write(raw + "\n")
+                os.replace(tmp, path)
+        for did in sorted(bank_updates.keys() - seen):
+            print(f"[storage] WARNING: apply_row_updates: doc_id {did!r} not "
+                  f"found in {path.name}; update skipped",
+                  file=sys.stderr, flush=True)
+    return replaced
 
 
 def _sweep_chrome_profiles(data_dir: Path, keep: Path) -> None:
@@ -347,29 +509,23 @@ class Storage:
     def _append(self, rec: DocRecord) -> None:
         path = self.cfg.manifest_file(rec.bank_code)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Exclusive same-host flock: mutual exclusion with (a) another
-        # process's _append() on this same bank file, and (b) the torn-tail
-        # repair path (_repair_torn_tail), which takes the same lock before
-        # deciding whether to truncate this file. Released implicitly when
-        # `fh` closes.
-        with path.open("a") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            fh.write(json.dumps(rec.to_row(), ensure_ascii=False) + "\n")
+        # Sidecar lock (stable inode): mutual exclusion with (a) another
+        # process's _append() on this bank, (b) the torn-tail repair path,
+        # and (c) apply_row_updates()'s read-merge-replace. A flock on the
+        # data file itself would be unsound — os.replace swaps its inode.
+        with _locked(path):
+            with path.open("a") as fh:
+                fh.write(json.dumps(rec.to_row(), ensure_ascii=False) + "\n")
 
-    def rewrite_manifest(self, rows: Iterable[dict]) -> int:
-        """Atomically (re)write the per-bank manifest files for the banks present
-        in `rows` (already-serialized dicts), grouping by `bank_code`.
-
-        For in-place metadata rewrites (e.g. the WP v3 date migration) the manifest
-        must be rewritten, not appended. Each bank file is written to a temp file
-        and `os.replace`-d, so a crash mid-write leaves the previous files intact.
-
-        Callers own the row contents (no merging). Pass the FULL set of rows for
-        each bank you touch — a bank's file is fully replaced by its rows here.
-        Returns the number of rows written and refreshes the in-memory dedup
-        indexes so a long-lived Storage stays consistent with disk.
+    def rewrite_manifest(self, updates: Mapping[str, dict]) -> int:
+        """Apply keyed row updates under the per-bank sidecar lock (see
+        apply_row_updates) and refresh the in-memory dedup indexes so a
+        long-lived Storage stays consistent with disk. `updates`:
+        doc_id -> full replacement row. Rows not in `updates` — including
+        rows appended concurrently — are preserved verbatim. Returns the
+        number of rows replaced.
         """
-        n = write_per_bank(self.cfg, rows)
+        n = apply_row_updates(self.cfg, updates)
         self._ids.clear(); self._hash_docid.clear(); self._urls.clear()
         self._source_urls.clear()
         self._load_existing()
@@ -388,20 +544,16 @@ class Storage:
         rewritten). Unknown doc_ids are silently ignored (defensive; the
         caller logs totals, this method doesn't need to explain a no-match).
 
-        Only the bank file(s) that actually changed are rewritten, in ONE
-        `rewrite_manifest` call covering all of them together (never a
-        rewrite per row). Returns `(urls_stamped, rows_modified)`; `(0, 0)`
-        means nothing changed and no rewrite happened at all.
+        Only rows that actually changed are rewritten, in ONE
+        rewrite_manifest call (lock-protected keyed updates). Returns
+        (urls_stamped, rows_modified); (0, 0) means nothing changed and no
+        rewrite happened at all.
         """
         if not stamps:
             return (0, 0)
-        by_bank: dict[str, list[dict]] = {}
-        touched_banks: set[str] = set()
+        updates: dict[str, dict] = {}
         stamped = 0
-        rows_modified = 0
         for row in self.iter_manifest():
-            bank = row.get("bank_code") or "_unknown"
-            by_bank.setdefault(bank, []).append(row)
             urls = stamps.get(row.get("doc_id"))
             if not urls:
                 continue
@@ -414,13 +566,11 @@ class Storage:
                 stamped += 1
             if alt_urls != (row.get("alt_urls") or []):
                 row["alt_urls"] = alt_urls
-                rows_modified += 1
-                touched_banks.add(bank)
+                updates[row["doc_id"]] = row
         if stamped == 0:
             return (0, 0)
-        rows_to_write = [r for bank in touched_banks for r in by_bank[bank]]
-        self.rewrite_manifest(rows_to_write)
-        return (stamped, rows_modified)
+        self.rewrite_manifest(updates)
+        return (stamped, len(updates))
 
     # -- paths -----------------------------------------------------------
     def target_path(self, rec: DocRecord) -> Path:

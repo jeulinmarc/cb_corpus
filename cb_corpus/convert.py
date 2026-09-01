@@ -15,7 +15,7 @@ from typing import Optional
 
 from .config import Config
 from .htmlpdf import find_chrome, render_url_to_pdf
-from .storage import iter_manifest_rows, write_per_bank
+from .storage import iter_manifest_rows, apply_row_updates
 
 
 def _ext_swap(path: Path, new_ext: str) -> Path:
@@ -36,25 +36,30 @@ def convert_existing(config: Optional[Config] = None,
     cfg = config or Config()
     if find_chrome() is None:
         raise RuntimeError("no Chrome / Chromium binary found")
-    rewritten: list[dict] = list(iter_manifest_rows(cfg))
-    if not rewritten:
+    snapshot: list[dict] = list(iter_manifest_rows(cfg))
+    if not snapshot:
         return {"empty": 0}
 
     counts: dict[str, int] = {}
+    updates: dict[str, dict] = {}
     n = 0
     # One Chrome profile reused across renders — avoids per-call cold-start
     # (10x speedup vs fresh tempdir per render).
     with tempfile.TemporaryDirectory(prefix="cbc_chrome_convert_") as udd:
-        for row in rewritten:
+        for row in snapshot:
             status = _convert_one(row, user_data_dir=udd, dry_run=dry_run)
             counts[status] = counts.get(status, 0) + 1
+            if status == "converted" and not dry_run:
+                updates[row["doc_id"]] = row
             n += 1
             if n % 50 == 0:
                 print(f"[convert-html] processed {n} ({dict(counts)})",
                       file=sys.stderr, flush=True)
 
-    if not dry_run:
-        write_per_bank(cfg, rewritten)
+    if not dry_run and updates:
+        # Keyed, lock-protected write-back: rows appended during the (hours
+        # long) render loop above survive — see storage.apply_row_updates.
+        apply_row_updates(cfg, updates)
     return counts
 
 

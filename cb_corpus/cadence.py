@@ -161,7 +161,8 @@ def compute_series(cfg: Config, *, today: Optional[date] = None) -> list[dict]:
 
 def write_cadence_jsonl(cfg: Config, entries: Iterable[dict]) -> Path:
     """Atomically (re)write `data/cadence.jsonl` as the full current snapshot
-    (temp file + os.replace, mirroring storage.py's write_per_bank) -- this
+    (temp file + os.replace, mirroring storage.py's per-bank write pattern,
+    `_write_per_bank_unlocked`) -- this
     is a regenerated-weekly report, not an append-only log, so each run
     fully replaces the prior contents."""
     path = cfg.data_dir / "cadence.jsonl"

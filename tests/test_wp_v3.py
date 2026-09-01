@@ -75,24 +75,43 @@ def test_load_existing_tolerates_null_alt_urls(tmp_path):
 def test_rewrite_manifest_is_atomic_and_idempotent(tmp_path):
     cfg = Config(data_dir=tmp_path)
     st = Storage(cfg)
-    rows = [
+    # Under the keyed-update contract, rewrite_manifest only ever REPLACES
+    # rows that already exist on disk -- it never conjures new ones (see
+    # apply_row_updates) -- so the manifest must be seeded first.
+    seed = [
         {"doc_id": "a", "bank_code": "ecb", "doc_type": "D1",
-         "pdf_url": "https://x/a.pdf", "alt_urls": ["https://x/a-alt.pdf"], "date": "2020-01-02"},
+         "pdf_url": "https://x/a.pdf", "alt_urls": [], "date": "2020-01-02"},
         {"doc_id": "b", "bank_code": "ecb", "doc_type": "D2",
          "pdf_url": "https://x/b.pdf", "alt_urls": [], "date": "2021-03-04"},
+        {"doc_id": "c", "bank_code": "ecb", "doc_type": "D1",
+         "pdf_url": "https://x/c.pdf", "alt_urls": [], "date": "2022-05-06"},
     ]
-    assert st.rewrite_manifest(rows) == 2
-    # rows go to the per-bank file data/manifest/ecb.jsonl
     ecb_file = cfg.manifest_file("ecb")
+    ecb_file.parent.mkdir(parents=True, exist_ok=True)
+    with ecb_file.open("w") as fh:
+        for r in seed:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    updates = {
+        "a": {**seed[0], "alt_urls": ["https://x/a-alt.pdf"]},
+        "b": {**seed[1], "alt_urls": ["https://x/b-alt.pdf"]},
+    }
+    # "c" is deliberately left out of `updates`: the keyed-contract stand-in
+    # for the old test's full-row-set replacement semantics (no longer
+    # expressible -- rewrite_manifest never replaces the whole file) is that
+    # rows NOT in `updates` survive verbatim.
+    assert st.rewrite_manifest(updates) == 2
+    # rows go to the per-bank file data/manifest/ecb.jsonl
     on_disk = [json.loads(l) for l in ecb_file.read_text().splitlines() if l.strip()]
-    assert on_disk == rows
+    assert on_disk == [updates["a"], updates["b"], seed[2]]
     assert not ecb_file.with_suffix(".jsonl.tmp").exists()
     # dedup indexes refreshed from the new content, incl. alt_urls
-    assert st.is_known_url("https://x/a.pdf") and st.is_known_url("https://x/a-alt.pdf")
-    # idempotent: rewriting the same rows yields the same file
-    st.rewrite_manifest(rows)
-    again = [json.loads(l) for l in ecb_file.read_text().splitlines() if l.strip()]
-    assert again == rows
+    assert st.is_known_url("https://x/a-alt.pdf") and st.is_known_url("https://x/b-alt.pdf")
+    # idempotent: re-applying the same updates leaves the file byte-identical
+    before = ecb_file.read_text()
+    assert st.rewrite_manifest(updates) == 2
+    assert ecb_file.read_text() == before
+    assert not ecb_file.with_suffix(".jsonl.tmp").exists()
 
 
 # ---- ECB foedb parsers ----------------------------------------------

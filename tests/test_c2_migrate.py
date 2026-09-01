@@ -225,8 +225,10 @@ def test_c2_migrate_matches_known_rehash(tmp_path, monkeypatch):
 
 
 def test_c2_migrate_non_c2_ecb_rows_pass_through_unchanged(tmp_path, monkeypatch):
-    """rewrite_manifest replaces a bank's file wholesale -- a non-C2 ecb row
-    must survive the --write pass byte-for-byte (no schema fields injected)."""
+    """rewrite_manifest applies keyed updates: only rows whose doc_id is in
+    the update set are replaced, every other line is preserved on disk -- so
+    a non-C2 ecb row must survive the --write pass byte-for-byte (no schema
+    fields injected)."""
     monkeypatch.setattr(c2_migrate, "discover_ecb_interviews",
                         lambda fetcher, since=None: iter([]))
 

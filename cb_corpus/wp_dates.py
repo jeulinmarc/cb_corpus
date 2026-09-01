@@ -29,7 +29,7 @@ from typing import Iterable, Optional
 from .config import Config
 from .http import Fetcher
 from .sources.wayback import first_capture
-from .storage import Storage, write_per_bank
+from .storage import Storage, apply_row_updates
 from .wp_migrate import normalize_title, repec_handle_from_source_url
 
 _LEGACY_BANKS = ("ecb", "us", "jp", "gb", "de")
@@ -222,8 +222,7 @@ def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
         print(f"wrote {len(by_id)} resolution(s) -> {out}", file=sys.stderr)
 
     if write and by_id:
-        rows = []
-        applied = 0
+        updates: dict[str, dict] = {}
         for row in storage.iter_manifest():
             c = by_id.get(row.get("doc_id"))
             if c is not None:
@@ -231,9 +230,8 @@ def run_wp_dates(bank_codes: Optional[Iterable[str]] = None,
                 row["year"] = int(c["date"][:4])
                 row["date_precision"] = "day"
                 row["date_source"] = c["date_source"]
-                applied += 1
-            rows.append(row)
-        write_per_bank(cfg, rows)
+                updates[row["doc_id"]] = row
+        applied = apply_row_updates(cfg, updates)
         print(f"wp-dates: applied {applied} day-precision date(s) to the manifest; "
               f"{new_count} new index entr(y/ies) appended to {index_path(cfg)}",
               file=sys.stderr)
