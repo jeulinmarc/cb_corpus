@@ -241,4 +241,5 @@ def run_c2_migrate(cfg: Config, fetcher: Fetcher, write: bool = False) -> dict:
         n = storage.rewrite_manifest(updates)
         print(f"C2-MIGRATED {n} row(s) in place "
               f"(doc_id/pdf_url/sha256/local_path untouched)", file=sys.stderr)
+        summary["applied"] = n
     return summary
