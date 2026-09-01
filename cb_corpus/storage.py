@@ -102,13 +102,37 @@ def _manifest_files(cfg: Config, bank_code: Optional[str] = None) -> list[Path]:
     return [cfg.manifest_path] if cfg.manifest_path.exists() else []
 
 
-def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
+def _repair_torn_tail(f: Path, offset: int, *, expected_ino: int,
+                      expected_size: int) -> list[dict]:
     """A malformed FINAL line, as seen by the caller's UNLOCKED first read, is
     presumed to be a torn append (SIGKILL/ENOSPC mid-write). But `_append()`
     (another process, same or different bank writer) or a concurrent repair
     could have completed or extended that very tail since that unlocked read
-    — so before touching the file we take the bank's exclusive SIDECAR lock (see _locked — a flock on the data file itself is unsound across os.replace) and RE-READ the
-    tail (from `offset` to current EOF) under the lock:
+    — so before touching the file we take the bank's exclusive SIDECAR lock
+    (see _locked — a flock on the data file itself is unsound across
+    os.replace) and RE-READ the tail (from `offset` to current EOF) under the
+    lock.
+
+    Stale-offset guard: `offset` was computed against the file AS READ by the
+    caller, identified by `expected_ino`/`expected_size` (captured at that
+    unlocked read). A concurrent `apply_row_updates()` may have os.replace'd
+    the file in the meantime — new inode, shifted byte offsets — so a stale
+    `offset` can point MID-LINE into the new file, and truncating there would
+    destroy valid rows. Therefore, after acquiring the lock and opening the
+    file, we validate BEFORE any truncation decision:
+
+      - the open fd's inode must equal `expected_ino`. If not, the file was
+        rewritten by a locked rewriter, which already dropped/handled any
+        torn tail -> return [] WITHOUT touching the file (the caller keeps
+        the prefix rows it already read; the fresh state is seen on the next
+        read — same philosophy as the "race with an in-flight writer" case
+        below).
+      - `offset` must lie within both `expected_size` and the current size,
+        and (when > 0) sit on a line boundary: the byte at `offset-1` must
+        be a newline. If not, the offset is stale -> return [] without
+        touching the file.
+
+    When the guards pass, the under-lock tail re-read proceeds:
 
       - if every line in the freshly re-read tail now parses as valid JSON,
         the earlier "torn" observation was just a race with an in-flight
@@ -124,9 +148,9 @@ def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
     Order matters for the repair itself: the fragment is written FIRST, so a
     crash between the two steps never loses data — worst case the next run
     re-detects the same torn tail (torn_path.write_bytes is idempotent/
-    overwriting). Holding the sidecar lock for the whole re-read+repair also blocks a
-    concurrent `_append()` and apply_row_updates() (which take the same lock) from writing into the
-    file while we decide/truncate.
+    overwriting). Holding the sidecar lock for the whole re-read+repair also
+    blocks a concurrent `_append()` and apply_row_updates() (which take the
+    same lock) from writing into the file while we decide/truncate.
 
     The lock only serializes the truncate DECISION, not the writes that can
     land in the caller's earlier unlocked-read window: an `_append()` that
@@ -137,6 +161,15 @@ def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
     """
     rows: list[dict] = []
     with _locked(f), f.open("r+b") as fh:
+        st = os.fstat(fh.fileno())
+        if st.st_ino != expected_ino:
+            return rows            # file rewritten (os.replace) since our read
+        if offset > expected_size or offset > st.st_size:
+            return rows            # stale offset: beyond the file we can trust
+        if offset > 0:
+            fh.seek(offset - 1)
+            if fh.read(1) != b"\n":
+                return rows        # stale offset: not on a line boundary
         fh.seek(offset)
         tail = fh.read()
         local_offset = offset
@@ -176,7 +209,14 @@ def _iter_manifest_file(f: Path) -> Iterator[dict]:
     (`UnicodeDecodeError` — `json.loads` decodes `bytes` internally before
     parsing); both are torn-append symptoms and are handled identically.
     """
-    raw = f.read_bytes()
+    # Capture the file's identity (inode, size) on the very fd the bytes are
+    # read from: _repair_torn_tail uses it to detect that an os.replace by a
+    # locked rewriter landed between this unlocked read and the repair lock,
+    # in which case a byte offset computed here would be stale (see its
+    # stale-offset guard).
+    with f.open("rb") as _fh:
+        st = os.fstat(_fh.fileno())
+        raw = _fh.read()
     if not raw:
         return
     lines = raw.splitlines(keepends=True)
@@ -198,7 +238,9 @@ def _iter_manifest_file(f: Path) -> Iterator[dict]:
             rows.append(json.loads(stripped))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             if i == last_content_idx:
-                rows.extend(_repair_torn_tail(f, offset))
+                rows.extend(_repair_torn_tail(
+                    f, offset,
+                    expected_ino=st.st_ino, expected_size=st.st_size))
                 break
             raise ValueError(
                 f"corrupt manifest line (not the final line -> not a torn "
@@ -282,7 +324,10 @@ def _read_rows_for_rewrite(f: Path) -> list[tuple[str, Optional[str]]]:
     and a second flock on another fd of the same process self-deadlocks.
     A malformed FINAL line is a torn append: the fragment is saved to
     `<file>.torn` and the line dropped — the caller's full rewrite replaces
-    the file, which IS the truncation. A malformed NON-final line raises
+    the file, which IS the truncation. Exception: when the file contains
+    ONLY the torn line, no pairs remain, apply_row_updates skips the rewrite
+    (`if pairs:`) and the torn line stays on disk — the next reader's
+    torn-tail repair handles it. A malformed NON-final line raises
     ValueError (real corruption, hard stop — same policy as
     _iter_manifest_file).
     """

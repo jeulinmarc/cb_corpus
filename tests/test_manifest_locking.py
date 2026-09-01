@@ -217,6 +217,70 @@ def test_rewrite_with_torn_tail_under_lock(tmp_path):
     assert path.with_name(path.name + ".torn").exists()
 
 
+# --- stale-offset guard in _repair_torn_tail (final review, I1) --------------
+# An offset computed by the UNLOCKED read in _iter_manifest_file can go stale
+# if apply_row_updates os.replace's the file before the repair takes the lock:
+# same path, new inode, shifted offsets. Truncating at that stale offset would
+# destroy valid rows of the NEW file. The guard must detect both symptoms
+# (inode mismatch; offset not on a line boundary) and leave the file alone.
+
+def _seed_with_torn_tail(tmp_path):
+    cfg, path, rows = _seed(tmp_path)
+    midline_offset = len(path.read_bytes().splitlines(keepends=True)[0]) - 2
+    with path.open("ab") as fh:
+        fh.write(b'{"doc_id": "torn-')                      # a REAL torn tail
+    return path, midline_offset
+
+
+def test_repair_wrong_inode_leaves_file_untouched(tmp_path):
+    """expected_ino mismatch (file was os.replace'd since the unlocked read)
+    -> no truncation, file byte-identical, no .torn fragment."""
+    from cb_corpus.storage import _repair_torn_tail
+    path, midline_offset = _seed_with_torn_tail(tmp_path)
+    before = path.read_bytes()
+    st = path.stat()
+    got = _repair_torn_tail(path, midline_offset,
+                            expected_ino=st.st_ino + 1,
+                            expected_size=st.st_size)
+    assert got == []
+    assert path.read_bytes() == before, "stale-inode repair truncated the file"
+    assert not path.with_name(path.name + ".torn").exists()
+
+
+def test_repair_midline_offset_leaves_file_untouched(tmp_path):
+    """Correct inode but an offset pointing MID-LINE (byte before it is not a
+    newline) -> stale offset, no truncation, file byte-identical."""
+    from cb_corpus.storage import _repair_torn_tail
+    path, midline_offset = _seed_with_torn_tail(tmp_path)
+    before = path.read_bytes()
+    st = path.stat()
+    got = _repair_torn_tail(path, midline_offset,
+                            expected_ino=st.st_ino,
+                            expected_size=st.st_size)
+    assert got == []
+    assert path.read_bytes() == before, "mid-line offset repair truncated the file"
+    assert not path.with_name(path.name + ".torn").exists()
+
+
+def test_repair_valid_identity_still_truncates(tmp_path):
+    """Positive control: correct inode + line-boundary offset + genuinely torn
+    tail -> the repair truncates as before (guard must not block real repairs).
+    The end-to-end path is also covered by tests/test_torn_manifest.py."""
+    from cb_corpus.storage import _repair_torn_tail
+    cfg, path, rows = _seed(tmp_path)
+    intact = path.read_bytes()
+    with path.open("ab") as fh:
+        fh.write(b'{"doc_id": "torn-')                      # torn, no newline
+    st = path.stat()
+    got = _repair_torn_tail(path, len(intact),              # true line boundary
+                            expected_ino=st.st_ino,
+                            expected_size=st.st_size)
+    assert got == []                                        # torn row dropped
+    assert path.read_bytes() == intact                      # truncated back
+    torn_path = path.with_name(path.name + ".torn")
+    assert torn_path.read_bytes() == b'{"doc_id": "torn-'
+
+
 def test_convert_existing_preserves_concurrent_append(tmp_path, monkeypatch):
     """convert-html's snapshot/write-back must go through apply_row_updates:
     a row appended during the render loop survives."""
