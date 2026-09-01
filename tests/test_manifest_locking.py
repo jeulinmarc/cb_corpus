@@ -226,20 +226,23 @@ def test_rewrite_with_torn_tail_under_lock(tmp_path):
 
 def _seed_with_torn_tail(tmp_path):
     cfg, path, rows = _seed(tmp_path)
+    intact_len = len(path.read_bytes())                     # a true line boundary
     midline_offset = len(path.read_bytes().splitlines(keepends=True)[0]) - 2
     with path.open("ab") as fh:
         fh.write(b'{"doc_id": "torn-')                      # a REAL torn tail
-    return path, midline_offset
+    return path, midline_offset, intact_len
 
 
 def test_repair_wrong_inode_leaves_file_untouched(tmp_path):
     """expected_ino mismatch (file was os.replace'd since the unlocked read)
-    -> no truncation, file byte-identical, no .torn fragment."""
+    -> no truncation, file byte-identical, no .torn fragment. Uses a genuine
+    LINE-BOUNDARY offset so the inode guard alone must do the refusing (a
+    mid-line offset would let the newline guard mask a missing ino check)."""
     from cb_corpus.storage import _repair_torn_tail
-    path, midline_offset = _seed_with_torn_tail(tmp_path)
+    path, _, boundary_offset = _seed_with_torn_tail(tmp_path)
     before = path.read_bytes()
     st = path.stat()
-    got = _repair_torn_tail(path, midline_offset,
+    got = _repair_torn_tail(path, boundary_offset,
                             expected_ino=st.st_ino + 1,
                             expected_size=st.st_size)
     assert got == []
@@ -251,7 +254,7 @@ def test_repair_midline_offset_leaves_file_untouched(tmp_path):
     """Correct inode but an offset pointing MID-LINE (byte before it is not a
     newline) -> stale offset, no truncation, file byte-identical."""
     from cb_corpus.storage import _repair_torn_tail
-    path, midline_offset = _seed_with_torn_tail(tmp_path)
+    path, midline_offset, _ = _seed_with_torn_tail(tmp_path)
     before = path.read_bytes()
     st = path.stat()
     got = _repair_torn_tail(path, midline_offset,
