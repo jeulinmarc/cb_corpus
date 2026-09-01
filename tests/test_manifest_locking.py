@@ -215,3 +215,31 @@ def test_rewrite_with_torn_tail_under_lock(tmp_path):
     lines = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
     assert len(lines) == 3
     assert path.with_name(path.name + ".torn").exists()
+
+
+def test_convert_existing_preserves_concurrent_append(tmp_path, monkeypatch):
+    """convert-html's snapshot/write-back must go through apply_row_updates:
+    a row appended during the render loop survives."""
+    import cb_corpus.convert as convert_mod
+    cfg, path, rows = _seed(tmp_path)
+    # Make row 0 an HTML row with an existing file so _convert_one converts it.
+    html = tmp_path / "doc.html"; html.write_text("<html/>")
+    raws = [json.loads(l) for l in path.read_text().splitlines()]
+    raws[0]["mime_type"] = "text/html"; raws[0]["local_path"] = str(html)
+    with path.open("w") as fh:
+        for r in raws:
+            fh.write(json.dumps(r) + "\n")
+    monkeypatch.setattr(convert_mod, "find_chrome", lambda: "/usr/bin/true")
+
+    def fake_render(url, pdf_path, user_data_dir=None):
+        Path(pdf_path).write_bytes(b"%PDF-1.4 fake")
+        # An append lands while "Chrome" renders — the heart of issue #18.
+        subprocess.run([sys.executable, "-c", APPENDER, str(path), "mid-render"],
+                       check=True)
+    monkeypatch.setattr(convert_mod, "render_url_to_pdf", fake_render)
+
+    counts = convert_mod.convert_existing(config=cfg)
+    assert counts.get("converted") == 1
+    ids = {json.loads(l)["doc_id"] for l in path.read_text().splitlines() if l.strip()}
+    assert "mid-render" in ids, "convert-html erased the row appended mid-render"
+    assert json.loads(path.read_text().splitlines()[0])["mime_type"] == "application/pdf"
