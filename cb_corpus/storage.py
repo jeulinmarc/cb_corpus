@@ -19,6 +19,7 @@ content sha256.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -34,6 +35,28 @@ from .http import Fetcher
 from .htmlpdf import render_url_to_pdf
 from .models import DocRecord
 from .quarantine import Quarantine
+
+
+@contextlib.contextmanager
+def _locked(data_file: Path):
+    """Exclusive flock on the SIDECAR lock file of `data_file`.
+
+    The data file's inode changes on every rewrite (temp + os.replace), so a
+    flock on the data file itself cannot give mutual exclusion between
+    appenders and rewriters — an appender can hold a lock on the OLD inode
+    while a rewriter swaps in a new one, orphaning the appended bytes
+    (issue #18). The sidecar (`.<name>.lock`, created on demand, never
+    replaced or deleted) has a stable inode. Every manifest write path —
+    _append(), _repair_torn_tail(), apply_row_updates() — takes this lock.
+    """
+    lock = data_file.with_name("." + data_file.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 _EXT_FOR_MIME = {
@@ -84,7 +107,7 @@ def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
     presumed to be a torn append (SIGKILL/ENOSPC mid-write). But `_append()`
     (another process, same or different bank writer) or a concurrent repair
     could have completed or extended that very tail since that unlocked read
-    — so before touching the file we take an exclusive flock and RE-READ the
+    — so before touching the file we take the bank's exclusive SIDECAR lock (see _locked — a flock on the data file itself is unsound across os.replace) and RE-READ the
     tail (from `offset` to current EOF) under the lock:
 
       - if every line in the freshly re-read tail now parses as valid JSON,
@@ -101,8 +124,8 @@ def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
     Order matters for the repair itself: the fragment is written FIRST, so a
     crash between the two steps never loses data — worst case the next run
     re-detects the same torn tail (torn_path.write_bytes is idempotent/
-    overwriting). Holding the lock for the whole re-read+repair also blocks a
-    concurrent `_append()` (which takes the same flock) from writing into the
+    overwriting). Holding the sidecar lock for the whole re-read+repair also blocks a
+    concurrent `_append()` and apply_row_updates() (which take the same lock) from writing into the
     file while we decide/truncate.
 
     The lock only serializes the truncate DECISION, not the writes that can
@@ -113,8 +136,7 @@ def _repair_torn_tail(f: Path, offset: int) -> list[dict]:
     reconverge on the next run via stable-key dedup, not via this repair.
     """
     rows: list[dict] = []
-    with f.open("r+b") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+    with _locked(f), f.open("r+b") as fh:
         fh.seek(offset)
         tail = fh.read()
         local_offset = offset
@@ -347,14 +369,13 @@ class Storage:
     def _append(self, rec: DocRecord) -> None:
         path = self.cfg.manifest_file(rec.bank_code)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Exclusive same-host flock: mutual exclusion with (a) another
-        # process's _append() on this same bank file, and (b) the torn-tail
-        # repair path (_repair_torn_tail), which takes the same lock before
-        # deciding whether to truncate this file. Released implicitly when
-        # `fh` closes.
-        with path.open("a") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            fh.write(json.dumps(rec.to_row(), ensure_ascii=False) + "\n")
+        # Sidecar lock (stable inode): mutual exclusion with (a) another
+        # process's _append() on this bank, (b) the torn-tail repair path,
+        # and (c) apply_row_updates()'s read-merge-replace. A flock on the
+        # data file itself would be unsound — os.replace swaps its inode.
+        with _locked(path):
+            with path.open("a") as fh:
+                fh.write(json.dumps(rec.to_row(), ensure_ascii=False) + "\n")
 
     def rewrite_manifest(self, rows: Iterable[dict]) -> int:
         """Atomically (re)write the per-bank manifest files for the banks present
