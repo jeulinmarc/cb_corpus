@@ -1,0 +1,6 @@
+# Test/development dependencies: runtime deps + the test runner and the
+# network guard (pytest.ini sets --disable-socket, so pytest-socket is
+# required to run the suite at all).
+-r requirements.txt
+pytest
+pytest-socket
