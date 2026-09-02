@@ -5,13 +5,28 @@ here: pytest-socket re-enables sockets in its per-test teardown hook, so a
 session-scoped fixture calling `disable_socket()` would only protect the very
 first test. See `tests/test_network_guard.py` for the proof that it holds.
 
-This module carries one shared duck-typed fetcher so the newer discovery tests
-(Bundesbank / BoE / BoJ / reindex) don't each grow their own copy. The older
-test modules keep their own local fakes on purpose — they are not touched.
+This module carries one shared duck-typed fetcher, and the one-line reader the
+fixture-backed tests use, so the newer discovery tests (Bundesbank / BoE / BoJ
+/ reindex) don't each grow their own copy. The older test modules keep their
+own local fakes on purpose — they are not touched.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def read_fixture(*parts: str) -> str:
+    """Read a recorded page, e.g. `read_fixture("boj", "wps_2026.html")`.
+
+    Always called from inside a test, never at import time: a stale or renamed
+    fixture must fail one test with a readable error, not break collection of
+    the whole module.
+    """
+    return FIXTURES.joinpath(*parts).read_text(encoding="utf-8")
 
 
 class RecordingFetcher:

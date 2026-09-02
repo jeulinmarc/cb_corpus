@@ -14,22 +14,17 @@ No live network in these tests.
 from __future__ import annotations
 
 from datetime import date
-from pathlib import Path
 
 from cb_corpus.sources.boj_wp import discover_boj_wp
 from cb_corpus.taxonomy import DocType
-
-FIX = Path(__file__).parent / "fixtures" / "boj"
+from tests.conftest import read_fixture
 
 YEARS = {2024, 2025, 2026}
 
 
-def _read(year: int) -> str:
-    return (FIX / f"wps_{year}.html").read_text(encoding="utf-8")
-
-
 def _pages(*years: int) -> dict[str, object]:
-    return {f"wps_{y}/index.htm": _read(y) for y in years}
+    """The recorded year listings, keyed by the URL suffix the walker builds."""
+    return {f"wps_{y}/index.htm": read_fixture("boj", f"wps_{y}.html") for y in years}
 
 
 def _codes(records) -> list[str]:

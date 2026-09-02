@@ -26,21 +26,17 @@ promises in its docstring was unverified. No live network in these tests.
 from __future__ import annotations
 
 from datetime import date
-from pathlib import Path
 
 from cb_corpus.sources.buba_wp import discover_buba_wp
 from cb_corpus.taxonomy import DocType
-
-FIX = Path(__file__).parent / "fixtures" / "buba"
-
-# The 1999-2000 pages served as pages 0/1 of the walk: real markup, and the
-# only pages in the archive old enough to carry direct blob links.
-PAGE_120 = (FIX / "bbksearch_page120.html").read_text(encoding="utf-8")
-PAGE_121 = (FIX / "bbksearch_page121.html").read_text(encoding="utf-8")
+from tests.conftest import read_fixture
 
 
-def _read(name: str) -> str:
-    return (FIX / name).read_text(encoding="utf-8")
+def _page(name: str) -> str:
+    """One recorded bbksearch result page. The 1999-2000 pages (120/121) are
+    the only ones in the archive old enough to carry direct blob links, and are
+    served to the walker as its pages 0/1."""
+    return read_fixture("buba", name)
 
 
 def _blob_names(records) -> list[str]:
@@ -53,7 +49,8 @@ def test_discover_walks_every_page_up_to_max_pages(fetcher_factory):
     """The listing renders only 10 papers per page: without following the
     `pageNumString` pagination the crawler would see the newest handful and
     silently declare the back-catalogue complete."""
-    f = fetcher_factory({"pageNumString=0": PAGE_120, "pageNumString=1": PAGE_121})
+    f = fetcher_factory({"pageNumString=0": _page("bbksearch_page120.html"),
+                         "pageNumString=1": _page("bbksearch_page121.html")})
     recs = list(discover_buba_wp(f, max_pages=2))
 
     assert [c.rsplit("?", 1)[-1] for c in f.calls] == ["pageNumString=0", "pageNumString=1"]
@@ -66,7 +63,7 @@ def test_discover_walks_every_page_up_to_max_pages(fetcher_factory):
 def test_discover_stops_at_max_pages_even_though_the_site_advertises_more(fetcher_factory):
     """Page 0 advertises `pageNumString=125` as the last page; `max_pages`
     must still bound the walk, or a smoke test would crawl 126 pages."""
-    f = fetcher_factory({"pageNumString=0": PAGE_120})
+    f = fetcher_factory({"pageNumString=0": _page("bbksearch_page120.html")})
     list(discover_buba_wp(f, max_pages=1))
     assert len(f.calls) == 1
 
@@ -77,7 +74,7 @@ def test_old_papers_take_the_blob_and_its_date_off_the_listing(fetcher_factory):
     """Pre-2001 items link the `…-dkp-NN-data.pdf` blob directly, whose
     filename embeds the ISO date: the walk must read both off the listing and
     NOT spend one HTTP request per paper (10x the traffic for nothing)."""
-    f = fetcher_factory({"pageNumString=0": PAGE_120})
+    f = fetcher_factory({"pageNumString=0": _page("bbksearch_page120.html")})
     recs = list(discover_buba_wp(f, max_pages=1))
 
     assert len(f.calls) == 1                            # listing only, no paper pages
@@ -96,10 +93,10 @@ def test_recent_papers_are_completed_from_their_own_page(fetcher_factory):
     URL is opaque (`/resource/blob/<id>/<hash>/…`) and cannot be derived, so
     the page MUST be fetched; the title and day come from it too."""
     f = fetcher_factory({
-        "pageNumString=0": _read("bbksearch_page0.html"),
+        "pageNumString=0": _page("bbksearch_page0.html"),
         # Only this one paper page resolves; the nine others 404, as a dead
         # paper page would live — one bad page must not sink the whole walk.
-        "collateral-policy-surprises-957108": _read("detail_dkp_22_2026.html"),
+        "collateral-policy-surprises-957108": _page("detail_dkp_22_2026.html"),
     })
     recs = list(discover_buba_wp(f, max_pages=1))
 
@@ -118,7 +115,8 @@ def test_since_cutoff_drops_older_papers_and_stops_paging(fetcher_factory):
     """The list is newest-first, so a page with nothing newer than `since`
     means every later page is older too: the walk must stop there instead of
     paging through 25 years of archive on every nightly run."""
-    f = fetcher_factory({"pageNumString=0": PAGE_120, "pageNumString=1": PAGE_121})
+    f = fetcher_factory({"pageNumString=0": _page("bbksearch_page120.html"),
+                         "pageNumString=1": _page("bbksearch_page121.html")})
     recs = list(discover_buba_wp(f, since=date(2000, 1, 1), max_pages=3))
 
     # page 1 (1997-1999) is entirely older -> page 2 is never requested.
@@ -138,7 +136,7 @@ def test_duplicate_dp_number_yields_one_record(fetcher_factory):
     as two items pointing at the SAME blob (DP 05/1999 here): keyed on
     `(num, year)` they collapse to one record, so the corpus doesn't grow a
     duplicate every time a bilingual paper is re-listed."""
-    f = fetcher_factory({"pageNumString=0": PAGE_120})
+    f = fetcher_factory({"pageNumString=0": _page("bbksearch_page120.html")})
     recs = list(discover_buba_wp(f, max_pages=1))
 
     names = _blob_names(recs)

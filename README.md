@@ -71,7 +71,7 @@ no machine-translated or model-generated text.
 
 ```bash
 pip install -r requirements-dev.txt      # runtime deps + pytest + pytest-socket
-python3.13 -m pytest -q                  # 470 tests
+python3.13 -m pytest -q
 ```
 > The suite is network-free by construction: `pytest.ini` sets `--disable-socket`,
 > so a test that reaches for the network fails instead of crawling a live bank.

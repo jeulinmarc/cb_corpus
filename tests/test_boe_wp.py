@@ -26,12 +26,10 @@ monkeypatched away). No live network in these tests.
 from __future__ import annotations
 
 from datetime import date
-from pathlib import Path
 
 from cb_corpus.sources.boe_wp import discover_boe_wp, paper_meta
 from cb_corpus.taxonomy import DocType
-
-FIX = Path(__file__).parent / "fixtures" / "boe"
+from tests.conftest import read_fixture
 
 SITEMAP = "/sitemap/staff-working-paper"
 WP_2025 = "/working-paper/2025/a-game-theoretic-foundation-for-the-fiscal-theory-of-the-price-level"
@@ -39,7 +37,19 @@ WP_1992 = "/working-paper/1992/financial-deregulation-and-household-saving"
 
 
 def _read(name: str) -> str:
-    return (FIX / name).read_text(encoding="utf-8")
+    return read_fixture("boe", name)
+
+
+def _walk_fetcher(fetcher_factory):
+    """The full walk: the recorded sitemap (5 papers over 1992 and 2025), the
+    real 2025 paper page, and the 1992 page stripped of its published-date
+    block. The other three papers have no page — as a dead paper page would.
+    """
+    return fetcher_factory({
+        SITEMAP: _read("sitemap_staff_working_paper_truncated.html"),
+        WP_1992: _read("wp_1992_financial_deregulation_synthetic_no_published_date.html"),
+        WP_2025: _read("wp_2025_game_theoretic_foundation.html"),
+    })
 
 
 # ---- paper_meta: the "Published on" day -------------------------------
@@ -92,31 +102,67 @@ def test_paper_meta_returns_none_when_the_page_cannot_be_fetched(fetcher_factory
 
 # ---- discover_boe_wp: sitemap -> pages -> records ---------------------
 
-def test_discover_walks_the_sitemap_and_mixes_day_and_year_precision(fetcher_factory):
-    """End to end over the real sitemap: each paper page is fetched for its
-    day, and a page without one is kept at year precision (1 January +
-    `date_precision="year"`) instead of being dropped or dated with a fake
-    day. Papers whose page is unreachable are skipped, not fatal."""
-    f = fetcher_factory({
-        SITEMAP: _read("sitemap_staff_working_paper_truncated.html"),
-        WP_1992: _read("wp_1992_financial_deregulation_synthetic_no_published_date.html"),
-        WP_2025: _read("wp_2025_game_theoretic_foundation.html"),
-    })
+def test_discover_reads_the_sitemap_first_then_every_paper_page(fetcher_factory):
+    """The sitemap is the only enumeration of the 2 400-paper back-catalogue,
+    and each paper page is then read in turn — that fan-out is the shape of the
+    walk, and the D1/gb provenance every yielded record must carry."""
+    f = _walk_fetcher(fetcher_factory)
+
     recs = list(discover_boe_wp(f))
 
-    assert f.calls[0].endswith(SITEMAP)                 # sitemap first, then pages
-    assert len(f.calls) == 6                            # 1 sitemap + 5 listed papers
-    assert len(recs) == 2                               # the 3 unreachable pages are skipped
-
-    old, new = recs
-    assert old.date == date(1992, 1, 1) and old.date_precision == "year"
-    assert old.title == "Financial Deregulation and Household Saving"
-    assert new.date == date(2025, 7, 18) and new.date_precision == "day"
+    assert f.calls[0].endswith(SITEMAP)                 # sitemap first...
+    assert len(f.calls) == 6                            # ...then its 5 listed papers
+    assert all(c.startswith("https://www.bankofengland.co.uk/working-paper/")
+               for c in f.calls[1:])
     assert all(r.bank_code == "gb" and r.doc_type == DocType.D1 for r in recs)
     assert all(r.provenance == "bank_site" and r.date_source == "bank_site" for r in recs)
     assert all(r.mime_type == "application/pdf" for r in recs)
     assert all(r.source_url.startswith("https://www.bankofengland.co.uk/working-paper/")
                for r in recs)
+
+
+def test_discover_keeps_the_day_read_from_the_paper_page(fetcher_factory):
+    """A paper whose page carries "Published on" is dated to that exact day —
+    the whole reason the walk pays for one fetch per paper instead of taking
+    the year off the sitemap and stopping there."""
+    f = _walk_fetcher(fetcher_factory)
+
+    recs = list(discover_boe_wp(f))
+
+    modern = next(r for r in recs if r.source_url.endswith(WP_2025))
+    assert modern.date == date(2025, 7, 18)
+    assert modern.date_precision == "day"
+
+
+def test_discover_falls_back_to_year_precision_when_the_page_has_no_day(fetcher_factory):
+    """A page with no published-date block still yields its paper, dated
+    1 January of the sitemap's year and LABELLED `year` — the corpus keeps the
+    document and stays honest about how precise its date is, instead of
+    dropping it or passing 1 January off as the real publication day."""
+    f = _walk_fetcher(fetcher_factory)
+
+    recs = list(discover_boe_wp(f))
+
+    old = next(r for r in recs if r.source_url.endswith(WP_1992))
+    assert old.date == date(1992, 1, 1)
+    assert old.date_precision == "year"
+    assert old.title == "Financial Deregulation and Household Saving"
+
+
+def test_discover_skips_papers_whose_page_is_unreachable(fetcher_factory):
+    """Three of the five listed papers have no reachable page. Each is
+    attempted and then skipped: a handful of dead pages must cost their own
+    papers, never the rest of the walk."""
+    f = _walk_fetcher(fetcher_factory)
+
+    recs = list(discover_boe_wp(f))
+
+    assert len(f.calls) == 6                            # all five were attempted
+    assert len(recs) == 2                               # only the two that answered
+    assert {r.source_url for r in recs} == {
+        "https://www.bankofengland.co.uk" + WP_1992,
+        "https://www.bankofengland.co.uk" + WP_2025,
+    }
 
 
 def test_discover_years_filter_skips_other_years_before_fetching_them(fetcher_factory):
