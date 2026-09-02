@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 
 from cb_corpus.config import Config
-from cb_corpus.quarantine import Quarantine
+from cb_corpus.quarantine import _DEFAULT_THRESHOLD, Quarantine
 
 
 def _mk(tmp_path) -> Quarantine:
@@ -166,6 +166,39 @@ def test_custom_threshold_env_read_at_call_time(tmp_path, monkeypatch):
     q.record_failure(url, "2026-08-02")
     assert q.is_quarantined(url) is False
     q.record_failure(url, "2026-08-03")
+    assert q.is_quarantined(url) is True
+
+
+def test_unparseable_threshold_env_falls_back_to_the_default(tmp_path, monkeypatch):
+    """A typo in QUARANTINE_AFTER_NIGHTS ("5 " fat-fingered into a word) must
+    never crash the nightly sync, and must not silently disable quarantine
+    either: the module default threshold applies, unchanged."""
+    monkeypatch.setenv("QUARANTINE_AFTER_NIGHTS", "not-a-number")
+    q = _mk(tmp_path)
+    url = "https://x.test/dead.pdf"
+    nights = [f"2026-08-{day:02d}" for day in range(1, _DEFAULT_THRESHOLD + 1)]
+
+    for night in nights[:-1]:
+        q.record_failure(url, night)
+    assert q.is_quarantined(url) is False           # one night short of the default
+
+    q.record_failure(url, nights[-1])
+    assert q.is_quarantined(url) is True            # exactly the default, not 1 or never
+
+
+def test_non_positive_threshold_env_falls_back_to_the_default(tmp_path, monkeypatch):
+    """QUARANTINE_AFTER_NIGHTS=0 parses fine but would quarantine every URL on
+    its first failure (and 0-length nights lists), so it is rejected the same
+    way a typo is — back to the default."""
+    monkeypatch.setenv("QUARANTINE_AFTER_NIGHTS", "0")
+    q = _mk(tmp_path)
+    url = "https://x.test/dead.pdf"
+
+    q.record_failure(url, "2026-08-01")
+    assert q.is_quarantined(url) is False
+
+    for day in range(2, _DEFAULT_THRESHOLD + 1):
+        q.record_failure(url, f"2026-08-{day:02d}")
     assert q.is_quarantined(url) is True
 
 
@@ -366,6 +399,33 @@ def test_corrupt_line_is_skipped_with_a_single_warning(tmp_path, capsys):
 
     err = capsys.readouterr().err
     assert err.count("WARNING") == 1
+    assert str(path) in err
+
+
+def test_row_without_a_url_is_skipped_under_the_same_single_warning(tmp_path, capsys):
+    """A row that is valid JSON but carries no usable `url` (schema drift, or a
+    url serialized as null) is unusable as quarantine state — there is nothing
+    to key it on. It is skipped like a corrupt line, under the SAME one warning
+    per load, and the rows around it still take effect."""
+    path = tmp_path / "download_quarantine.jsonl"
+    quarantined_nights = [f"2026-08-{day:02d}" for day in range(1, _DEFAULT_THRESHOLD + 1)]
+    rows = [
+        json.dumps({"url": "https://x.test/a.pdf", "nights": ["2026-08-01"],
+                    "quarantined": False}),
+        json.dumps({"nights": quarantined_nights, "quarantined": True}),   # no url key
+        json.dumps({"url": None, "nights": quarantined_nights, "quarantined": True}),
+        json.dumps({"url": "https://x.test/c.pdf", "nights": quarantined_nights,
+                    "quarantined": True}),
+    ]
+    path.write_text("\n".join(rows) + "\n")
+
+    q = Quarantine(Config(data_dir=tmp_path))
+
+    assert q.is_quarantined("https://x.test/a.pdf") is False
+    assert q.is_quarantined("https://x.test/c.pdf") is True   # loaded after the bad rows
+
+    err = capsys.readouterr().err
+    assert err.count("WARNING") == 1                # two bad rows, still ONE warning
     assert str(path) in err
 
 
