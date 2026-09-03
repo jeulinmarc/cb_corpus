@@ -58,3 +58,9 @@ class Config:
     @property
     def reports_dir(self) -> Path:
         return self.data_dir / "reports"
+
+    @property
+    def orphans_dir(self) -> Path:
+        """Quarantine for on-disk files that duplicate an indexed document
+        (`sweep-orphans`): mirror tree of raw/, sibling of it, walked by nothing."""
+        return self.data_dir / "raw_orphans"

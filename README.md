@@ -87,6 +87,33 @@ fatal, `3` degraded — a run that did no useful work never exits 0. The NAS
 wrapper pushes an ntfy notification on non-zero exits when `NTFY_URL` is set
 (absent = no-op).
 
+### Maintenance: orphan sweep
+
+An *orphan* is a file under `data/raw/` whose name is not a manifest `doc_id`
+(left behind by an earlier id scheme, or by a manifest reset). Most orphans are
+byte-identical to a document that is indexed under another id.
+
+```bash
+python -m cb_corpus sweep-orphans                 # dry-run: classify + report, moves nothing
+python -m cb_corpus sweep-orphans --move          # move duplicates to data/raw_orphans/ (mirror tree)
+python -m cb_corpus sweep-orphans --banks ecb,us  # restrict the walk
+```
+
+Rules: a file whose sha256 is owned by a manifest row is a **duplicate** and is
+moved (atomic rename, never overwritten, and only after verifying that the
+owning row's own file is still on disk with the same size and sha256 — the
+sweep never removes the last good copy of a document); any other orphan is
+**unindexed** and stays in place — follow up with `reindex-from-disk` on that
+scope. Indexed files are never touched; symlinks are ignored; an unreadable
+file is reported (`hash-failed`), never moved. A `kept-owner-missing` row
+carries the reason (`error`) and the resolved `owner_path`. Every run writes
+`data/reports/orphan_sweep_<ts>.jsonl` (one line per orphan) and
+`orphan_sweep_<ts>.summary.json`. Exit 0 when the sweep completed (failed
+moves are counted in the summary), 1 on a fatal error.
+`data/raw_orphans/` is walked by nothing and pushed by nothing; delete it by hand
+once the vault confirms nothing is missing. Run it under the NAS job lock
+(`run-job.sh campaign sweep-orphans …`) or outside the nightly sync window.
+
 ## Use
 
 ```bash

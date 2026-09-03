@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 
@@ -113,6 +115,16 @@ def main(argv: list[str] | None = None) -> int:
     rx.add_argument("--titles", action="store_true",
                     help="bis-sitemap only: fetch each matched speech's detail page "
                          "for a human title (one HTTP request per matched file; slower)")
+
+    so = sub.add_parser("sweep-orphans",
+                        help="Quarantine on-disk files that have no manifest row and "
+                             "duplicate an indexed document (moved to raw_orphans/, "
+                             "mirror tree); report the rest. Dry-run unless --move.")
+    so.add_argument("--banks", default="", help="restrict to bank codes")
+    so.add_argument("--move", action="store_true",
+                    help="actually move duplicates (default: dry-run, report only)")
+    so.add_argument("--progress-every", type=int, default=1000,
+                    help="stderr progress line every N files examined (default 1000)")
 
     r = sub.add_parser("report")
     r.add_argument("--banks", default="")
@@ -316,7 +328,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "c2-migrate":
         from .c2_migrate import run_c2_migrate
-        from .config import Config
         from .http import Fetcher
         cfg = Config()
         run_c2_migrate(cfg, Fetcher(cfg), write=args.write)
@@ -366,9 +377,30 @@ def main(argv: list[str] | None = None) -> int:
             run_repec_reconcile(bank_codes=banks, write=args.write, csv_path=args.csv or None)
         return 0
 
+    if args.cmd == "sweep-orphans":
+        import json as _json
+        from . import orphans
+        try:
+            summary = orphans.sweep_orphans(
+                Config(), banks=set(banks) if banks else None, move=args.move,
+                progress_every=args.progress_every,
+            )
+        except (OSError, ValueError) as exc:   # FileNotFoundError is an OSError
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(_json.dumps(asdict(summary)))
+        gib = summary.bytes_duplicates / (1024 ** 3)
+        scope = f" [banks: {','.join(summary.banks)}]" if summary.banks else ""
+        print(f"sweep-orphans{scope}: {summary.orphans} orphans / {summary.duplicates} duplicates "
+              f"({gib:.2f} GiB) / {summary.unindexed} unindexed — moved {summary.moved}"
+              f"{' (dry-run)' if summary.dry_run else ''}"
+              f"{f', {summary.move_failed} move(s) failed' if summary.move_failed else ''}"
+              f"{f', {summary.owner_missing} kept (owner file missing)' if summary.owner_missing else ''}"
+              f"{f', {summary.hash_failed} hash failure(s)' if summary.hash_failed else ''}")
+        return 0
+
     if args.cmd == "cadence-watch":
         from .cadence import run_cadence_watch
-        from .config import Config
         run_cadence_watch(Config(), write=args.write)
         return 0
 
