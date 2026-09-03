@@ -464,3 +464,43 @@ def test_raw_dir_present_but_not_a_directory_is_reported_clearly(tmp_path):
     cfg.raw_dir.write_bytes(b"not a directory")
     with pytest.raises(FileNotFoundError, match="corpus raw dir not found or not a directory"):
         orphans.sweep_orphans(cfg)
+
+
+# --- Task 3: CLI ---------------------------------------------------------------
+
+def test_cli_sweep_orphans_dry_run_and_move_exit_zero(tmp_path, monkeypatch, capsys):
+    import cb_corpus.cli as cli
+    cfg = _corpus(tmp_path)
+    monkeypatch.setattr(cli, "Config", lambda: cfg)           # cli builds Config() itself
+    assert cli.main(["sweep-orphans"]) == 0
+    out = capsys.readouterr().out
+    assert '"dry_run": true' in out and "sweep-orphans:" in out and "(dry-run)" in out
+    assert (cfg.raw_dir / "us/C1/2015/dup.pdf").exists()
+    assert cli.main(["sweep-orphans", "--move"]) == 0
+    assert not (cfg.raw_dir / "us/C1/2015/dup.pdf").exists()
+
+
+def test_cli_passes_banks_and_progress_through(tmp_path, monkeypatch, capsys):
+    import cb_corpus.cli as cli
+    seen = {}
+
+    def fake_sweep(cfg, **kw):
+        seen.update(kw)
+        return orphans.SweepSummary(files_seen=0, orphans=0, duplicates=0, unindexed=0, moved=0,
+                                    move_failed=0, bytes_duplicates=0, dry_run=not kw["move"],
+                                    report_path="r", started_at="s", finished_at="f",
+                                    banks=sorted(kw["banks"]) if kw["banks"] else None)
+
+    monkeypatch.setattr(cli, "Config", lambda: _cfg(tmp_path))
+    monkeypatch.setattr(orphans, "sweep_orphans", fake_sweep)
+    assert cli.main(["sweep-orphans", "--banks", "ecb,us", "--progress-every", "7"]) == 0
+    assert seen["banks"] == {"ecb", "us"} and seen["progress_every"] == 7 and seen["move"] is False
+    assert "[banks: ecb,us]" in capsys.readouterr().out
+
+
+def test_cli_missing_raw_dir_is_a_fatal_error(tmp_path, monkeypatch, capsys):
+    import cb_corpus.cli as cli
+    cfg = Config(data_dir=tmp_path / "nowhere")
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    assert cli.main(["sweep-orphans"]) == 1
+    assert "error:" in capsys.readouterr().err
