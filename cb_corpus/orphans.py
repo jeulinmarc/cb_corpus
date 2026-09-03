@@ -31,7 +31,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import sys
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +63,7 @@ class OrphanEntry:
     action: str
     dest: Optional[str]       # relative path under raw_orphans/ (duplicates only)
     error: Optional[str] = None
+    owner_path: Optional[str] = None   # resolved owner path (set for every duplicate)
 
 
 @dataclass
@@ -91,17 +94,17 @@ class ManifestIndex:
 def _resolve_local_path(cfg: Config, local_path: str) -> Optional[Path]:
     """Best-effort on-disk path for a manifest row's ``local_path``.
 
-    If it contains ``"raw/"``, take the part after the FIRST occurrence and
-    join it to ``cfg.raw_dir``; else if it is absolute use it as is; else the
+    If it is absolute, use it as is; else if it contains ``"raw/"``, take the
+    part after the FIRST occurrence and join it to ``cfg.raw_dir``; else the
     owner path is unknown (treated as missing).
     """
+    p = Path(local_path)
+    if p.is_absolute():
+        return p
     marker = "raw/"
     idx = local_path.find(marker)
     if idx != -1:
         return cfg.raw_dir / local_path[idx + len(marker):]
-    p = Path(local_path)
-    if p.is_absolute():
-        return p
     return None
 
 
@@ -157,14 +160,14 @@ def _iter_all_files(cfg: Config, banks: Optional[set[str]]) -> Iterator[Path]:
                 yield path
 
 
-def iter_orphans(cfg: Config, doc_ids: set[str], *,
-                 banks: Optional[set[str]] = None) -> Iterator[Path]:
-    """Every regular file under ``raw/`` (any depth, any extension) whose stem
-    is not in ``doc_ids``, in sorted order. ``banks`` restricts the top-level
-    ``raw/<bank>/`` directories walked."""
-    for path in _iter_all_files(cfg, banks):
-        if path.stem not in doc_ids:
-            yield path
+def _parts(rel: str) -> tuple[str, str, str]:
+    """(bank, doc_type, year_dir) from a raw/-relative posix path, empty for
+    any segment the path is too shallow to have."""
+    parts = rel.split("/")
+    bank = parts[0] if len(parts) > 1 else ""
+    doc_type = parts[1] if len(parts) > 2 else ""
+    year_dir = parts[2] if len(parts) > 3 else ""
+    return bank, doc_type, year_dir
 
 
 def _sha256_of(path: Path) -> tuple[str, int, bool]:
@@ -192,10 +195,7 @@ def classify(path: Path, raw: Path, index: ManifestIndex) -> OrphanEntry:
     responsible for containing that per file.
     """
     rel = path.relative_to(raw).as_posix()
-    parts = rel.split("/")
-    bank = parts[0] if len(parts) > 1 else ""
-    doc_type = parts[1] if len(parts) > 2 else ""
-    year_dir = parts[2] if len(parts) > 3 else ""
+    bank, doc_type, year_dir = _parts(rel)
     ext = path.suffix.lower().lstrip(".")
     sha, size, valid = _sha256_of(path)
     owner = index.by_hash.get(sha)
@@ -214,6 +214,11 @@ def move_to_orphans(entry: OrphanEntry, cfg: Config) -> None:
     Never overwrites: a destination that already holds the same bytes means a
     replayed sweep, so the source is simply removed; a destination with other
     content is left alone and the move is recorded as failed.
+
+    The replayed-sweep ``unlink`` trusts the sha256 captured at classify time
+    rather than re-hashing the source — safe under the NAS job lock (no
+    concurrent writer can touch ``raw/`` mid-sweep), so avoid running this
+    from a workstation against live SMB writers.
     """
     src = Path(entry.path)
     dest = cfg.orphans_dir / entry.rel
@@ -240,6 +245,38 @@ def move_to_orphans(entry: OrphanEntry, cfg: Config) -> None:
         entry.action, entry.error = "move-failed", f"{type(exc).__name__}: {exc}"
 
 
+def _owner_holds(owner: Optional[Path], entry: OrphanEntry,
+                 cache: dict[Path, str]) -> tuple[bool, Optional[str]]:
+    """Verify the manifest row's owner file still holds this duplicate's exact
+    bytes: same file, same size, same sha256 — never existence alone.
+
+    The owner is hashed at most once per owner path across the whole sweep
+    (memoised in ``cache``, streaming via :func:`_sha256_of`), since many
+    duplicates commonly share one owner.
+    """
+    if owner is None:
+        return False, "owner path unknown"
+    try:
+        if not owner.is_file():
+            return False, f"owner file missing: {owner}"
+        try:
+            if owner.samefile(entry.path):
+                return False, "owner is this file"
+        except OSError:
+            return False, f"owner file missing: {owner}"
+        if owner.stat().st_size != entry.size:
+            return False, f"owner size differs: {owner}"
+        owner_sha = cache.get(owner)
+        if owner_sha is None:
+            owner_sha, _, _ = _sha256_of(owner)
+            cache[owner] = owner_sha
+        if owner_sha != entry.sha256:
+            return False, f"owner content differs: {owner}"
+        return True, None
+    except OSError as exc:
+        return False, f"owner check failed: {type(exc).__name__}: {exc}"
+
+
 def _hash_failed_entry(path: Path, rel: str, bank: str, doc_type: str, year_dir: str,
                        exc: OSError) -> OrphanEntry:
     try:
@@ -254,25 +291,43 @@ def _hash_failed_entry(path: Path, rel: str, bank: str, doc_type: str, year_dir:
     )
 
 
+def _raise_sigterm(signum, frame) -> None:
+    raise SystemExit(143)
+
+
 def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool = False,
                   progress_every: int = 1000, report_path: Optional[Path] = None,
                   now: Optional[datetime] = None) -> SweepSummary:
     """Find, classify, (move) and report every orphan under raw/.
 
     Raises ``FileNotFoundError`` when ``raw/`` is missing or not a directory —
-    a mis-pointed data dir must not look like a clean corpus.
+    a mis-pointed data dir must not look like a clean corpus — or when
+    ``banks`` names a code with no ``raw/<code>/`` directory.
+
+    Installs a ``SIGTERM`` handler (main thread only) for the duration of the
+    sweep so an operator-issued kill still writes the summary; the previous
+    handler is always restored.
     """
     if not cfg.raw_dir.is_dir():
         raise FileNotFoundError(f"corpus raw dir not found or not a directory: {cfg.raw_dir}")
+    if banks is not None:
+        missing = {b for b in banks if not (cfg.raw_dir / b).is_dir()}
+        if missing:
+            raise FileNotFoundError(
+                f"unknown bank code(s) (no raw/<code>/ directory): {', '.join(sorted(missing))}")
     started = now or datetime.now(timezone.utc)
     stamp = started.strftime("%Y%m%dT%H%M%SZ")
     report_path = report_path or (cfg.reports_dir / f"orphan_sweep_{stamp}.jsonl")
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     index = load_manifest_index(cfg)
+    owner_hash_cache: dict[Path, str] = {}
     files_seen = orphans_n = dups = unindexed = moved = failed = 0
     hash_failed = owner_missing = 0
     bytes_dups = 0
+
+    install_handler = threading.current_thread() is threading.main_thread()
+    prev_handler = signal.signal(signal.SIGTERM, _raise_sigterm) if install_handler else None
     try:
         with report_path.open("w", encoding="utf-8") as out:
             for path in _iter_all_files(cfg, banks):
@@ -280,6 +335,8 @@ def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool =
                 if progress_every and files_seen % progress_every == 0:
                     print(f"sweep-orphans: examined {files_seen} files "
                           f"({orphans_n} orphans, {dups} duplicates so far)", file=sys.stderr, flush=True)
+                # Multi-dot names (e.g. "x.tar.gz") would have stem "x.tar";
+                # the corpus layout is "<id>.<ext>" so this never arises here.
                 if path.stem in index.doc_ids:
                     continue
                 orphans_n += 1
@@ -287,10 +344,7 @@ def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool =
                     entry = classify(path, cfg.raw_dir, index)
                 except OSError as exc:
                     rel = path.relative_to(cfg.raw_dir).as_posix()
-                    parts = rel.split("/")
-                    bank = parts[0] if len(parts) > 1 else ""
-                    doc_type = parts[1] if len(parts) > 2 else ""
-                    year_dir = parts[2] if len(parts) > 3 else ""
+                    bank, doc_type, year_dir = _parts(rel)
                     entry = _hash_failed_entry(path, rel, bank, doc_type, year_dir, exc)
                     hash_failed += 1
                 else:
@@ -299,8 +353,10 @@ def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool =
                     else:
                         dups += 1
                         owner = index.owner_path.get(entry.sha256)
-                        if owner is None or not owner.is_file() or owner.resolve() == path.resolve():
-                            entry.action, entry.dest = "kept-owner-missing", None
+                        entry.owner_path = str(owner) if owner is not None else None
+                        ok, reason = _owner_holds(owner, entry, owner_hash_cache)
+                        if not ok:
+                            entry.action, entry.dest, entry.error = "kept-owner-missing", None, reason
                             owner_missing += 1
                         else:
                             bytes_dups += entry.size
@@ -313,6 +369,8 @@ def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool =
                 out.write(json.dumps(asdict(entry), ensure_ascii=True) + "\n")
                 out.flush()
     finally:
+        if install_handler:
+            signal.signal(signal.SIGTERM, prev_handler)
         finished = datetime.now(timezone.utc)
         summary = SweepSummary(
             files_seen=files_seen, orphans=orphans_n, duplicates=dups, unindexed=unindexed,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 
@@ -384,10 +385,10 @@ def main(argv: list[str] | None = None) -> int:
                 Config(), banks=set(banks) if banks else None, move=args.move,
                 progress_every=args.progress_every,
             )
-        except (FileNotFoundError, OSError, ValueError) as exc:
+        except (OSError, ValueError) as exc:   # FileNotFoundError is an OSError
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        print(_json.dumps(orphans.asdict(summary)))
+        print(_json.dumps(asdict(summary)))
         gib = summary.bytes_duplicates / (1024 ** 3)
         scope = f" [banks: {','.join(summary.banks)}]" if summary.banks else ""
         print(f"sweep-orphans{scope}: {summary.orphans} orphans / {summary.duplicates} duplicates "

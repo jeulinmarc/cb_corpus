@@ -91,16 +91,21 @@ def test_walk_yields_only_files_whose_stem_is_not_indexed(tmp_path):
     _write(cfg, "us/C1/undated/orph3", TINY)           # orphan, no ext, non-numeric year dir
     _write(cfg, "us/.DS_Store", b"junk")               # shallow orphan is still an orphan
     _index(cfg, "us", _row("aaaa", PDF_A, "us", "us/C1/2015/aaaa.pdf"))
-    index = orphans.load_manifest_index(cfg)
-    rels = sorted(p.relative_to(cfg.raw_dir).as_posix() for p in orphans.iter_orphans(cfg, index.doc_ids))
+    s = orphans.sweep_orphans(cfg)
+    rows = [json.loads(l) for l in Path(s.report_path).read_text().splitlines()]
+    rels = sorted(r["rel"] for r in rows)
     assert rels == ["us/.DS_Store", "us/C1/2015/orph1.pdf", "us/C1/2015/orph2.html", "us/C1/undated/orph3"]
 
 
 def test_walk_restricts_to_requested_banks(tmp_path):
+    """banks={"ecb"} restricts the walk; both bank dirs exist so H3's
+    unknown-bank guard does not trigger."""
     cfg = _cfg(tmp_path)
     _write(cfg, "us/C1/2015/o1.pdf", PDF_A)
     _write(cfg, "ecb/C1/2015/o2.pdf", PDF_B)
-    rels = [p.relative_to(cfg.raw_dir).as_posix() for p in orphans.iter_orphans(cfg, set(), banks={"ecb"})]
+    s = orphans.sweep_orphans(cfg, banks={"ecb"})
+    rows = [json.loads(l) for l in Path(s.report_path).read_text().splitlines()]
+    rels = [r["rel"] for r in rows]
     assert rels == ["ecb/C1/2015/o2.pdf"]
 
 
@@ -259,6 +264,7 @@ def test_duplicate_is_kept_when_the_owner_row_file_is_missing_from_disk(tmp_path
     rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
     row = rows["us/C1/2015/renamed.pdf"]
     assert row["action"] == "kept-owner-missing" and row["dest"] is None
+    assert row["error"].startswith("owner file missing:")
 
 
 def test_duplicate_is_kept_when_the_owner_path_resolves_to_the_file_itself(tmp_path):
@@ -277,14 +283,22 @@ def test_duplicate_is_kept_when_the_owner_path_resolves_to_the_file_itself(tmp_p
     rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
     row = rows["us/C1/2015/renamed.pdf"]
     assert row["action"] == "kept-owner-missing" and row["dest"] is None
+    assert row["error"] == "owner is this file"
 
 
 def test_absolute_local_path_pointing_at_the_owner_file_is_accepted(tmp_path):
+    """local_path is absolute and has no `raw/` segment anywhere — this must
+    exercise the absolute branch of `_resolve_local_path`, not the marker
+    branch. The copy lives outside raw/ but holds the owner's exact bytes so
+    H1's verification still passes."""
     cfg = _cfg(tmp_path)
-    owner = _write(cfg, "us/C1/2015/aaaa.pdf", PDF_A)
+    outside_dir = tmp_path / "outside_owner"
+    outside_dir.mkdir()
+    owner_copy = outside_dir / "aaaa.pdf"
+    owner_copy.write_bytes(PDF_A)
     dup = _write(cfg, "us/C1/2015/dup.pdf", PDF_A)
     row = {"doc_id": "aaaa", "bank_code": "us", "doc_type": "C1", "sha256": _sha(PDF_A),
-           "local_path": str(owner), "pdf_url": "https://x/aaaa.pdf"}
+           "local_path": str(owner_copy), "pdf_url": "https://x/aaaa.pdf"}
     _index(cfg, "us", row)
     s = orphans.sweep_orphans(cfg, move=True)
     assert s.owner_missing == 0
@@ -400,6 +414,7 @@ def test_loose_files_directly_under_raw_are_swept_only_without_banks_filter(tmp_
 
 def test_summary_records_the_requested_banks_or_none_for_a_full_sweep(tmp_path):
     cfg = _corpus(tmp_path)
+    _write(cfg, "ecb/C1/2015/o2.pdf", PDF_B)   # both requested banks must exist (H3)
     s_full = orphans.sweep_orphans(cfg)
     assert s_full.banks is None
     s_banked = orphans.sweep_orphans(cfg, banks={"us", "ecb"})
@@ -456,6 +471,109 @@ def test_summary_is_still_written_when_classify_raises_unexpectedly(tmp_path, mo
         orphans.sweep_orphans(cfg)
     summaries = list(cfg.reports_dir.glob("*.summary.json"))
     assert len(summaries) == 1
+
+
+def test_owner_holds_rejects_owner_with_different_size(tmp_path):
+    """The owner path exists (same doc_id row) but the file at it is not the
+    same bytes any more — 0 bytes here, a truncated/corrupted owner. The
+    duplicate must be kept, not quarantined."""
+    cfg = _cfg(tmp_path)
+    _write(cfg, "us/C1/2015/aaaa.pdf", b"")            # owner exists but is 0 bytes
+    dup = _write(cfg, "us/C1/2015/dup.pdf", PDF_A)
+    _index(cfg, "us", _row("aaaa", PDF_A, "us", "us/C1/2015/aaaa.pdf"))
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.owner_missing == 1
+    assert s.moved == 0
+    assert dup.exists()
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    row = rows["us/C1/2015/dup.pdf"]
+    assert row["action"] == "kept-owner-missing"
+    assert row["error"].startswith("owner size differs:")
+
+
+def test_owner_holds_rejects_owner_with_same_size_different_bytes(tmp_path):
+    cfg = _cfg(tmp_path)
+    _write(cfg, "us/C1/2015/aaaa.pdf", PDF_B)           # same size as PDF_A, different bytes
+    dup = _write(cfg, "us/C1/2015/dup.pdf", PDF_A)
+    _index(cfg, "us", _row("aaaa", PDF_A, "us", "us/C1/2015/aaaa.pdf"))
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.owner_missing == 1
+    assert s.moved == 0
+    assert dup.exists()
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    row = rows["us/C1/2015/dup.pdf"]
+    assert row["action"] == "kept-owner-missing"
+    assert row["error"].startswith("owner content differs:")
+
+
+def test_verified_duplicate_is_moved_and_carries_the_owner_path(tmp_path):
+    cfg = _corpus(tmp_path)
+    owner = cfg.raw_dir / "us/C1/2015/aaaa.pdf"
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.moved == 2
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    assert rows["us/C1/2015/dup.pdf"]["owner_path"] == str(owner)
+    assert rows["us/C1/2015/page.html"]["owner_path"] == str(owner)
+
+
+def test_owner_is_hashed_once_per_owner_path_across_duplicates(tmp_path, monkeypatch):
+    """Two duplicates of the same owner hash must reuse one memoised owner
+    hash rather than re-hashing the owner file per duplicate."""
+    cfg = _cfg(tmp_path)
+    owner = _write(cfg, "us/C1/2015/aaaa.pdf", PDF_A)
+    _write(cfg, "us/C1/2015/dup1.pdf", PDF_A)
+    _write(cfg, "us/C1/2015/dup2.pdf", PDF_A)
+    _index(cfg, "us", _row("aaaa", PDF_A, "us", "us/C1/2015/aaaa.pdf"))
+    owner_hash_calls = []
+    orig = orphans._sha256_of
+
+    def counting(path):
+        if Path(path) == owner:
+            owner_hash_calls.append(1)
+        return orig(path)
+
+    monkeypatch.setattr(orphans, "_sha256_of", counting)
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.moved == 2
+    assert len(owner_hash_calls) == 1
+
+
+def test_sigterm_during_the_sweep_still_writes_the_summary_and_restores_the_handler(tmp_path, monkeypatch):
+    import signal
+    cfg = _corpus(tmp_path)
+    prev_handler = signal.getsignal(signal.SIGTERM)
+    orig_classify = orphans.classify
+    calls = {"n": 0}
+
+    def _classify(path, raw, index):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return orig_classify(path, raw, index)
+
+    monkeypatch.setattr(orphans, "classify", _classify)
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            orphans.sweep_orphans(cfg)
+        assert exc_info.value.code == 143
+    finally:
+        assert signal.getsignal(signal.SIGTERM) == prev_handler
+    summaries = list(cfg.reports_dir.glob("*.summary.json"))
+    assert len(summaries) == 1
+
+
+def test_sweep_rejects_unknown_bank_codes(tmp_path):
+    cfg = _corpus(tmp_path)
+    with pytest.raises(FileNotFoundError, match="unknown bank code"):
+        orphans.sweep_orphans(cfg, banks={"ecbb"})
+
+
+def test_cli_sweep_rejects_unknown_bank_codes(tmp_path, monkeypatch, capsys):
+    import cb_corpus.cli as cli
+    cfg = _corpus(tmp_path)
+    monkeypatch.setattr(cli, "Config", lambda: cfg)
+    assert cli.main(["sweep-orphans", "--banks", "ecbb"]) == 1
+    assert "error:" in capsys.readouterr().err
 
 
 def test_raw_dir_present_but_not_a_directory_is_reported_clearly(tmp_path):
