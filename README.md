@@ -70,9 +70,11 @@ no machine-translated or model-generated text.
 ## Install / test
 
 ```bash
-pip install -r requirements.txt
-python3.13 -m pytest tests/ -q          # 425 tests
+pip install -r requirements-dev.txt      # runtime deps + pytest + pytest-socket
+python3.13 -m pytest -q
 ```
+> The suite is network-free by construction: `pytest.ini` sets `--disable-socket`,
+> so a test that reaches for the network fails instead of crawling a live bank.
 > Use **`python3.13`** — that interpreter has the dependencies in this environment
 > (`python3` resolves to 3.14 without them).
 
