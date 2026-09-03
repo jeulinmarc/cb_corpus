@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -67,11 +68,17 @@ def test_manifest_index_maps_ids_and_hashes_across_bank_files(tmp_path):
     """The index is built from every per-bank file, and a blank line (a
     legitimate artefact of the append-only writers) must not break loading."""
     cfg = _cfg(tmp_path)
+    _write(cfg, "us/C1/2015/aaaa.pdf", PDF_A)
+    _write(cfg, "ecb/C1/2016/bbbb.pdf", PDF_B)
     _index(cfg, "us", _row("aaaa", PDF_A, "us", "us/C1/2015/aaaa.pdf"), blank_line=True)
     _index(cfg, "ecb", _row("bbbb", PDF_B, "ecb", "ecb/C1/2016/bbbb.pdf"))
-    ids, by_hash = orphans.load_manifest_index(cfg)
-    assert ids == {"aaaa", "bbbb"}
-    assert by_hash == {_sha(PDF_A): "aaaa", _sha(PDF_B): "bbbb"}
+    index = orphans.load_manifest_index(cfg)
+    assert index.doc_ids == {"aaaa", "bbbb"}
+    assert index.by_hash == {_sha(PDF_A): "aaaa", _sha(PDF_B): "bbbb"}
+    assert index.owner_path == {
+        _sha(PDF_A): cfg.raw_dir / "us/C1/2015/aaaa.pdf",
+        _sha(PDF_B): cfg.raw_dir / "ecb/C1/2016/bbbb.pdf",
+    }
 
 
 def test_walk_yields_only_files_whose_stem_is_not_indexed(tmp_path):
@@ -84,8 +91,8 @@ def test_walk_yields_only_files_whose_stem_is_not_indexed(tmp_path):
     _write(cfg, "us/C1/undated/orph3", TINY)           # orphan, no ext, non-numeric year dir
     _write(cfg, "us/.DS_Store", b"junk")               # shallow orphan is still an orphan
     _index(cfg, "us", _row("aaaa", PDF_A, "us", "us/C1/2015/aaaa.pdf"))
-    ids, _ = orphans.load_manifest_index(cfg)
-    rels = sorted(p.relative_to(cfg.raw_dir).as_posix() for p in orphans.iter_orphans(cfg, ids))
+    index = orphans.load_manifest_index(cfg)
+    rels = sorted(p.relative_to(cfg.raw_dir).as_posix() for p in orphans.iter_orphans(cfg, index.doc_ids))
     assert rels == ["us/.DS_Store", "us/C1/2015/orph1.pdf", "us/C1/2015/orph2.html", "us/C1/undated/orph3"]
 
 
@@ -97,27 +104,32 @@ def test_walk_restricts_to_requested_banks(tmp_path):
     assert rels == ["ecb/C1/2015/o2.pdf"]
 
 
+def _mi(by_hash=None, doc_ids=None, owner_path=None) -> "orphans.ManifestIndex":
+    return orphans.ManifestIndex(doc_ids=doc_ids or set(), by_hash=by_hash or {},
+                                  owner_path=owner_path or {})
+
+
 def test_classify_marks_duplicates_and_pdf_validity(tmp_path):
     cfg = _cfg(tmp_path)
     dup = _write(cfg, "us/C1/2015/dup.pdf", PDF_A)
     fresh = _write(cfg, "us/C1/2015/fresh.pdf", PDF_B)
     tiny = _write(cfg, "us/C1/undated/tiny", TINY)
-    hash_index = {_sha(PDF_A): "aaaa"}
-    e = orphans.classify(dup, cfg.raw_dir, hash_index)
+    index = _mi(by_hash={_sha(PDF_A): "aaaa"})
+    e = orphans.classify(dup, cfg.raw_dir, index)
     assert (e.rel, e.bank, e.doc_type, e.year_dir, e.ext) == ("us/C1/2015/dup.pdf", "us", "C1", "2015", "pdf")
     assert e.size == len(PDF_A) and e.sha256 == _sha(PDF_A) and e.valid_pdf is True
     assert e.matched_doc_id == "aaaa" and e.action == "would-move"
     assert e.dest == "us/C1/2015/dup.pdf"
-    f = orphans.classify(fresh, cfg.raw_dir, hash_index)
+    f = orphans.classify(fresh, cfg.raw_dir, index)
     assert f.matched_doc_id is None and f.action == "kept-unindexed" and f.dest is None and f.valid_pdf is True
-    t = orphans.classify(tiny, cfg.raw_dir, hash_index)
+    t = orphans.classify(tiny, cfg.raw_dir, index)
     assert t.ext == "" and t.year_dir == "undated" and t.valid_pdf is False
 
 
 def test_classify_shallow_path_leaves_missing_parts_empty(tmp_path):
     cfg = _cfg(tmp_path)
     p = _write(cfg, "us/.DS_Store", b"junk")
-    e = orphans.classify(p, cfg.raw_dir, {})
+    e = orphans.classify(p, cfg.raw_dir, _mi())
     assert (e.bank, e.doc_type, e.year_dir, e.ext) == ("us", "", "", "")   # ".DS_Store" has no suffix
 
 
@@ -227,3 +239,153 @@ def test_progress_lines_go_to_stderr(tmp_path, capsys):
     orphans.sweep_orphans(cfg, progress_every=2)
     err = capsys.readouterr().err
     assert "sweep-orphans: examined 2 files" in err and "examined 4 files" in err
+
+
+# --- Review fixes ------------------------------------------------------------
+
+def test_duplicate_is_kept_when_the_owner_row_file_is_missing_from_disk(tmp_path):
+    """The manifest row for aaaa points at data/raw/us/C1/2015/aaaa.pdf, which
+    does not exist on disk; the only file on disk with those bytes is
+    renamed.pdf. renamed.pdf must NOT be quarantined — moving it would leave
+    zero on-disk copies of aaaa."""
+    cfg = _cfg(tmp_path)
+    renamed = _write(cfg, "us/C1/2015/renamed.pdf", PDF_A)   # NOT at the row's local_path
+    _index(cfg, "us", _row("aaaa", PDF_A, "us", "us/C1/2015/aaaa.pdf"))  # missing on disk
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.owner_missing == 1
+    assert s.moved == 0
+    assert renamed.exists()
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    row = rows["us/C1/2015/renamed.pdf"]
+    assert row["action"] == "kept-owner-missing" and row["dest"] is None
+
+
+def test_absolute_local_path_pointing_at_the_owner_file_is_accepted(tmp_path):
+    cfg = _cfg(tmp_path)
+    owner = _write(cfg, "us/C1/2015/aaaa.pdf", PDF_A)
+    dup = _write(cfg, "us/C1/2015/dup.pdf", PDF_A)
+    row = {"doc_id": "aaaa", "bank_code": "us", "doc_type": "C1", "sha256": _sha(PDF_A),
+           "local_path": str(owner), "pdf_url": "https://x/aaaa.pdf"}
+    _index(cfg, "us", row)
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.owner_missing == 0
+    assert s.moved == 1
+    assert not dup.exists()
+    assert (cfg.orphans_dir / "us/C1/2015/dup.pdf").read_bytes() == PDF_A
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses unix permission checks")
+def test_unreadable_file_is_reported_not_fatal_and_others_still_move(tmp_path):
+    """A file that cannot be hashed (chmod 0) must not abort the sweep: it gets
+    a hash-failed row, is never moved, and the rest of the sweep proceeds."""
+    cfg = _corpus(tmp_path)
+    bad = _write(cfg, "us/C1/2015/bad.pdf", PDF_B)
+    bad.chmod(0)
+    try:
+        s = orphans.sweep_orphans(cfg, move=True)
+    finally:
+        bad.chmod(0o644)   # restore so tmp_path cleanup can remove it
+    assert s.hash_failed == 1
+    assert s.moved == 2                 # dup.pdf and page.html still moved
+    assert bad.exists()                 # never moved
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    row = rows["us/C1/2015/bad.pdf"]
+    assert row["action"] == "hash-failed"
+    # stat() still works without read permission (only the parent dir's
+    # permissions matter) so the row carries the real size, not a dummy 0.
+    assert row["sha256"] == "" and row["size"] == len(PDF_B) and row["valid_pdf"] is False
+    assert row["matched_doc_id"] is None and row["dest"] is None
+    assert "PermissionError" in row["error"]
+
+
+def test_symlink_under_raw_is_ignored_by_the_walk(tmp_path):
+    cfg = _corpus(tmp_path)
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(PDF_A)
+    link = cfg.raw_dir / "us/C1/2015/link.pdf"
+    link.symlink_to(outside)
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.files_seen == 5           # unchanged: the symlink itself is not counted
+    rels = [json.loads(l)["rel"] for l in Path(s.report_path).read_text().splitlines()]
+    assert "us/C1/2015/link.pdf" not in rels
+    assert link.is_symlink() and outside.exists() and outside.read_bytes() == PDF_A
+
+
+def test_move_fails_when_destination_is_a_symlink(tmp_path):
+    cfg = _corpus(tmp_path)
+    dest = cfg.orphans_dir / "us/C1/2015/dup.pdf"
+    dest.parent.mkdir(parents=True)
+    dest.symlink_to(cfg.raw_dir / "us/C1/2015/aaaa.pdf")
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.move_failed == 1
+    assert (cfg.raw_dir / "us/C1/2015/dup.pdf").exists()      # source untouched
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    row = rows["us/C1/2015/dup.pdf"]
+    assert row["action"] == "move-failed" and row["error"] == "dest is a symlink"
+
+
+def test_loose_files_directly_under_raw_are_swept_only_without_banks_filter(tmp_path):
+    cfg = _corpus(tmp_path)
+    loose = _write(cfg, "loose.pdf", PDF_A)      # duplicate of aaaa, sitting at raw/ top level
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert not loose.exists()
+    assert (cfg.orphans_dir / "loose.pdf").read_bytes() == PDF_A
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    assert rows["loose.pdf"]["bank"] == ""
+    # with an explicit banks filter, loose files at the top level belong to no bank
+    loose2 = _write(cfg, "loose2.pdf", PDF_A)
+    s2 = orphans.sweep_orphans(cfg, move=True, banks={"us"})
+    rels2 = [json.loads(l)["rel"] for l in Path(s2.report_path).read_text().splitlines()]
+    assert "loose2.pdf" not in rels2
+    assert loose2.exists()
+
+
+def test_summary_records_the_requested_banks_or_none_for_a_full_sweep(tmp_path):
+    cfg = _corpus(tmp_path)
+    s_full = orphans.sweep_orphans(cfg)
+    assert s_full.banks is None
+    s_banked = orphans.sweep_orphans(cfg, banks={"us", "ecb"})
+    assert s_banked.banks == ["ecb", "us"]
+
+
+def test_report_is_flushed_after_every_written_row(tmp_path, monkeypatch):
+    """io.TextIOWrapper is a C type and can't be monkeypatched directly, so
+    wrap the file object Path.open('w', ...) hands back for the report."""
+    cfg = _corpus(tmp_path)
+    calls = []
+
+    class _FlushCountingFile:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return self._inner.__exit__(*exc_info)
+
+        def flush(self):
+            calls.append(1)
+            return self._inner.flush()
+
+    orig_open = Path.open
+
+    def counting_open(self, *args, **kwargs):
+        f = orig_open(self, *args, **kwargs)
+        if self.suffix == ".jsonl":
+            return _FlushCountingFile(f)
+        return f
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    s = orphans.sweep_orphans(cfg)
+    assert len(calls) >= s.orphans
+
+
+def test_raw_dir_present_but_not_a_directory_is_reported_clearly(tmp_path):
+    cfg = Config(data_dir=tmp_path / "data")
+    cfg.data_dir.mkdir(parents=True)
+    cfg.raw_dir.write_bytes(b"not a directory")
+    with pytest.raises(FileNotFoundError, match="corpus raw dir not found or not a directory"):
+        orphans.sweep_orphans(cfg)

@@ -12,7 +12,14 @@ Rules (see the design note of 2026-09-03):
 * any other orphan is **unindexed** → left in place, reported (candidate for
   ``reindex-from-disk``);
 * a file whose stem IS a manifest doc_id is never examined, let alone moved;
-* the default run is a dry-run: it classifies and reports, moves nothing.
+* the default run is a dry-run: it classifies and reports, moves nothing;
+* a file that cannot be hashed (permission error, vanished mid-walk) is
+  reported as a failure, never fatal to the sweep, and never moved;
+* a duplicate whose owning manifest row's own file is missing from disk is
+  never moved — quarantining it would leave zero on-disk copies of that
+  document;
+* symlinks are ignored: never walked as orphans, never used as a move
+  destination.
 
 The manifest is read once, through :func:`storage.iter_manifest_rows` (no
 ``Storage()`` side effects). On the NAS the run-job global lock guarantees no
@@ -50,7 +57,8 @@ class OrphanEntry:
     sha256: str
     valid_pdf: bool
     matched_doc_id: Optional[str]
-    action: str               # would-move | moved | move-failed | kept-unindexed
+    # would-move | moved | move-failed | kept-unindexed | kept-owner-missing | hash-failed
+    action: str
     dest: Optional[str]       # relative path under raw_orphans/ (duplicates only)
     error: Optional[str] = None
 
@@ -68,10 +76,38 @@ class SweepSummary:
     report_path: str
     started_at: str
     finished_at: str
+    hash_failed: int = 0
+    owner_missing: int = 0
+    banks: Optional[list[str]] = None
 
 
-def load_manifest_index(cfg: Config) -> tuple[set[str], dict[str, str]]:
-    """``(doc_ids, sha256 -> doc_id)`` across every per-bank manifest.
+@dataclass
+class ManifestIndex:
+    doc_ids: set[str]
+    by_hash: dict[str, str]          # sha256 -> doc_id
+    owner_path: dict[str, Path]      # sha256 -> resolved on-disk path of the owning row
+
+
+def _resolve_local_path(cfg: Config, local_path: str) -> Optional[Path]:
+    """Best-effort on-disk path for a manifest row's ``local_path``.
+
+    If it contains ``"raw/"``, take the part after the FIRST occurrence and
+    join it to ``cfg.raw_dir``; else if it is absolute use it as is; else the
+    owner path is unknown (treated as missing).
+    """
+    marker = "raw/"
+    idx = local_path.find(marker)
+    if idx != -1:
+        return cfg.raw_dir / local_path[idx + len(marker):]
+    p = Path(local_path)
+    if p.is_absolute():
+        return p
+    return None
+
+
+def load_manifest_index(cfg: Config) -> ManifestIndex:
+    """Index every per-bank manifest into doc_ids, a sha256->doc_id map, and a
+    sha256->owner on-disk path map.
 
     Read-only, via :func:`storage.iter_manifest_rows` (blank lines skipped,
     torn tails handled there). A sha256 owned by two rows keeps the first
@@ -79,6 +115,7 @@ def load_manifest_index(cfg: Config) -> tuple[set[str], dict[str, str]]:
     """
     ids: set[str] = set()
     by_hash: dict[str, str] = {}
+    owner_path: dict[str, Path] = {}
     for rec in iter_manifest_rows(cfg):
         doc_id = rec.get("doc_id")
         if not doc_id:
@@ -87,7 +124,35 @@ def load_manifest_index(cfg: Config) -> tuple[set[str], dict[str, str]]:
         sha = rec.get("sha256")
         if sha:
             by_hash.setdefault(sha, doc_id)
-    return ids, by_hash
+            if sha not in owner_path:
+                local_path = rec.get("local_path")
+                if local_path:
+                    resolved = _resolve_local_path(cfg, local_path)
+                    if resolved is not None:
+                        owner_path[sha] = resolved
+    return ManifestIndex(doc_ids=ids, by_hash=by_hash, owner_path=owner_path)
+
+
+def _iter_all_files(cfg: Config, banks: Optional[set[str]]) -> Iterator[Path]:
+    """Every regular file under raw/ (sorted), for the counters; the orphan
+    test itself is applied by the caller so ``files_seen`` is honest.
+
+    Symlinks are never yielded (broken or not — they are not this sweep's
+    concern). Loose files sitting directly at the top level of ``raw/`` (not
+    inside any bank directory) are included only for a full sweep
+    (``banks is None``); with an explicit ``banks`` filter they belong to no
+    requested bank and are skipped.
+    """
+    if banks is None:
+        for path in sorted(cfg.raw_dir.iterdir()):
+            if path.is_file() and not path.is_symlink():
+                yield path
+    for bank_dir in sorted(p for p in cfg.raw_dir.iterdir() if p.is_dir()):
+        if banks is not None and bank_dir.name not in banks:
+            continue
+        for path in sorted(bank_dir.rglob("*")):
+            if path.is_file() and not path.is_symlink():
+                yield path
 
 
 def iter_orphans(cfg: Config, doc_ids: set[str], *,
@@ -117,8 +182,13 @@ def _sha256_of(path: Path) -> tuple[str, int, bool]:
     return h.hexdigest(), size, (size > MIN_VALID_PDF_BYTES and head == PDF_MAGIC)
 
 
-def classify(path: Path, raw: Path, hash_index: dict[str, str]) -> OrphanEntry:
-    """Hash one orphan and decide its provisional action."""
+def classify(path: Path, raw: Path, index: ManifestIndex) -> OrphanEntry:
+    """Hash one orphan and decide its provisional action.
+
+    Raises whatever :func:`_sha256_of` raises (``OSError`` subclasses) on an
+    unreadable or vanished file — the caller (:func:`sweep_orphans`) is
+    responsible for containing that per file.
+    """
     rel = path.relative_to(raw).as_posix()
     parts = rel.split("/")
     bank = parts[0] if len(parts) > 1 else ""
@@ -126,7 +196,7 @@ def classify(path: Path, raw: Path, hash_index: dict[str, str]) -> OrphanEntry:
     year_dir = parts[2] if len(parts) > 3 else ""
     ext = path.suffix.lower().lstrip(".")
     sha, size, valid = _sha256_of(path)
-    owner = hash_index.get(sha)
+    owner = index.by_hash.get(sha)
     return OrphanEntry(
         path=str(path), rel=rel, bank=bank, doc_type=doc_type, year_dir=year_dir,
         ext=ext, size=size, sha256=sha, valid_pdf=valid, matched_doc_id=owner,
@@ -145,6 +215,9 @@ def move_to_orphans(entry: OrphanEntry, cfg: Config) -> None:
     """
     src = Path(entry.path)
     dest = cfg.orphans_dir / entry.rel
+    if dest.is_symlink():
+        entry.action, entry.error = "move-failed", "dest is a symlink"
+        return
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
@@ -160,23 +233,38 @@ def move_to_orphans(entry: OrphanEntry, cfg: Config) -> None:
         entry.action, entry.error = "move-failed", f"{type(exc).__name__}: {exc}"
 
 
+def _hash_failed_entry(path: Path, rel: str, bank: str, doc_type: str, year_dir: str,
+                       exc: OSError) -> OrphanEntry:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return OrphanEntry(
+        path=str(path), rel=rel, bank=bank, doc_type=doc_type, year_dir=year_dir,
+        ext=path.suffix.lower().lstrip("."), size=size, sha256="", valid_pdf=False,
+        matched_doc_id=None, action="hash-failed", dest=None,
+        error=f"{type(exc).__name__}: {exc}",
+    )
+
+
 def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool = False,
                   progress_every: int = 1000, report_path: Optional[Path] = None,
                   now: Optional[datetime] = None) -> SweepSummary:
     """Find, classify, (move) and report every orphan under raw/.
 
-    Raises ``FileNotFoundError`` when ``raw/`` is missing — a mis-pointed data
-    dir must not look like a clean corpus.
+    Raises ``FileNotFoundError`` when ``raw/`` is missing or not a directory —
+    a mis-pointed data dir must not look like a clean corpus.
     """
     if not cfg.raw_dir.is_dir():
-        raise FileNotFoundError(f"corpus raw dir not found: {cfg.raw_dir}")
+        raise FileNotFoundError(f"corpus raw dir not found or not a directory: {cfg.raw_dir}")
     started = now or datetime.now(timezone.utc)
     stamp = started.strftime("%Y%m%dT%H%M%SZ")
     report_path = report_path or (cfg.reports_dir / f"orphan_sweep_{stamp}.jsonl")
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    doc_ids, by_hash = load_manifest_index(cfg)
+    index = load_manifest_index(cfg)
     files_seen = orphans_n = dups = unindexed = moved = failed = 0
+    hash_failed = owner_missing = 0
     bytes_dups = 0
     with report_path.open("w", encoding="utf-8") as out:
         for path in _iter_all_files(cfg, banks):
@@ -184,41 +272,46 @@ def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool =
             if progress_every and files_seen % progress_every == 0:
                 print(f"sweep-orphans: examined {files_seen} files "
                       f"({orphans_n} orphans, {dups} duplicates so far)", file=sys.stderr, flush=True)
-            if path.stem in doc_ids:
+            if path.stem in index.doc_ids:
                 continue
             orphans_n += 1
-            entry = classify(path, cfg.raw_dir, by_hash)
-            if entry.matched_doc_id is None:
-                unindexed += 1
+            try:
+                entry = classify(path, cfg.raw_dir, index)
+            except OSError as exc:
+                rel = path.relative_to(cfg.raw_dir).as_posix()
+                parts = rel.split("/")
+                bank = parts[0] if len(parts) > 1 else ""
+                doc_type = parts[1] if len(parts) > 2 else ""
+                year_dir = parts[2] if len(parts) > 3 else ""
+                entry = _hash_failed_entry(path, rel, bank, doc_type, year_dir, exc)
+                hash_failed += 1
             else:
-                dups += 1
-                bytes_dups += entry.size
-                if move:
-                    move_to_orphans(entry, cfg)
-                    if entry.action == "moved":
-                        moved += 1
-                    else:
-                        failed += 1
+                if entry.matched_doc_id is None:
+                    unindexed += 1
+                else:
+                    dups += 1
+                    bytes_dups += entry.size
+                    owner = index.owner_path.get(entry.sha256)
+                    if owner is None or not owner.is_file():
+                        entry.action, entry.dest = "kept-owner-missing", None
+                        owner_missing += 1
+                    elif move:
+                        move_to_orphans(entry, cfg)
+                        if entry.action == "moved":
+                            moved += 1
+                        else:
+                            failed += 1
             out.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+            out.flush()
 
     finished = datetime.now(timezone.utc)
     summary = SweepSummary(
         files_seen=files_seen, orphans=orphans_n, duplicates=dups, unindexed=unindexed,
         moved=moved, move_failed=failed, bytes_duplicates=bytes_dups, dry_run=not move,
         report_path=str(report_path), started_at=started.isoformat(),
-        finished_at=finished.isoformat(),
+        finished_at=finished.isoformat(), hash_failed=hash_failed, owner_missing=owner_missing,
+        banks=sorted(banks) if banks is not None else None,
     )
     report_path.with_suffix(".summary.json").write_text(
         json.dumps(asdict(summary), indent=2) + "\n", encoding="utf-8")
     return summary
-
-
-def _iter_all_files(cfg: Config, banks: Optional[set[str]]) -> Iterator[Path]:
-    """Every regular file under raw/<bank>/ (sorted), for the counters; the
-    orphan test itself is applied by the caller so ``files_seen`` is honest."""
-    for bank_dir in sorted(p for p in cfg.raw_dir.iterdir() if p.is_dir()):
-        if banks is not None and bank_dir.name not in banks:
-            continue
-        for path in sorted(bank_dir.rglob("*")):
-            if path.is_file():
-                yield path
