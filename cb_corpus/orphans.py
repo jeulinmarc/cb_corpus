@@ -95,13 +95,9 @@ def iter_orphans(cfg: Config, doc_ids: set[str], *,
     """Every regular file under ``raw/`` (any depth, any extension) whose stem
     is not in ``doc_ids``, in sorted order. ``banks`` restricts the top-level
     ``raw/<bank>/`` directories walked."""
-    raw = cfg.raw_dir
-    for bank_dir in sorted(p for p in raw.iterdir() if p.is_dir()):
-        if banks is not None and bank_dir.name not in banks:
-            continue
-        for path in sorted(bank_dir.rglob("*")):
-            if path.is_file() and path.stem not in doc_ids:
-                yield path
+    for path in _iter_all_files(cfg, banks):
+        if path.stem not in doc_ids:
+            yield path
 
 
 def _sha256_of(path: Path) -> tuple[str, int, bool]:
@@ -137,3 +133,92 @@ def classify(path: Path, raw: Path, hash_index: dict[str, str]) -> OrphanEntry:
         action="would-move" if owner else "kept-unindexed",
         dest=rel if owner else None,
     )
+
+
+def move_to_orphans(entry: OrphanEntry, cfg: Config) -> None:
+    """Move one duplicate from raw/ to raw_orphans/ (same relative path).
+
+    ``os.replace`` inside ``data_dir`` — an atomic rename on one filesystem.
+    Never overwrites: a destination that already holds the same bytes means a
+    replayed sweep, so the source is simply removed; a destination with other
+    content is left alone and the move is recorded as failed.
+    """
+    src = Path(entry.path)
+    dest = cfg.orphans_dir / entry.rel
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            dest_sha, _, _ = _sha256_of(dest)
+            if dest_sha != entry.sha256:
+                entry.action, entry.error = "move-failed", "dest exists with different content"
+                return
+            src.unlink()
+        else:
+            os.replace(src, dest)
+        entry.action = "moved"
+    except OSError as exc:
+        entry.action, entry.error = "move-failed", f"{type(exc).__name__}: {exc}"
+
+
+def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool = False,
+                  progress_every: int = 1000, report_path: Optional[Path] = None,
+                  now: Optional[datetime] = None) -> SweepSummary:
+    """Find, classify, (move) and report every orphan under raw/.
+
+    Raises ``FileNotFoundError`` when ``raw/`` is missing — a mis-pointed data
+    dir must not look like a clean corpus.
+    """
+    if not cfg.raw_dir.is_dir():
+        raise FileNotFoundError(f"corpus raw dir not found: {cfg.raw_dir}")
+    started = now or datetime.now(timezone.utc)
+    stamp = started.strftime("%Y%m%dT%H%M%SZ")
+    report_path = report_path or (cfg.reports_dir / f"orphan_sweep_{stamp}.jsonl")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    doc_ids, by_hash = load_manifest_index(cfg)
+    files_seen = orphans_n = dups = unindexed = moved = failed = 0
+    bytes_dups = 0
+    with report_path.open("w", encoding="utf-8") as out:
+        for path in _iter_all_files(cfg, banks):
+            files_seen += 1
+            if progress_every and files_seen % progress_every == 0:
+                print(f"sweep-orphans: examined {files_seen} files "
+                      f"({orphans_n} orphans, {dups} duplicates so far)", file=sys.stderr, flush=True)
+            if path.stem in doc_ids:
+                continue
+            orphans_n += 1
+            entry = classify(path, cfg.raw_dir, by_hash)
+            if entry.matched_doc_id is None:
+                unindexed += 1
+            else:
+                dups += 1
+                bytes_dups += entry.size
+                if move:
+                    move_to_orphans(entry, cfg)
+                    if entry.action == "moved":
+                        moved += 1
+                    else:
+                        failed += 1
+            out.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+
+    finished = datetime.now(timezone.utc)
+    summary = SweepSummary(
+        files_seen=files_seen, orphans=orphans_n, duplicates=dups, unindexed=unindexed,
+        moved=moved, move_failed=failed, bytes_duplicates=bytes_dups, dry_run=not move,
+        report_path=str(report_path), started_at=started.isoformat(),
+        finished_at=finished.isoformat(),
+    )
+    report_path.with_suffix(".summary.json").write_text(
+        json.dumps(asdict(summary), indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def _iter_all_files(cfg: Config, banks: Optional[set[str]]) -> Iterator[Path]:
+    """Every regular file under raw/<bank>/ (sorted), for the counters; the
+    orphan test itself is applied by the caller so ``files_seen`` is honest."""
+    for bank_dir in sorted(p for p in cfg.raw_dir.iterdir() if p.is_dir()):
+        if banks is not None and bank_dir.name not in banks:
+            continue
+        for path in sorted(bank_dir.rglob("*")):
+            if path.is_file():
+                yield path
