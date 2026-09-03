@@ -129,6 +129,10 @@ into the stack's folder under the name `deploy_key` → Deploy. The container
 waits for any running sync or campaign to finish (lock), runs, pushes the state, stops.
 To launch another campaign: re-edit `command:` + Deploy.
 
+Maintenance example — orphan sweep (see README § Maintenance): first
+`command: ["/app/deploy/run-job.sh", "campaign", "sweep-orphans"]` (dry-run; read
+`reports/orphan_sweep_<ts>.summary.json`), then the same with `"--move"`.
+
 ## 4a. Weekly cadence watchdog (automated)
 
 The cadence watchdog detects silent series — banks/doc-types with no new

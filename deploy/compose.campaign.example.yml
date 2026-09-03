@@ -13,6 +13,9 @@ services:
       AUTOCOMMIT: "1"
     command: ["/app/deploy/run-job.sh", "campaign",
               "discover", "--banks", "fr,it", "--types", "A3", "--download", "--rounds", "3"]
+    # Maintenance: orphan sweep (dry-run, then --move) — see README § Maintenance
+    # command: ["/app/deploy/run-job.sh", "campaign", "sweep-orphans"]
+    # command: ["/app/deploy/run-job.sh", "campaign", "sweep-orphans", "--move"]
     volumes:
       - /mnt/POOL/DATASET:/app/data
       - ./deploy_key:/run/secrets/deploy_key:ro
