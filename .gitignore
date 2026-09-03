@@ -12,6 +12,9 @@ data/manifest/*
 data/cadence.jsonl
 data/cadence_state.jsonl
 
+# Orphan sweep quarantine tree (already covered by data/* above; explicit for clarity).
+data/raw_orphans/
+
 # Python
 __pycache__/
 *.py[cod]
