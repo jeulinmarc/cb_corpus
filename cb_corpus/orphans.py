@@ -369,8 +369,6 @@ def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool =
                 out.write(json.dumps(asdict(entry), ensure_ascii=True) + "\n")
                 out.flush()
     finally:
-        if install_handler:
-            signal.signal(signal.SIGTERM, prev_handler)
         finished = datetime.now(timezone.utc)
         summary = SweepSummary(
             files_seen=files_seen, orphans=orphans_n, duplicates=dups, unindexed=unindexed,
@@ -381,4 +379,9 @@ def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool =
         )
         report_path.with_suffix(".summary.json").write_text(
             json.dumps(asdict(summary), indent=2) + "\n", encoding="utf-8")
+        # Restore the handler only after the summary is on disk: a restore that
+        # raises (a C-level previous handler reads back as None) must not cost
+        # the operator's primary artefact.
+        if install_handler and prev_handler is not None:
+            signal.signal(signal.SIGTERM, prev_handler)
     return summary
