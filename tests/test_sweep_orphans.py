@@ -254,6 +254,25 @@ def test_duplicate_is_kept_when_the_owner_row_file_is_missing_from_disk(tmp_path
     s = orphans.sweep_orphans(cfg, move=True)
     assert s.owner_missing == 1
     assert s.moved == 0
+    assert s.bytes_duplicates == 0     # owner missing: not reclaimable, must not be counted
+    assert renamed.exists()
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    row = rows["us/C1/2015/renamed.pdf"]
+    assert row["action"] == "kept-owner-missing" and row["dest"] is None
+
+
+def test_duplicate_is_kept_when_the_owner_path_resolves_to_the_file_itself(tmp_path):
+    """The manifest row for aaaa points at data/raw/us/C1/2015/renamed.pdf (the
+    file that got renamed away from its indexed doc_id) and renamed.pdf is the
+    ONLY on-disk copy of those bytes: the owner path IS the file being
+    examined. It must NOT be quarantined — moving it would leave zero on-disk
+    copies of aaaa, exactly like the owner-file-missing case."""
+    cfg = _cfg(tmp_path)
+    renamed = _write(cfg, "us/C1/2015/renamed.pdf", PDF_A)
+    _index(cfg, "us", _row("aaaa", PDF_A, "us", "us/C1/2015/renamed.pdf"))
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.owner_missing == 1
+    assert s.moved == 0
     assert renamed.exists()
     rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
     row = rows["us/C1/2015/renamed.pdf"]
@@ -323,6 +342,46 @@ def test_move_fails_when_destination_is_a_symlink(tmp_path):
     assert row["action"] == "move-failed" and row["error"] == "dest is a symlink"
 
 
+def test_symlinked_bank_directory_is_not_followed(tmp_path):
+    """A symlink sitting at the top level of raw/ that points at a directory
+    (e.g. an accidental `raw/ext -> /some/tmp/outside_dir`) must not be walked
+    as if it were a bank: the files inside it are outside this sweep's scope."""
+    cfg = _corpus(tmp_path)
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    outside_dup = outside_dir / "dup.pdf"
+    outside_dup.write_bytes(PDF_A)          # duplicate of aaaa, but outside raw/
+    link = cfg.raw_dir / "ext"
+    link.symlink_to(outside_dir)
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.files_seen == 5               # unchanged: nothing inside the symlinked dir counted
+    rows = [json.loads(l)["rel"] for l in Path(s.report_path).read_text().splitlines()]
+    assert not any(r.startswith("ext/") for r in rows)
+    assert link.is_symlink()
+    assert outside_dup.exists() and outside_dup.read_bytes() == PDF_A
+
+
+def test_move_fails_when_an_intermediate_destination_directory_is_a_symlink(tmp_path):
+    """raw_orphans/us -> <somewhere outside raw_orphans/>: the immediate dest
+    check (`dest.is_symlink()`) doesn't catch this because the symlink is an
+    ancestor, not the leaf. `dest.parent.resolve()` must still land inside
+    cfg.orphans_dir, or the move is refused rather than writing outside the
+    quarantine tree."""
+    cfg = _corpus(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    cfg.orphans_dir.mkdir(parents=True)
+    (cfg.orphans_dir / "us").symlink_to(elsewhere)
+    s = orphans.sweep_orphans(cfg, move=True)
+    assert s.move_failed == 2          # dup.pdf and page.html both land under raw_orphans/us/...
+    assert (cfg.raw_dir / "us/C1/2015/dup.pdf").exists()      # source untouched
+    assert (cfg.raw_dir / "us/C1/2015/page.html").exists()    # source untouched
+    assert not any(elsewhere.iterdir())                       # nothing written under elsewhere/
+    rows = {json.loads(l)["rel"]: json.loads(l) for l in Path(s.report_path).read_text().splitlines()}
+    row = rows["us/C1/2015/dup.pdf"]
+    assert row["action"] == "move-failed" and row["error"] == "dest parent escapes raw_orphans/"
+
+
 def test_loose_files_directly_under_raw_are_swept_only_without_banks_filter(tmp_path):
     cfg = _corpus(tmp_path)
     loose = _write(cfg, "loose.pdf", PDF_A)      # duplicate of aaaa, sitting at raw/ top level
@@ -381,6 +440,22 @@ def test_report_is_flushed_after_every_written_row(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "open", counting_open)
     s = orphans.sweep_orphans(cfg)
     assert len(calls) >= s.orphans
+
+
+def test_summary_is_still_written_when_classify_raises_unexpectedly(tmp_path, monkeypatch):
+    """An unexpected exception mid-walk (not the contained OSError case) must
+    not leave the operator without a summary: sweep_orphans re-raises, but the
+    .summary.json file exists so a monitoring job can tell the run happened."""
+    cfg = _corpus(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(orphans, "classify", _boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        orphans.sweep_orphans(cfg)
+    summaries = list(cfg.reports_dir.glob("*.summary.json"))
+    assert len(summaries) == 1
 
 
 def test_raw_dir_present_but_not_a_directory_is_reported_clearly(tmp_path):

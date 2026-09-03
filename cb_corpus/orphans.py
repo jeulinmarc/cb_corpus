@@ -134,8 +134,10 @@ def load_manifest_index(cfg: Config) -> ManifestIndex:
 
 
 def _iter_all_files(cfg: Config, banks: Optional[set[str]]) -> Iterator[Path]:
-    """Every regular file under raw/ (sorted), for the counters; the orphan
-    test itself is applied by the caller so ``files_seen`` is honest.
+    """Every regular file under raw/ — loose top-level files first, then bank
+    directories in sorted order, files sorted within each bank — for the
+    counters; the orphan test itself is applied by the caller so
+    ``files_seen`` is honest.
 
     Symlinks are never yielded (broken or not — they are not this sweep's
     concern). Loose files sitting directly at the top level of ``raw/`` (not
@@ -147,7 +149,7 @@ def _iter_all_files(cfg: Config, banks: Optional[set[str]]) -> Iterator[Path]:
         for path in sorted(cfg.raw_dir.iterdir()):
             if path.is_file() and not path.is_symlink():
                 yield path
-    for bank_dir in sorted(p for p in cfg.raw_dir.iterdir() if p.is_dir()):
+    for bank_dir in sorted(p for p in cfg.raw_dir.iterdir() if p.is_dir() and not p.is_symlink()):
         if banks is not None and bank_dir.name not in banks:
             continue
         for path in sorted(bank_dir.rglob("*")):
@@ -218,6 +220,11 @@ def move_to_orphans(entry: OrphanEntry, cfg: Config) -> None:
     if dest.is_symlink():
         entry.action, entry.error = "move-failed", "dest is a symlink"
         return
+    orphans_root = cfg.orphans_dir.resolve()
+    dest_parent = dest.parent.resolve()
+    if dest_parent != orphans_root and orphans_root not in dest_parent.parents:
+        entry.action, entry.error = "move-failed", "dest parent escapes raw_orphans/"
+        return
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
@@ -266,52 +273,54 @@ def sweep_orphans(cfg: Config, *, banks: Optional[set[str]] = None, move: bool =
     files_seen = orphans_n = dups = unindexed = moved = failed = 0
     hash_failed = owner_missing = 0
     bytes_dups = 0
-    with report_path.open("w", encoding="utf-8") as out:
-        for path in _iter_all_files(cfg, banks):
-            files_seen += 1
-            if progress_every and files_seen % progress_every == 0:
-                print(f"sweep-orphans: examined {files_seen} files "
-                      f"({orphans_n} orphans, {dups} duplicates so far)", file=sys.stderr, flush=True)
-            if path.stem in index.doc_ids:
-                continue
-            orphans_n += 1
-            try:
-                entry = classify(path, cfg.raw_dir, index)
-            except OSError as exc:
-                rel = path.relative_to(cfg.raw_dir).as_posix()
-                parts = rel.split("/")
-                bank = parts[0] if len(parts) > 1 else ""
-                doc_type = parts[1] if len(parts) > 2 else ""
-                year_dir = parts[2] if len(parts) > 3 else ""
-                entry = _hash_failed_entry(path, rel, bank, doc_type, year_dir, exc)
-                hash_failed += 1
-            else:
-                if entry.matched_doc_id is None:
-                    unindexed += 1
+    try:
+        with report_path.open("w", encoding="utf-8") as out:
+            for path in _iter_all_files(cfg, banks):
+                files_seen += 1
+                if progress_every and files_seen % progress_every == 0:
+                    print(f"sweep-orphans: examined {files_seen} files "
+                          f"({orphans_n} orphans, {dups} duplicates so far)", file=sys.stderr, flush=True)
+                if path.stem in index.doc_ids:
+                    continue
+                orphans_n += 1
+                try:
+                    entry = classify(path, cfg.raw_dir, index)
+                except OSError as exc:
+                    rel = path.relative_to(cfg.raw_dir).as_posix()
+                    parts = rel.split("/")
+                    bank = parts[0] if len(parts) > 1 else ""
+                    doc_type = parts[1] if len(parts) > 2 else ""
+                    year_dir = parts[2] if len(parts) > 3 else ""
+                    entry = _hash_failed_entry(path, rel, bank, doc_type, year_dir, exc)
+                    hash_failed += 1
                 else:
-                    dups += 1
-                    bytes_dups += entry.size
-                    owner = index.owner_path.get(entry.sha256)
-                    if owner is None or not owner.is_file():
-                        entry.action, entry.dest = "kept-owner-missing", None
-                        owner_missing += 1
-                    elif move:
-                        move_to_orphans(entry, cfg)
-                        if entry.action == "moved":
-                            moved += 1
+                    if entry.matched_doc_id is None:
+                        unindexed += 1
+                    else:
+                        dups += 1
+                        owner = index.owner_path.get(entry.sha256)
+                        if owner is None or not owner.is_file() or owner.resolve() == path.resolve():
+                            entry.action, entry.dest = "kept-owner-missing", None
+                            owner_missing += 1
                         else:
-                            failed += 1
-            out.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
-            out.flush()
-
-    finished = datetime.now(timezone.utc)
-    summary = SweepSummary(
-        files_seen=files_seen, orphans=orphans_n, duplicates=dups, unindexed=unindexed,
-        moved=moved, move_failed=failed, bytes_duplicates=bytes_dups, dry_run=not move,
-        report_path=str(report_path), started_at=started.isoformat(),
-        finished_at=finished.isoformat(), hash_failed=hash_failed, owner_missing=owner_missing,
-        banks=sorted(banks) if banks is not None else None,
-    )
-    report_path.with_suffix(".summary.json").write_text(
-        json.dumps(asdict(summary), indent=2) + "\n", encoding="utf-8")
+                            bytes_dups += entry.size
+                            if move:
+                                move_to_orphans(entry, cfg)
+                                if entry.action == "moved":
+                                    moved += 1
+                                else:
+                                    failed += 1
+                out.write(json.dumps(asdict(entry), ensure_ascii=True) + "\n")
+                out.flush()
+    finally:
+        finished = datetime.now(timezone.utc)
+        summary = SweepSummary(
+            files_seen=files_seen, orphans=orphans_n, duplicates=dups, unindexed=unindexed,
+            moved=moved, move_failed=failed, bytes_duplicates=bytes_dups, dry_run=not move,
+            report_path=str(report_path), started_at=started.isoformat(),
+            finished_at=finished.isoformat(), hash_failed=hash_failed, owner_missing=owner_missing,
+            banks=sorted(banks) if banks is not None else None,
+        )
+        report_path.with_suffix(".summary.json").write_text(
+            json.dumps(asdict(summary), indent=2) + "\n", encoding="utf-8")
     return summary
